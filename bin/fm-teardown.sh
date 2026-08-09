@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Tear down a finished task: return the treehouse worktree, release the Orca
+# Tear down a finished task: return the treehouse worktree (the same
+# `treehouse return --force` also releases the durable lease fm-spawn.sh
+# acquires on it under holder fm-<task-id>), release the Orca
 # worktree, or retire a secondmate home; kill the recorded runtime endpoint,
 # clear volatile state, refresh/prune the project's clone for PR-based ship
 # tasks, then print a backlog-refresh reminder for ship and scout teardowns
