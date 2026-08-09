@@ -1088,6 +1088,120 @@ test_wedge_escalation_resets_when_pane_becomes_active() {
   pass "a pane becoming active again resets the consecutive wedge-escalation counter"
 }
 
+# --- wedge escalation re-consults the semantic busy contract (#1769) ----------
+# wedge_timer_check used to escalate purely on elapsed time: once a timer was
+# running, a healthy worker whose harness lifecycle provably had a turn open
+# (the same busy contract the poll gate consults through window_is_busy) still
+# escalated every FM_STALE_ESCALATE_SECS. Before escalating, the timer now
+# re-consults that contract: busy extends the timer quietly and resets the
+# streak; only once the contract stops saying busy does the escalation fire.
+# Unit-level: fm-watch.sh's source guard loads the functions without starting
+# the loop, and the test overrides the wake callback so escalation is recorded
+# rather than exiting.
+test_wedge_timer_recheck_suppresses_escalation_while_busy_contract_working() (
+  dir=$(make_case wedge-recheck-busy); state="$dir/state"
+  window="test:fm-recheck"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  ssf="$state/.stale-since-$key"
+  ewf="$state/.wedge-escalations-$key"
+  printf 'window=%s\nkind=ship\nharness=claude\n' "$window" > "$state/recheck.meta"
+  gen=$("$ROOT/bin/fm-busy-event.sh" arm "$state" recheck)
+  "$ROOT/bin/fm-busy-event.sh" apply "$state" recheck busy --gen "$gen" \
+    --source claude-hook --event user-prompt-submit
+  FM_HOME="$dir"
+  FM_STATE_OVERRIDE="$state"
+  export FM_HOME FM_STATE_OVERRIDE
+  # shellcheck source=/dev/null
+  . "$ROOT/bin/fm-watch.sh"
+  WAKE_LOG="$dir/wakes.log"
+  : > "$WAKE_LOG"
+  # shellcheck disable=SC2329 # runtime override consumed by the sourced watcher
+  wake() { printf '%s\n' "$1" >> "$WAKE_LOG"; }
+
+  # Expired timer + a busy semantic record: no escalation, timer extended,
+  # streak cleared.
+  echo $(( $(date +%s) - 500 )) > "$ssf"
+  printf '2\n' > "$ewf"
+  wedge_timer_check "$window" "$ssf" "non-terminal stale" "$ewf"
+  [ ! -s "$WAKE_LOG" ] || fail "wedge timer escalated while the busy contract said working: $(cat "$WAKE_LOG")"
+  [ ! -s "$state/.wake-queue" ] || fail "suppressed wedge escalation still queued a wake"
+  [ ! -e "$ewf" ] || fail "a busy-contract suppression did not reset the escalation streak"
+  since=$(cat "$ssf" 2>/dev/null || true)
+  case "$since" in ''|*[!0-9]*) fail "suppression did not extend the wedge timer" ;; esac
+  [ $(( $(date +%s) - since )) -lt 60 ] || fail "suppression left the wedge timer expired"
+
+  # The turn closes (Stop): the contract stops saying busy, so the next expiry
+  # escalates exactly as before.
+  "$ROOT/bin/fm-busy-event.sh" apply "$state" recheck idle --gen "$gen" \
+    --source claude-hook --event stop
+  echo $(( $(date +%s) - 500 )) > "$ssf"
+  wedge_timer_check "$window" "$ssf" "non-terminal stale" "$ewf"
+  grep -F "stale: $window" "$WAKE_LOG" >/dev/null || fail "wedge timer did not escalate once the busy contract settled"
+  grep -F "escalation 1" "$WAKE_LOG" >/dev/null || fail "post-suppression escalation did not restart the streak at 1: $(cat "$WAKE_LOG")"
+  grep -F "possible wedge" "$state/.wake-queue" >/dev/null || fail "post-suppression escalation was not queued"
+  pass "wedge escalation is suppressed while the busy contract says working and fires once it stops"
+)
+
+# --- wedge escalation streak resets on positive progress signals (#1769) ------
+# The consecutive-escalation counter used to reset only on a pane-hash change,
+# so a healthy worker with a static pane ratcheted to demand-deep-inspection.
+# It now also resets when the task shows progress since the LAST escalation: a
+# busy-record lifecycle event (gen/seq advance) or a status-log append. The
+# busy-turn guard is exercised here because that path deliberately skips the
+# busy-contract recheck (busy-ness is the very signal it bounds), so the
+# progress reset is what protects its healthy long-runners.
+test_wedge_escalation_streak_resets_on_busy_record_advance() (
+  dir=$(make_case wedge-progress-reset); state="$dir/state"
+  window="test:fm-progress"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  ssf="$state/.stale-since-$key"
+  ewf="$state/.wedge-escalations-$key"
+  printf 'window=%s\nkind=ship\nharness=claude\n' "$window" > "$state/progress.meta"
+  printf 'working: long delegation turn\n' > "$state/progress.status"
+  gen=$("$ROOT/bin/fm-busy-event.sh" arm "$state" progress)
+  "$ROOT/bin/fm-busy-event.sh" apply "$state" progress busy --gen "$gen" \
+    --source claude-hook --event user-prompt-submit
+  FM_HOME="$dir"
+  FM_STATE_OVERRIDE="$state"
+  export FM_HOME FM_STATE_OVERRIDE
+  # shellcheck source=/dev/null
+  . "$ROOT/bin/fm-watch.sh"
+  WAKE_LOG="$dir/wakes.log"
+  : > "$WAKE_LOG"
+  # shellcheck disable=SC2329 # runtime override consumed by the sourced watcher
+  wake() { printf '%s\n' "$1" >> "$WAKE_LOG"; }
+
+  # Round 1: expired timer, no prior fingerprint -> escalates and records one.
+  echo $(( $(date +%s) - 500 )) > "$ssf"
+  wedge_timer_check "$window" "$ssf" "busy (no completed turn)" "$ewf" busy-turn
+  grep -F "escalation 1" "$WAKE_LOG" >/dev/null || fail "busy-turn round 1 did not escalate: $(cat "$WAKE_LOG")"
+  [ -s "$ewf.progress" ] || fail "escalation did not record a progress fingerprint"
+
+  # The busy record advances (a real lifecycle event landed): the next expiry
+  # resets the streak instead of escalating toward deep inspection.
+  "$ROOT/bin/fm-busy-event.sh" apply "$state" progress busy --gen "$gen" \
+    --source claude-hook --event user-prompt-submit
+  : > "$WAKE_LOG"
+  echo $(( $(date +%s) - 500 )) > "$ssf"
+  wedge_timer_check "$window" "$ssf" "busy (no completed turn)" "$ewf" busy-turn
+  [ ! -s "$WAKE_LOG" ] || fail "a busy-record advance did not suppress the next escalation: $(cat "$WAKE_LOG")"
+  [ ! -e "$ewf" ] || fail "a busy-record advance did not reset the escalation counter"
+
+  # No further progress: the following expiry escalates again, restarting at 1.
+  echo $(( $(date +%s) - 500 )) > "$ssf"
+  wedge_timer_check "$window" "$ssf" "busy (no completed turn)" "$ewf" busy-turn
+  grep -F "escalation 1" "$WAKE_LOG" >/dev/null || fail "post-progress escalation did not restart the streak at 1: $(cat "$WAKE_LOG")"
+
+  # A status-log append is the other progress signal: it resets the streak too.
+  printf 'working: still delegating, children active\n' >> "$state/progress.status"
+  : > "$WAKE_LOG"
+  echo $(( $(date +%s) - 500 )) > "$ssf"
+  wedge_timer_check "$window" "$ssf" "busy (no completed turn)" "$ewf" busy-turn
+  [ ! -s "$WAKE_LOG" ] || fail "a status-log append did not suppress the next escalation: $(cat "$WAKE_LOG")"
+  [ ! -e "$ewf" ] || fail "a status-log append did not reset the escalation counter"
+  pass "the wedge-escalation streak resets on busy-record advance and status-log append, not only pane-hash change"
+)
+
 # --- busy pane duration bound: a completed-turn age gate on top of busy -----
 # 2026-07 hibit-agent-focus-nonsteal-r1 incident: a busy pane (herdr "working"
 # and/or the harness's rendered busy footer) is unconditional, unbounded proof
@@ -1816,6 +1930,8 @@ test_terminal_stale_surfaced
 test_stale_terminal_status_overridden_by_active_run
 test_nonterminal_stale_provably_working_absorbed_then_escalated
 test_wedge_escalation_marks_demand_deep_inspection_after_threshold
+test_wedge_timer_recheck_suppresses_escalation_while_busy_contract_working
+test_wedge_escalation_streak_resets_on_busy_record_advance
 test_wedge_escalation_resets_when_pane_becomes_active
 test_busy_pane_below_turn_age_bound_is_absorbed
 test_busy_pane_stable_hash_escalates_past_turn_age_bound

@@ -30,7 +30,14 @@
 #                          also carries a "demand-deep-inspection" marker so the
 #                          wake payload itself, not just repetition, forces a
 #                          closer look instead of another routine supervision
-#                          resume. Unless afk is active. A genuinely busy pane
+#                          resume. Before any wedge escalation fires, the timer
+#                          re-consults the semantic busy contract and a cheap
+#                          per-task progress fingerprint (see wedge_timer_check),
+#                          so a worker the harness lifecycle proves mid-turn, or
+#                          one showing busy-record/status-log progress since the
+#                          last escalation, extends the timer and resets the
+#                          streak instead of escalating on elapsed time alone.
+#                          Unless afk is active. A genuinely busy pane
 #                          (window_is_busy true) is exempt from the above, but
 #                          only up to BUSY_TURN_MAX_SECS with no completed turn
 #                          (state/<id>.turn-ended, or the spawn record before any
@@ -40,7 +47,13 @@
 #                          count, and demand-deep-inspection marker, for human
 #                          inspection only - never an automatic interrupt,
 #                          signal, or restart of the worker or its tool process.
-#   check: <script>: <out> authenticated check output, always actionable
+#   check: <script>: <out> authenticated check output, always actionable. A
+#                          merged PR poll retires after its wake; a PR poll
+#                          reporting "closed" (closed without merging) wakes
+#                          with the PR URL and task named as a needs-decision
+#                          reason and stays armed until firstmate re-points or
+#                          retires the watch, so the outcome cannot be dropped
+#                          silently
 #   check: process-event result captured: <keys>
 #                          a durably captured process-to-event result is queued
 #                          and has not been surfaced yet; reported once per
@@ -267,16 +280,47 @@ recorded_windows() {
 # below).
 FM_WEDGE_DEMAND_INSPECT_COUNT=${FM_WEDGE_DEMAND_INSPECT_COUNT:-3}
 
+# wedge_progress_signature: cheap positive-progress fingerprint for a task -
+# the raw semantic busy record line (its gen/seq/ts advance on every applied
+# lifecycle event) plus the status log's size:mtime signature (a new append).
+# Read-only and bounded (one line read plus one stat); never a crew-state call.
+wedge_progress_signature() {  # <task>
+  local task=$1 rec_line='' status_sig=''
+  if [ -f "$STATE/$task.busy-state" ]; then
+    IFS= read -r rec_line < "$STATE/$task.busy-state" 2>/dev/null || rec_line=
+  fi
+  [ -n "$rec_line" ] || rec_line=none
+  status_sig=$(stat_sig "$STATE/$task.status") || status_sig=none
+  printf '%s|%s' "$rec_line" "$status_sig"
+}
+
 # Repeat-poll wedge-timer bookkeeping for an already-classified stale hash
 # absorbed as provably-working - repairs a missing/corrupt timer (self-heals a
 # watcher restart between recording the hash and recording the timer), or
-# escalates once STALE_ESCALATE_SECS have elapsed. Never re-reads the crew
-# state (the costly check already ran once, at classification time). Shared by
-# both places a hash can be absorbed this way: the plain non-terminal path,
-# and the stale_is_terminal-overridden path (a captain-relevant status-log
-# line that an active run/busy pane outranked).
-wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-file>
-  local win=$1 since_file=$2 label=$3 escalation_file=$4 since age n reason
+# escalates once STALE_ESCALATE_SECS have elapsed. Shared by both places a
+# hash can be absorbed this way (the plain non-terminal path and the
+# stale_is_terminal-overridden path - a captain-relevant status-log line that
+# an active run/busy pane outranked) plus the busy_turn_over_age bound.
+# Before an escalation fires, two cheap gates run (the costly fm-crew-state
+# read still runs only once, at classification time - it is never repeated
+# here):
+#   1. The semantic busy contract (window_is_busy over bin/fm-busy-lib.sh) is
+#      re-consulted for the stale-classified call sites: a worker whose
+#      harness lifecycle proves a turn is open NOW is not a wedge, so the
+#      timer is quietly extended and the escalation streak reset instead of
+#      waking on elapsed time alone. The busy-turn callers pass the busy-turn
+#      guard to skip this gate - a busy verdict is exactly the signal whose
+#      duration they bound (BUSY_TURN_MAX_SECS), so re-trusting it there
+#      would disable the bound.
+#   2. Both guards reset the escalation streak when the task shows a positive
+#      progress signal since the LAST escalation (a busy-record lifecycle
+#      event or a status-log append; see wedge_progress_signature), so a
+#      healthy long-running worker cannot ratchet to demand-deep-inspection
+#      by accumulating quiet periods. Only an unchanged fingerprint keeps the
+#      consecutive count growing.
+wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-file> [busy-turn]
+  local win=$1 since_file=$2 label=$3 escalation_file=$4 guard=${5:-stale}
+  local since age n reason task progress_file sig prev_sig
   since=$(cat "$since_file" 2>/dev/null || true)
   case "$since" in
     ''|*[!0-9]*)
@@ -286,8 +330,26 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
     *)
       age=$(( $(date +%s) - since ))
       if [ "$age" -ge "$STALE_ESCALATE_SECS" ]; then
+        task=$(window_to_task "$win" "$STATE")
+        progress_file="$escalation_file.progress"
+        if [ "$guard" != busy-turn ] && window_is_busy "$win" ""; then
+          date +%s > "$since_file"
+          rm -f "$escalation_file" "$progress_file"
+          triage_log "absorbed $label (busy contract says working - wedge timer extended, streak reset): $win"
+          return 0
+        fi
+        sig=$(wedge_progress_signature "$task")
+        prev_sig=$(cat "$progress_file" 2>/dev/null || true)
+        if [ -n "$prev_sig" ] && [ "$sig" != "$prev_sig" ]; then
+          date +%s > "$since_file"
+          rm -f "$escalation_file"
+          printf '%s' "$sig" > "$progress_file"
+          triage_log "absorbed $label (progress signal since last escalation - streak reset): $win"
+          return 0
+        fi
         n=$(( $(cat "$escalation_file" 2>/dev/null || echo 0) + 1 ))
         echo "$n" > "$escalation_file"
+        printf '%s' "$sig" > "$progress_file"
         reason="stale: $win (idle ${age}s, possible wedge, escalation $n)"
         if [ "$n" -ge "$FM_WEDGE_DEMAND_INSPECT_COUNT" ]; then
           reason="stale: $win (idle ${age}s, possible wedge, escalation $n, demand-deep-inspection: same pane has wedge-escalated $n times in a row - do not re-absorb on the run-step/pane state alone)"
@@ -329,7 +391,7 @@ handle_paused_stale() {  # <window> <task> <hash>
   key=$(printf '%s' "$win" | tr ':/.' '___')
   printf '%s' "$h" > "$STATE/.stale-$key"
   : > "$STATE/.paused-$key"
-  rm -f "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
+  rm -f "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key" "$STATE/.wedge-escalations-$key.progress"
   statusf="$STATE/$task.status"
   mtime=$(stat_mtime "$statusf")
   case "$mtime" in ''|*[!0-9]*) mtime=$(date +%s) ;; esac
@@ -359,7 +421,7 @@ clear_pause_tracking() {  # <window>
   key=${key//\//_}
   key=${key//./_}
   clear_pause_state "$win"
-  rm -f "$STATE/.stale-$key" "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
+  rm -f "$STATE/.stale-$key" "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key" "$STATE/.wedge-escalations-$key.progress"
 }
 
 # Reconcile a declared pause or captain-held status with authoritative crew state.
@@ -840,6 +902,16 @@ while :; do
       fi
       if [ -n "$out" ]; then
         reason="check: $c: $out"
+        if [ "$is_pr_poll" -eq 1 ] && [ "$out" = closed ]; then
+          # A PR closed without merging is a routine outcome (superseded or
+          # abandoned), but it never proves whether the work landed elsewhere,
+          # so it is surfaced as a decision naming the PR and task rather than
+          # retired like a merged result. The poll stays armed until firstmate
+          # reconciles it - re-pointing the watch at a successor PR through
+          # fm-pr-check.sh, or retiring it with the task - so the outcome
+          # re-surfaces on the check cadence instead of stranding the task.
+          reason="check: $c: closed - PR $url (task $id) closed without merging - needs decision: confirm whether the work landed elsewhere, then re-point or retire the watch"
+        fi
         fm_wake_append check "$c" "$reason" || exit 1
         if [ "$is_pr_poll" -eq 1 ] && [ "$out" = merged ]; then
           if fm_pr_poll_retirement_publish "$STATE" "$id" "$SCRIPT_DIR/fm-pr-poll.sh" "$out"; then
@@ -1059,9 +1131,9 @@ EOF
         # unless a genuinely busy pane has gone too long with no completed turn -
         # then route it through the same wedge timer instead of erasing it.
         if [ "$busy_now" -eq 0 ] && busy_turn_over_age "$task"; then
-          wedge_timer_check "$w" "$ssf" "busy (no completed turn)" "$ewf"
+          wedge_timer_check "$w" "$ssf" "busy (no completed turn)" "$ewf" busy-turn
         else
-          rm -f "$ssf" "$ewf"
+          rm -f "$ssf" "$ewf" "$ewf.progress"
         fi
         if [ -e "$pf" ] && { [ "$n" -ge 2 ] || ! status_is_paused_or_captain_held "$(last_status_line "$STATE/$(window_to_task "$w" "$STATE").status")"; }; then
           clear_pause_tracking "$w"
@@ -1071,9 +1143,9 @@ EOF
       printf '%s' "$h" > "$hf"
       echo 0 > "$cf"
       if [ "$busy_now" -eq 0 ] && busy_turn_over_age "$task"; then
-        wedge_timer_check "$w" "$ssf" "busy (no completed turn)" "$ewf"
+        wedge_timer_check "$w" "$ssf" "busy (no completed turn)" "$ewf" busy-turn
       else
-        rm -f "$ssf" "$ewf"
+        rm -f "$ssf" "$ewf" "$ewf.progress"
       fi
       task=$(window_to_task "$w" "$STATE")
       if ! afk_present && status_is_paused_or_captain_held "$(last_status_line "$STATE/$task.status")" && [ "$busy_now" -ne 0 ]; then
