@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # tests/fm-spawn-worktree-ownership.test.sh - worktree ownership and abort
-# cleanup regressions for bin/fm-spawn.sh (issues #1573, #1913, #1924).
+# cleanup regressions for bin/fm-spawn.sh (issues #1573, #1913, #1924, #1818).
 #
 # Covers, with a fake tmux/treehouse world and real isolated git worktrees:
 #   - lease-based worktree acquisition: when the fake treehouse's `get --help`
@@ -15,7 +15,9 @@
 #   - pre-metadata abort cleanup: a validation refusal or leased-worktree entry
 #     timeout kills the exact created tmux window id and returns the
 #     just-acquired lease, so a re-spawn never hits "window already exists"
-#     (#1913).
+#     (#1913);
+#   - the claude settings write: $WT/.claude/settings.local.json binds
+#     autoMemoryDirectory to the project clone's own auto-memory store (#1818).
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -281,11 +283,40 @@ SH
   pass "a leased-worktree entry timeout kills the created window and returns the lease"
 }
 
+# (e) A claude spawn's generated settings bind autoMemoryDirectory to the
+# project clone's own auto-memory store (#1818), alongside the hooks.
+test_claude_settings_bind_auto_memory() {
+  local rec id out status proj_real sanitized expected settings config_dir
+  id=own-memory-e7
+  rec=$(make_ownership_case auto-memory "$id")
+  read_ownership_record "$rec"
+  printf 'claude\n' > "$HOME_DIR/config/crew-harness"
+  config_dir="$CASE_DIR/claude-config"
+  proj_real=$(cd "$PROJ_DIR" && pwd -P)
+  sanitized=$(printf '%s' "$proj_real" | sed 's/[^a-zA-Z0-9]/-/g')
+  expected="$config_dir/projects/$sanitized/memory"
+
+  out=$(run_ownership_spawn "$id" \
+    CLAUDE_CONFIG_DIR="$config_dir" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 FM_FAKE_TREEHOUSE_WT="$WT_DIR" \
+    FM_FAKE_PANE_PATH="$WT_DIR")
+  status=$?
+  expect_code 0 "$status" "claude spawn should succeed: $out"
+  settings="$WT_DIR/.claude/settings.local.json"
+  assert_present "$settings" "claude spawn did not write hook settings"
+  assert_grep "\"autoMemoryDirectory\":\"$expected\"" "$settings" \
+    "settings did not bind autoMemoryDirectory to the project clone's store"
+  assert_grep '"hooks"' "$settings" \
+    "settings lost the hooks block alongside the auto-memory binding"
+  pass "claude settings bind autoMemoryDirectory to the project clone's auto-memory store"
+}
+
 test_lease_get_uses_task_holder
 test_fallback_without_lease_warns
 test_sibling_ownership_refusal
 test_dead_sibling_does_not_block
 test_abort_cleanup_on_validation_refusal
 test_abort_cleanup_on_entry_timeout
+test_claude_settings_bind_auto_memory
 
 echo "# all fm-spawn-worktree-ownership tests passed"

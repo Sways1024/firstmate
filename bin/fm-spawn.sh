@@ -1182,6 +1182,27 @@ json_escape() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
+# claude_auto_memory_dir <project-root-real>: the auto-memory store directory
+# Claude Code keys for the project clone (#1818). Claude keys the store by the
+# git repository root - every worktree of the clone resolves to the clone's own
+# store - at <config>/projects/<sanitized-root>/memory, sanitizing the root
+# path with [^a-zA-Z0-9] -> '-' (verified against Claude Code 2.1.226). A
+# sanitized path longer than 200 characters gains a hash suffix this script
+# cannot reproduce, so that case returns 1 and the spawn writes no binding
+# (crewmates then fall back to Claude's own implicit keying, exactly as
+# before). Making the binding explicit in the worktree's settings keeps every
+# crewmate of one project on ONE shared store even if the implicit
+# worktree-to-repo keying ever changes, and gives the captain a single place to
+# re-point a project's store.
+claude_auto_memory_dir() {  # <project-root-real>
+  local root=$1 sanitized
+  [ -n "$root" ] || return 1
+  sanitized=$(printf '%s' "$root" | sed 's/[^a-zA-Z0-9]/-/g')
+  [ -n "$sanitized" ] || return 1
+  [ "${#sanitized}" -le 200 ] || return 1
+  printf '%s/projects/%s/memory\n' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" "$sanitized"
+}
+
 resolved_existing_dir() {
   local path=$1
   [ -d "$path" ] || { echo "error: firstmate home does not exist or is not a directory: $path" >&2; return 1; }
@@ -2056,8 +2077,19 @@ if [ "$KIND" != secondmate ]; then
       j_stop=$(json_escape "touch $(shell_quote "$TURNEND"); $busy_cmd_prefix idle $busy_suffix --event stop 2>/dev/null || true")
       j_stopfail=$(json_escape "$busy_cmd_prefix idle $busy_suffix --event stop-failure 2>/dev/null || true")
       j_sessionend=$(json_escape "$busy_cmd_prefix idle $busy_suffix --event session-end 2>/dev/null || true")
+      # #1818: bind the crewmate's auto-memory to the project clone's own
+      # store (claude_auto_memory_dir above), so every crewmate of this
+      # project shares one store instead of each session depending on
+      # implicit keying. Written to settings.local.json, the scope Claude
+      # honors for autoMemoryDirectory (project-scope settings.json is
+      # ignored for it). Skipped, never guessed, when the store path is not
+      # identifiable.
+      AUTO_MEMORY_JSON=
+      if AUTO_MEMORY_DIR=$(claude_auto_memory_dir "$PROJ_ABS_REAL"); then
+        AUTO_MEMORY_JSON="\"autoMemoryDirectory\":\"$(json_escape "$AUTO_MEMORY_DIR")\","
+      fi
       cat > "$WT/.claude/settings.local.json" <<EOF
-{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"$j_submit"}]}],"Stop":[{"hooks":[{"type":"command","command":"$j_stop"}]}],"StopFailure":[{"hooks":[{"type":"command","command":"$j_stopfail"}]}],"SessionEnd":[{"hooks":[{"type":"command","command":"$j_sessionend"}]}]}}
+{$AUTO_MEMORY_JSON"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"$j_submit"}]}],"Stop":[{"hooks":[{"type":"command","command":"$j_stop"}]}],"StopFailure":[{"hooks":[{"type":"command","command":"$j_stopfail"}]}],"SessionEnd":[{"hooks":[{"type":"command","command":"$j_sessionend"}]}]}}
 EOF
       exclude_path '.claude/settings.local.json'
       ;;

@@ -368,6 +368,13 @@ test_ship_project_memory_wording() {
     "project-memory contract lost pointer-over-copy guidance"
   assert_grep "lacks \`## Maintaining this file\`, add that short self-governance section" "$brief" \
     "project-memory contract lost the self-governance add-in-same-pass rule"
+  # #1818: the auto-memory ask must exist, stay conditional on the worker's
+  # runtime actually having such a store (fm-brief takes no harness input),
+  # and carry the one-line index-entry cap.
+  assert_grep "If your agent runtime keeps a per-project auto-memory store" "$brief" \
+    "project-memory contract lost the conditional auto-memory ask"
+  assert_grep "keep each index entry to one line" "$brief" \
+    "auto-memory ask lost the one-line index-entry cap"
   pass "fm-brief.sh: ship project-memory wording carries the AGENTS.md authoring bar"
 }
 

@@ -53,7 +53,10 @@
 # learnings can be committed to AGENTS.md through the project's delivery path;
 # it carries the AGENTS.md authoring bar (widely useful knowledge only, pointers
 # over copied detail) and has the crewmate add the fm-ensure-agents-md.sh
-# self-governance section when a touched project AGENTS.md lacks it.
+# self-governance section when a touched project AGENTS.md lacks it. The same
+# section asks a worker whose runtime keeps a per-project auto-memory store to
+# record significant learnings there (conditionally worded: this script takes
+# no harness input, and only some harnesses have such a store).
 # Refuses to overwrite an existing brief.
 set -eu
 
@@ -458,6 +461,7 @@ Record only project knowledge useful to almost every future session.
 For anything the codebase already shows, prefer a pointer to the authoritative file, command, or doc over copying the detail.
 If you touch a project \`AGENTS.md\` that lacks \`## Maintaining this file\`, add that short self-governance section from \`$FM_ROOT/bin/fm-ensure-agents-md.sh\` in the same pass.
 Keep it proportionate: skip \`AGENTS.md\` edits for trivial tasks that produced no durable project knowledge.
+If your agent runtime keeps a per-project auto-memory store, it is shared across this project's crew sessions: record significant durable learnings there as you work, and keep each index entry to one line.
 
 $DOD
 EOF
