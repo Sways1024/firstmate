@@ -41,7 +41,18 @@
 # Classifier-only sources (never written into a record):
 #   endpoint-gone, herdr-native, grok-regex, muse-session-log, missing,
 #   malformed, gen-mismatch, source-mismatch, kimi-unverified,
-#   codex-unverified, capture-failed, no-target
+#   codex-unverified, capture-failed, no-target, busy-contradicted
+#
+# Staleness bound on busy records (busy-contradicted): a trusted busy record
+# that the task's own append-only status log contradicts - the log's LAST
+# line is a terminal or declared-pause event (done:/failed:/paused:) written
+# AFTER the record's ts - classifies unknown, never busy and never idle. The
+# worker itself wrote that later line, so it is direct evidence the turn the
+# record claims open has in fact settled and the record is pinned by a
+# missing close event (e.g. hook wiring that never fired for the
+# incarnation). Unknown is the only safe verdict: the contradiction proves
+# the record wrong without proving the worker idle, so consumers degrade to
+# inspection and their other signals instead of trusting either pole.
 #
 # Classification (fm_busy_classify): busy | idle | unknown | dead, always
 # with the producing source as the second token. Precedence:
@@ -203,7 +214,7 @@ fm_busy_source_trusted() {  # <harness> <source>
 }
 
 # fm_busy_record_read: parse and validate state/<id>.busy-state against the
-# armed gen. Prints "<state> <source> <event> <seq>" for a valid record.
+# armed gen. Prints "<state> <source> <event> <seq> <ts>" for a valid record.
 # Non-zero returns name the reason on stdout instead:
 #   missing      no record file (or no armed gen and no record)
 #   malformed    unparseable line, bad tokens, or a missing armed gen for an
@@ -254,7 +265,49 @@ fm_busy_record_read() {  # <state-dir> <id>
     printf 'gen-mismatch'
     return 1
   fi
-  printf '%s %s %s %s' "$r_state" "$r_source" "$r_event" "$r_seq"
+  printf '%s %s %s %s %s' "$r_state" "$r_source" "$r_event" "$r_seq" "$r_ts"
+}
+
+# Portable file mtime in epoch seconds; platform-detected, never the
+# `stat -f || stat -c` fallback form (see bin/fm-watch.sh for why).
+fm_busy_file_mtime() {  # <path>
+  if [ "$(uname)" = Darwin ]; then
+    stat -f %m "$1" 2>/dev/null
+  else
+    stat -c %Y "$1" 2>/dev/null
+  fi
+}
+
+# fm_busy_record_contradicted: 0 when a busy record is contradicted by the
+# task's own durable status log (the staleness bound documented in the header
+# above): the log was modified strictly after the record's ts AND its last
+# non-blank line's leading verb is done, failed, or the declared-pause verb.
+# The log is append-only and worker-written, so that later line outranks a
+# record whose closing event never arrived. Any read failure keeps the record
+# trusted (return 1), so this bound can only ever downgrade busy to unknown,
+# never invent a contradiction.
+fm_busy_record_contradicted() {  # <state-dir> <id> <record-ts>
+  local state=$1 id=$2 ts=$3 f line last='' verb mtime
+  f="$state/$id.status"
+  [ -f "$f" ] && [ ! -L "$f" ] || return 1
+  mtime=$(fm_busy_file_mtime "$f") || return 1
+  case "$mtime" in ''|*[!0-9]*) return 1 ;; esac
+  case "$ts" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$mtime" -gt "$ts" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      *[![:space:]]*) last=$line ;;
+    esac
+  done < "$f"
+  [ -n "$last" ] || return 1
+  verb=${last%%:*}
+  verb=${verb%%\[key=*}
+  verb=${verb#"${verb%%[![:space:]]*}"}
+  verb=${verb%"${verb##*[![:space:]]}"}
+  case "$verb" in
+    done|failed|"${FM_CLASSIFY_PAUSED_VERB:-paused}") return 0 ;;
+  esac
+  return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -567,7 +620,7 @@ fm_busy_grok_tail_busy() {
 # if available, else reports unknown capture-failed.
 fm_busy_classify() {  # <backend> <target> <harness> <id> <state-dir> [tail40]
   local backend=$1 target=$2 harness=$3 id=$4 state=$5 tail40=${6-}
-  local out rc r_state r_source native log
+  local out rc r_state r_source r_ts native log
   case "$harness" in
     kimi*)
       if ! fm_busy_kimi_verified; then
@@ -585,10 +638,17 @@ fm_busy_classify() {  # <backend> <target> <harness> <id> <state-dir> [tail40]
   out=$(fm_busy_record_read "$state" "$id") && rc=0 || rc=$?
   if [ "$rc" = 0 ]; then
     r_state=${out%% *}
+    r_ts=${out##* }
     out=${out#* }
     r_source=${out%% *}
     if fm_busy_source_trusted "$harness" "$r_source"; then
-      printf '%s %s' "$r_state" "$r_source"
+      if [ "$r_state" = busy ] && fm_busy_record_contradicted "$state" "$id" "$r_ts"; then
+        # The staleness bound (see header): a later worker-written terminal or
+        # pause line outranks a busy record whose close event never arrived.
+        printf 'unknown busy-contradicted'
+      else
+        printf '%s %s' "$r_state" "$r_source"
+      fi
     else
       printf 'unknown source-mismatch'
     fi

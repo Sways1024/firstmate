@@ -340,6 +340,62 @@ test_record_read_leaves_caller_shell_intact() {
   pass "record parsing never clobbers the caller's positional parameters, glob setting, or fields"
 }
 
+# --- staleness bound: a later terminal/pause status line contradicts busy ------
+# The #1792 shape: hook wiring never fired for an incarnation, so the busy
+# record stayed pinned at the launch turn while the worker went on to finish
+# and append done:. A busy record contradicted by a LATER worker-written
+# terminal or declared-pause status line must classify unknown busy-contradicted
+# - never busy (the record is provably stale) and never idle (the contradiction
+# does not prove idleness).
+test_busy_record_contradicted_by_later_status_is_unknown() {
+  local state gen out verb
+  state=$(new_state_dir busy-contradicted)
+  gen=$("$EV" arm "$state" t1)
+  # Pin the record at a busy state whose ts predates any status append.
+  printf 'v1 gen=%s seq=2 state=busy source=claude-hook event=user-prompt-submit ts=1\n' "$gen" \
+    > "$state/t1.busy-state"
+  for verb in 'done' failed paused; do
+    printf '%s: the worker settled this itself\n' "$verb" > "$state/t1.status"
+    out=$(fm_busy_classify tmux w1 claude t1 "$state")
+    [ "$out" = "unknown busy-contradicted" ] \
+      || fail "busy record contradicted by a later $verb: line must be 'unknown busy-contradicted', got '$out'"
+  done
+  printf 'done [key=ship]: keyed completion\n' > "$state/t1.status"
+  out=$(fm_busy_classify tmux w1 claude t1 "$state")
+  [ "$out" = "unknown busy-contradicted" ] \
+    || fail "a keyed later done: line must still contradict the busy record, got '$out'"
+  # A nonterminal working: append is not a contradiction: the turn may
+  # genuinely still be open.
+  printf 'working: still compiling\n' > "$state/t1.status"
+  out=$(fm_busy_classify tmux w1 claude t1 "$state")
+  [ "$out" = "busy claude-hook" ] \
+    || fail "a later working: line must not downgrade a busy record, got '$out'"
+  # A terminal line OLDER than the record never contradicts it: the bound only
+  # trusts lines appended after the record's own timestamp.
+  printf 'done: stale pre-turn completion\n' > "$state/t1.status"
+  printf 'v1 gen=%s seq=3 state=busy source=claude-hook event=user-prompt-submit ts=9999999999\n' "$gen" \
+    > "$state/t1.busy-state"
+  out=$(fm_busy_classify tmux w1 claude t1 "$state")
+  [ "$out" = "busy claude-hook" ] \
+    || fail "a terminal line older than the record must not contradict it, got '$out'"
+  # No status log at all leaves the record fully trusted.
+  rm -f "$state/t1.status"
+  printf 'v1 gen=%s seq=4 state=busy source=claude-hook event=user-prompt-submit ts=1\n' "$gen" \
+    > "$state/t1.busy-state"
+  out=$(fm_busy_classify tmux w1 claude t1 "$state")
+  [ "$out" = "busy claude-hook" ] \
+    || fail "a busy record with no status log must stay busy, got '$out'"
+  # The bound applies to busy records only: an idle record after a done: line
+  # is coherent, not contradicted.
+  "$EV" apply "$state" t1 idle --gen "$gen" --source claude-hook --event stop \
+    || fail "apply idle failed"
+  printf 'done: shipped\n' > "$state/t1.status"
+  out=$(fm_busy_classify tmux w1 claude t1 "$state")
+  [ "$out" = "idle claude-hook" ] \
+    || fail "the staleness bound must never touch a non-busy record, got '$out'"
+  pass "a busy record contradicted by a later done:/failed:/paused: line classifies unknown, never idle"
+}
+
 test_boolean_view_never_promotes_unknown() {
   local state gen
   state=$(new_state_dir boolean)
@@ -375,6 +431,7 @@ test_kimi_unverified_gate
 test_dead_endpoint_overrides
 test_herdr_native_busy_only
 test_record_read_leaves_caller_shell_intact
+test_busy_record_contradicted_by_later_status_is_unknown
 test_boolean_view_never_promotes_unknown
 
 echo "all fm-busy-state tests passed"
