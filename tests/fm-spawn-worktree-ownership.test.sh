@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# tests/fm-spawn-worktree-ownership.test.sh - worktree ownership regressions
-# for bin/fm-spawn.sh (issues #1573, #1924).
+# tests/fm-spawn-worktree-ownership.test.sh - worktree ownership and abort
+# cleanup regressions for bin/fm-spawn.sh (issues #1573, #1913, #1924).
 #
 # Covers, with a fake tmux/treehouse world and real isolated git worktrees:
 #   - lease-based worktree acquisition: when the fake treehouse's `get --help`
@@ -11,7 +11,11 @@
 #     the installed treehouse lacks --lease;
 #   - the sibling-ownership guard: a spawn refuses a worktree another LIVE
 #     task's state/<id>.meta already records, keeps its just-acquired lease
-#     held to shield the incumbent, and does not repair anything (#1573).
+#     held to shield the incumbent, and does not repair anything (#1573);
+#   - pre-metadata abort cleanup: a validation refusal or leased-worktree entry
+#     timeout kills the exact created tmux window id and returns the
+#     just-acquired lease, so a re-spawn never hits "window already exists"
+#     (#1913).
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -191,6 +195,8 @@ test_sibling_ownership_refusal() {
     "sibling refusal did not report keeping the acquired lease held"
   assert_no_grep "return --force $WT_DIR" "$TREEHOUSE_LOG" \
     "sibling refusal must NOT return the lease (a forced return would reset the incumbent's checkout)"
+  assert_grep "kill-window" "$TMUX_LOG" \
+    "sibling refusal did not remove the created tmux window"
   pass "a live sibling's recorded worktree is refused, unrepaired, with the shielding lease kept held"
 }
 
@@ -221,9 +227,65 @@ test_dead_sibling_does_not_block() {
   pass "a dead sibling's stale meta does not block a legitimate worktree reuse"
 }
 
+# (d) A validation refusal after the window exists kills the exact created
+# window id and returns the just-acquired lease (#1913). The leased path here
+# is a plain non-worktree directory, so validate_spawn_worktree refuses.
+test_abort_cleanup_on_validation_refusal() {
+  local rec id out status notgit
+  id=own-abort-d5
+  rec=$(make_ownership_case abort-validation "$id")
+  read_ownership_record "$rec"
+  notgit="$CASE_DIR/not-a-worktree"
+  mkdir -p "$notgit"
+
+  out=$(run_ownership_spawn "$id" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 FM_FAKE_TREEHOUSE_WT="$notgit" \
+    FM_FAKE_PANE_PATH="$notgit" FM_FAKE_WINDOW_ID=@77)
+  status=$?
+  expect_code 1 "$status" "spawn into a non-worktree leased path should refuse"
+  assert_contains "$out" "did not yield an isolated worktree" \
+    "validation refusal lost its isolation error"
+  assert_grep "kill-window @77" "$TMUX_LOG" \
+    "abort cleanup did not kill the exact created window id"
+  assert_grep "return --force $notgit" "$TREEHOUSE_LOG" \
+    "abort cleanup did not return the just-acquired lease"
+  assert_absent "$HOME_DIR/state/$id.meta" "aborted spawn must not record meta"
+  pass "a validation refusal kills the created window and returns the acquired lease"
+}
+
+# (d2) The leased-worktree entry timeout exits through the same cleanup. A fake
+# `sleep` collapses the 60-poll wait so the timeout is observable in-test.
+test_abort_cleanup_on_entry_timeout() {
+  local rec id out status
+  id=own-timeout-d6
+  rec=$(make_ownership_case abort-timeout "$id")
+  read_ownership_record "$rec"
+  cat > "$FAKEBIN_DIR/sleep" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$FAKEBIN_DIR/sleep"
+
+  out=$(run_ownership_spawn "$id" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 FM_FAKE_TREEHOUSE_WT="$WT_DIR" \
+    FM_FAKE_PANE_PATH="$PROJ_DIR" FM_FAKE_WINDOW_ID=@78)
+  status=$?
+  expect_code 1 "$status" "a pane that never enters the leased worktree should abort"
+  assert_contains "$out" "did not enter the leased worktree" \
+    "entry timeout lost its leased-worktree error"
+  assert_grep "kill-window @78" "$TMUX_LOG" \
+    "entry-timeout cleanup did not kill the exact created window id"
+  assert_grep "return --force $WT_DIR" "$TREEHOUSE_LOG" \
+    "entry-timeout cleanup did not return the just-acquired lease"
+  assert_absent "$HOME_DIR/state/$id.meta" "timed-out spawn must not record meta"
+  pass "a leased-worktree entry timeout kills the created window and returns the lease"
+}
+
 test_lease_get_uses_task_holder
 test_fallback_without_lease_warns
 test_sibling_ownership_refusal
 test_dead_sibling_does_not_block
+test_abort_cleanup_on_validation_refusal
+test_abort_cleanup_on_entry_timeout
 
 echo "# all fm-spawn-worktree-ownership tests passed"

@@ -119,9 +119,9 @@
 #   supports leases, then cd the pane into the leased path; teardown's
 #   `treehouse return --force` releases the lease. Without lease support the
 #   pane types a bare `treehouse get` as before, with a loud warning.
-#   A spawn aborting before metadata is written returns its own just-acquired
-#   lease (kept held only on the sibling-ownership refusal, to shield the
-#   incumbent).
+#   A spawn aborting after the tmux window exists but before metadata is
+#   written kills that exact window and returns its own just-acquired lease
+#   (kept held only on the sibling-ownership refusal, to shield the incumbent).
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
@@ -630,9 +630,11 @@ fi
 ORCA_ABORT_CLEANUP=0
 ORCA_WORKTREE_ID=
 ORCA_TERMINAL=
-# The treehouse lease path this script acquired (#1924), cleared once
-# state/<id>.meta is written, because from that point fm-teardown.sh owns the
-# lease.
+# Pre-metadata abort cleanup (#1913): the exact tmux window id this spawn
+# created, and the treehouse lease path this script acquired (#1924). Both are
+# cleared once state/<id>.meta is written, because from that point
+# fm-teardown.sh owns the endpoint and the lease.
+TMUX_ABORT_WINDOW=
 TREEHOUSE_LEASE_ABORT_PATH=
 HERDR_PROJECTION_ABORT_CLEANUP=0
 HERDR_PROJECTION_ABORT_SESSION=
@@ -710,12 +712,19 @@ spawn_abort_cleanup() {
       fi
     fi
   fi
-  # Release the lease this spawn itself acquired when it aborts before
-  # metadata is written, so an aborted spawn does not hold a pool slot
-  # forever. The sibling-ownership refusal deliberately clears
+  # #1913: a validation refusal or treehouse-entry timeout used to leave the
+  # just-created tmux window alive (re-spawn then failed on "window already
+  # exists" and no metadata existed for teardown to act on). Kill the exact
+  # created window id, tolerating an already-gone window; then release the
+  # lease this spawn itself acquired, so an aborted spawn does not hold a pool
+  # slot forever. The sibling-ownership refusal deliberately clears
   # TREEHOUSE_LEASE_ABORT_PATH before exiting instead (see
   # validate_spawn_worktree): returning that slot would hard-reset a live
   # task's checkout, the exact loss the refusal exists to prevent.
+  if [ -n "${TMUX_ABORT_WINDOW:-}" ]; then
+    fm_backend_tmux_kill_window_id "$TMUX_ABORT_WINDOW" || true
+    TMUX_ABORT_WINDOW=
+  fi
   if [ -n "${TREEHOUSE_LEASE_ABORT_PATH:-}" ]; then
     if ! ( cd "${PROJ_ABS:-.}" && treehouse return --force "$TREEHOUSE_LEASE_ABORT_PATH" ) >/dev/null 2>&1; then
       echo "warning: could not return leased worktree $TREEHOUSE_LEASE_ABORT_PATH during spawn abort; its lease may still be held (release with: treehouse return --force $TREEHOUSE_LEASE_ABORT_PATH)" >&2
@@ -1564,6 +1573,9 @@ case "$BACKEND" in
     # stays $T (the name form), which is safe now that rename is disabled.
     WID=$(fm_backend_tmux_create_task "$SES" "$W" "$PROJ_ABS") || exit 1
     WT_TARGET="$WID"
+    # Arm pre-metadata abort cleanup (#1913) on the exact created window id;
+    # cleared once state/<id>.meta is written and teardown owns the endpoint.
+    TMUX_ABORT_WINDOW="$WID"
     ;;
   herdr)
     # fm_backend_herdr_workspace_label resolves the target workspace from
@@ -2329,8 +2341,9 @@ META_WINDOW=$T
   fi
 } > "$STATE/$ID.meta"
 [ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
-# Metadata is published: fm-teardown.sh now owns the lease, so the abort-time
-# lease release must stand down.
+# Metadata is published: fm-teardown.sh now owns the endpoint and the lease,
+# so the pre-metadata abort cleanup (#1913) must stand down.
+TMUX_ABORT_WINDOW=
 TREEHOUSE_LEASE_ABORT_PATH=
 
 sq_brief=$(shell_quote "$BRIEF")
