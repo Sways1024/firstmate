@@ -208,6 +208,13 @@ set -u
   printf '\n'
 } >> "$TREEHOUSE_CALL_LOG"
 if [ -d "$POST_CREATE_ABORT_CONTROL" ] && [ "${1:-}" = get ]; then
+  # A lease-capable real treehouse makes fm-spawn.sh acquire the worktree
+  # itself, so the abort fixture must hand it a non-worktree path to reach the
+  # armed validation failure; the legacy pane-typed bare get stays a no-op and
+  # the fake herdr pane cwd carries the same path.
+  case "$*" in
+    *--lease*) printf '%s\n' "$POST_CREATE_ABORT_CONTROL/not-a-worktree" ;;
+  esac
   exit 0
 fi
 exec "$REAL_TREEHOUSE" "$@"

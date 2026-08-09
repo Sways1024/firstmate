@@ -319,6 +319,14 @@ fm_backend_required_tools() {  # <backend>
   esac
 }
 
+# fm_backend_treehouse_supports_lease: 0 when the installed treehouse's `get`
+# advertises durable --lease support. Single owner of the capability probe:
+# bootstrap's upgrade diagnostic and fm-spawn.sh's lease-based worktree
+# acquisition (#1924) both key off this exact check.
+fm_backend_treehouse_supports_lease() {
+  treehouse get --help 2>&1 | grep -Eq '(^|[^[:alnum:]_-])--lease([^[:alnum:]_-]|$)'
+}
+
 fm_backend_required_tool_available() {  # <backend> <tool>
   local backend=$1 tool=$2 required
   required=$(fm_backend_required_tools "$backend") || return 1

@@ -53,7 +53,10 @@
 # learnings can be committed to AGENTS.md through the project's delivery path;
 # it carries the AGENTS.md authoring bar (widely useful knowledge only, pointers
 # over copied detail) and has the crewmate add the fm-ensure-agents-md.sh
-# self-governance section when a touched project AGENTS.md lacks it.
+# self-governance section when a touched project AGENTS.md lacks it. The same
+# section asks a worker whose runtime keeps a per-project auto-memory store to
+# record significant learnings there (conditionally worded: this script takes
+# no harness input, and only some harnesses have such a store).
 # Refuses to overwrite an existing brief.
 set -eu
 
@@ -384,9 +387,9 @@ EOF
     IFS= read -r -d '' DOD <<EOF || true
 # Definition of done
 Delivery contract: mode=no-mistakes
-The task is complete only when committed on your branch.
-When you believe it is complete, append \`done: {summary}\` to the status file and stop.
-Firstmate will then instruct you to run /no-mistakes to validate and ship a PR.
+The task is complete only when the /no-mistakes pipeline has validated your committed branch and shipped a PR whose checks are green.
+When your implementation is committed on your branch, start validation yourself: invoke the no-mistakes skill (\`/no-mistakes\`, or your harness's own skill-invocation form for it) and drive the run.
+Do not stop to wait for a go-ahead, and never append \`done:\` for the implementation commit alone - the commit is a milestone, not the definition of done.
 
 You drive no-mistakes by responding to its gates, not by implementing fixes.
 Follow the guidance no-mistakes itself provides for the mechanics: it loads when you invoke /no-mistakes, and \`no-mistakes axi run --help\` plus the \`help\` lines in each \`axi\` response are authoritative and version-matched to the installed binary.
@@ -400,6 +403,7 @@ Two firstmate-specific rules layer on top of that guidance:
 - Avoid \`--yes\`: it would silently bypass firstmate's authority check and any required captain escalation.
 
 After /no-mistakes reports CI green (the CI-ready return point - do not wait for it to keep monitoring in the background until merge), append \`done: PR {url} checks green\` and stop. You are finished.
+\`done:\` always means the gate went green: when the pipeline instead parks on a finding that is not yours to answer, the rule-6 \`needs-decision:\` escalation is your only stop, and you resume the same run once firstmate's decision lands.
 EOF
     ;;
 esac
@@ -458,6 +462,7 @@ Record only project knowledge useful to almost every future session.
 For anything the codebase already shows, prefer a pointer to the authoritative file, command, or doc over copying the detail.
 If you touch a project \`AGENTS.md\` that lacks \`## Maintaining this file\`, add that short self-governance section from \`$FM_ROOT/bin/fm-ensure-agents-md.sh\` in the same pass.
 Keep it proportionate: skip \`AGENTS.md\` edits for trivial tasks that produced no durable project knowledge.
+If your agent runtime keeps a per-project auto-memory store, it is shared across this project's crew sessions: record significant durable learnings there as you work, and keep each index entry to one line.
 
 $DOD
 EOF

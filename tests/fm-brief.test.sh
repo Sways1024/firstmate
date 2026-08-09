@@ -256,7 +256,7 @@ test_ship_mode_is_explicit_not_registry() {
   brief="$home/data/brief-explicit-a5/brief.md"
   grep -qx "Delivery contract: mode=no-mistakes" "$brief" \
     || fail "registered direct-PR posture overrode the explicit --mode"
-  assert_grep "Firstmate will then instruct you to run /no-mistakes" "$brief" \
+  assert_grep "start validation yourself" "$brief" \
     "explicit no-mistakes brief did not render the pipeline definition of done"
 
   # An unregistered project is not a blocker either, because nothing is looked up.
@@ -354,6 +354,40 @@ test_no_mistakes_dod_wording() {
   pass "fm-brief.sh: no-mistakes DOD keeps its apostrophe prose, now parse-safe"
 }
 
+# The no-mistakes DOD must have the implementation worker start the validation
+# gate itself after its implementation commit, and reserve done: for the green
+# gate (or needs-decision: for a parked finding), instead of stopping at the
+# commit to wait for a firstmate instruction - the stop-and-wait wording cost
+# one supervision round trip per ship and parked unattended ships at done:
+# with no PR.
+test_no_mistakes_dod_worker_self_validates() {
+  local home id brief
+  home="$TMP_ROOT/self-validate-home"
+  mkdir -p "$home/data"
+  id="brief-selfvalidate-b2"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --mode no-mistakes >/dev/null 2>&1
+  brief="$home/data/$id/brief.md"
+  assert_present "$brief" "brief was not scaffolded"
+  assert_grep "start validation yourself" "$brief" \
+    "no-mistakes DOD does not have the worker start its own validation"
+  assert_grep "or your harness's own skill-invocation form" "$brief" \
+    "no-mistakes DOD hardcodes one harness invocation syntax with no neutral form"
+  assert_grep "never append \`done:\` for the implementation commit alone" "$brief" \
+    "no-mistakes DOD does not forbid a pre-validation done: report"
+  assert_grep "append \`done: PR {url} checks green\` and stop" "$brief" \
+    "no-mistakes DOD lost the CI-green terminal done: gate"
+  # shellcheck disable=SC2016  # single quotes are deliberate: the backticks must stay literal
+  assert_grep '`done:` always means the gate went green' "$brief" \
+    "no-mistakes DOD does not bind done: to the green gate"
+  assert_grep "\`needs-decision:\` escalation is your only stop" "$brief" \
+    "no-mistakes DOD does not route a parked finding to needs-decision:"
+  assert_no_grep "Firstmate will then instruct you to run /no-mistakes" "$brief" \
+    "no-mistakes DOD still parks the worker to wait for a firstmate validation instruction"
+  assert_no_grep "The task is complete only when committed on your branch." "$brief" \
+    "no-mistakes DOD still declares the bare implementation commit complete"
+  pass "fm-brief.sh: the no-mistakes DOD has the worker run the gate itself and reserves done: for a green gate"
+}
+
 test_ship_project_memory_wording() {
   local home id brief
   home="$TMP_ROOT/project-memory-home"
@@ -368,6 +402,13 @@ test_ship_project_memory_wording() {
     "project-memory contract lost pointer-over-copy guidance"
   assert_grep "lacks \`## Maintaining this file\`, add that short self-governance section" "$brief" \
     "project-memory contract lost the self-governance add-in-same-pass rule"
+  # #1818: the auto-memory ask must exist, stay conditional on the worker's
+  # runtime actually having such a store (fm-brief takes no harness input),
+  # and carry the one-line index-entry cap.
+  assert_grep "If your agent runtime keeps a per-project auto-memory store" "$brief" \
+    "project-memory contract lost the conditional auto-memory ask"
+  assert_grep "keep each index entry to one line" "$brief" \
+    "auto-memory ask lost the one-line index-entry cap"
   pass "fm-brief.sh: ship project-memory wording carries the AGENTS.md authoring bar"
 }
 
@@ -719,6 +760,7 @@ test_ship_mode_is_explicit_not_registry
 test_delivery_flags_are_refused_where_they_do_not_apply
 test_faster_paths_use_configured_authority_without_stacked_review
 test_no_mistakes_dod_wording
+test_no_mistakes_dod_worker_self_validates
 test_ship_project_memory_wording
 test_herdr_lab_contract_is_explicit_and_complete
 test_herdr_lab_contract_quotes_foreign_firstmate_path

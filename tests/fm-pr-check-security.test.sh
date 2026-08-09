@@ -714,17 +714,19 @@ test_static_poll_contract() {
   dir=$(make_case poll-contract)
   make_poll_fixture "$dir"
 
-  for state in OPEN CLOSED EMPTY MALFORMED; do
+  for state in OPEN EMPTY MALFORMED; do
     case "$state" in
       EMPTY) value= ;;
       MALFORMED) value='not-a-state' ;;
       *) value=$state ;;
     esac
     out=$(FM_TEST_GH_STATE="$value" run_poll "$dir")
-    [ -z "$out" ] || fail "static poll emitted for non-merged state"
+    [ -z "$out" ] || fail "static poll emitted for a non-terminal state"
   done
   out=$(FM_TEST_GH_STATE=MERGED run_poll "$dir")
   [ "$out" = merged ] || fail "static poll did not emit exactly one merged line"
+  out=$(FM_TEST_GH_STATE=CLOSED run_poll "$dir")
+  [ "$out" = closed ] || fail "static poll did not emit exactly one closed line for a closed unmerged PR"
   out=$(FM_TEST_GH_FAIL=1 run_poll "$dir")
   [ -z "$out" ] || fail "static poll emitted after gh failure"
 
@@ -2803,14 +2805,17 @@ gitlab.example
 group/subgroup/project
 7" ] || fail "published GitLab sidecar bytes were not exact"
 
-  # Only an exact merged state wakes firstmate. Every other reading, including
-  # an unreadable merge request and a changed output format, stays silent.
-  for value in opened closed locked '' not-a-state MERGED merged-but-not; do
+  # Only an exact merged or closed (closed-without-merge) state wakes
+  # firstmate. Every other reading, including an unreadable merge request and
+  # a changed output format, stays silent.
+  for value in opened locked '' not-a-state MERGED CLOSED merged-but-not closed-but-not; do
     out=$(FM_TEST_GLAB_STATE="$value" run_poll "$dir")
-    [ -z "$out" ] || fail "GitLab poll emitted for a non-merged state"
+    [ -z "$out" ] || fail "GitLab poll emitted for a non-terminal state"
   done
   out=$(FM_TEST_GLAB_STATE=merged run_poll "$dir")
   [ "$out" = merged ] || fail "GitLab poll did not emit exactly one merged line"
+  out=$(FM_TEST_GLAB_STATE=closed run_poll "$dir")
+  [ "$out" = closed ] || fail "GitLab poll did not emit exactly one closed line for a closed unmerged MR"
   out=$(FM_TEST_GLAB_FAIL=1 run_poll "$dir")
   [ -z "$out" ] || fail "GitLab poll emitted after a glab failure"
 
@@ -2966,6 +2971,70 @@ test_merged_poll_retires_once() {
   [ "$(grep -c $'\tcheck\t.*task-a.check.sh\t' "$state/.wake-queue" 2>/dev/null || true)" -eq 1 ] \
     || fail "merged poll did not queue exactly one terminal notification"
   pass "validated merged polls notify once and retire before the next watcher cycle"
+}
+
+# A PR closed WITHOUT merging (#1897): the poll must report it, and the watcher
+# must convert it into an actionable needs-decision wake naming the PR and the
+# task rather than a silent retirement - a closed PR never proves whether the
+# work landed elsewhere, so only firstmate may reconcile and retire the watch.
+test_closed_poll_wakes_actionably_and_stays_armed() {
+  local dir state rc first
+  dir=$(make_case closed-needs-decision)
+  state="$dir/home/state"
+  write_poll_meta "$state" task-a https://github.com/o/r/pull/1
+  seed_canonical_poll "$dir" task-a https://github.com/o/r/pull/1
+
+  set +e
+  FM_TEST_GH_STATE=CLOSED run_watcher_bounded "$dir/home" "$dir/fakebin" > "$dir/watch-1.out" 2> "$dir/watch-1.err"
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || fail "closed poll watcher failed: $(cat "$dir/watch-1.err")"
+  first=$(cat "$dir/watch-1.out")
+  case "$first" in check:*task-a.check.sh:*closed*) ;; *) fail "closed poll did not wake through the check path: $first" ;; esac
+  grep -F "PR https://github.com/o/r/pull/1 (task task-a) closed without merging" "$dir/watch-1.out" >/dev/null \
+    || fail "closed wake did not name the PR and task: $first"
+  grep -F "needs decision" "$dir/watch-1.out" >/dev/null \
+    || fail "closed wake was not phrased as a decision: $first"
+  grep -F "closed without merging" "$state/.wake-queue" >/dev/null \
+    || fail "closed wake was not queued durably"
+  # No silent retirement: the armed poll artifacts survive intact and no
+  # retirement receipt appears, so the decision re-surfaces until firstmate
+  # re-points or retires the watch.
+  fm_pr_poll_artifacts_valid "$state" task-a "$POLL" \
+    || fail "closed outcome disturbed the armed poll artifacts"
+  [ ! -e "$state/task-a.pr-poll-retirement" ] && [ ! -L "$state/task-a.pr-poll-retirement" ] \
+    || fail "closed outcome published a retirement receipt"
+
+  rm -f "$state/.last-check"
+  set +e
+  FM_TEST_GH_STATE=CLOSED run_watcher_bounded "$dir/home" "$dir/fakebin" > "$dir/watch-2.out" 2> "$dir/watch-2.err"
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || fail "second closed watcher cycle failed: $(cat "$dir/watch-2.err")"
+  grep -F "closed without merging" "$dir/watch-2.out" >/dev/null \
+    || fail "closed poll went silent on the next cycle instead of re-surfacing the decision"
+  pass "a closed unmerged PR wakes as an actionable decision naming the PR and task, and the poll stays armed"
+}
+
+# The GitLab closed-without-merge state routes through the identical consumer
+# branch, so the wake names the MR URL and task the same way.
+test_gitlab_closed_poll_wakes_actionably() {
+  local dir state url rc
+  dir=$(make_case gitlab-closed-needs-decision)
+  state="$dir/home/state"
+  url=https://gitlab.example/group/subgroup/project/-/merge_requests/17
+  write_poll_meta "$state" task-a "$url"
+  seed_canonical_poll "$dir" task-a "$url"
+  set +e
+  FM_TEST_GLAB_STATE=closed run_watcher_bounded "$dir/home" "$dir/fakebin" > "$dir/watch.out" 2> "$dir/watch.err"
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || fail "GitLab closed watcher failed: $(cat "$dir/watch.err")"
+  grep -F "PR $url (task task-a) closed without merging" "$dir/watch.out" >/dev/null \
+    || fail "GitLab closed wake did not name the MR and task: $(cat "$dir/watch.out")"
+  fm_pr_poll_artifacts_valid "$state" task-a "$POLL" \
+    || fail "GitLab closed outcome disturbed the armed poll artifacts"
+  pass "a GitLab MR closed without merging produces the same actionable decision wake"
 }
 
 test_persistent_secondmate_retirement_is_poll_only() {
@@ -3150,7 +3219,20 @@ test_external_merge_transition_retires_only_terminal_poll() {
     rc=$?
     set -e
     [ "$rc" -eq 0 ] || fail "$label watcher cycle failed: $(cat "$dir/$label.err")"
-    case "$(cat "$dir/$label.out")" in check:*z-stop.check.sh:*stop-cycle) ;; *) fail "$label did not reach the control check" ;; esac
+    case "$label" in
+      closed-unmerged)
+        # A closed unmerged PR is a terminal observation that now wakes as an
+        # actionable decision (so the cycle exits on the poll's own wake before
+        # reaching the control check), but it never retires the armed poll.
+        case "$(cat "$dir/$label.out")" in
+          check:*task-a.check.sh:*closed*"closed without merging"*) ;;
+          *) fail "$label did not wake as a closed-without-merging decision: $(cat "$dir/$label.out")" ;;
+        esac
+        ;;
+      *)
+        case "$(cat "$dir/$label.out")" in check:*z-stop.check.sh:*stop-cycle) ;; *) fail "$label did not reach the control check" ;; esac
+        ;;
+    esac
     [ "$(poll_artifact_snapshot "$state" task-a)" = "$before" ] || fail "$label changed the armed poll"
   done
 
@@ -3162,7 +3244,7 @@ test_external_merge_transition_retires_only_terminal_poll() {
   [ "$rc" -eq 0 ] || fail "external merged transition failed: $(cat "$dir/merged.err")"
   case "$(cat "$dir/merged.out")" in check:*task-a.check.sh:*merged) ;; *) fail "external merge did not preserve its notification" ;; esac
   assert_poll_absent "$state" task-a
-  pass "open/red, closed-unmerged, malformed, and forge errors remain armed until an exact merged transition"
+  pass "open/red, closed-unmerged (waking as a decision), malformed, and forge errors remain armed until an exact merged transition"
 }
 
 test_retirement_refuses_replacement_and_nonterminal_results() {
@@ -3328,6 +3410,8 @@ test_gitlab_merged_poll_retires() {
 test_parser_matrix
 test_gitlab_merge_watch
 test_merged_poll_retires_once
+test_closed_poll_wakes_actionably_and_stays_armed
+test_gitlab_closed_poll_wakes_actionably
 test_persistent_secondmate_retirement_is_poll_only
 test_retirement_crash_recovery
 test_external_merge_transition_retires_only_terminal_poll

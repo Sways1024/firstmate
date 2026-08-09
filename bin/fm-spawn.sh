@@ -111,7 +111,17 @@
 #   Before a secondmate launch, the home is locally fast-forwarded to the primary
 #   default-branch commit when safe; skipped syncs warn and launch unchanged.
 #   Ship/scout spawns refuse to launch unless the resolved task path is a real
-#   git worktree root distinct from the primary project checkout.
+#   git worktree root distinct from the primary project checkout, and refuse a
+#   path another live task's state/<id>.meta already records as its worktree
+#   (endpoint liveness decides; only a dead/missing endpoint frees the slot).
+#   Non-orca ship/scout spawns acquire that worktree from this script via
+#   `treehouse get --lease --lease-holder fm-<id>` when the installed treehouse
+#   supports leases, then cd the pane into the leased path; teardown's
+#   `treehouse return --force` releases the lease. Without lease support the
+#   pane types a bare `treehouse get` as before, with a loud warning.
+#   A spawn aborting after the tmux window exists but before metadata is
+#   written kills that exact window and returns its own just-acquired lease
+#   (kept held only on the sibling-ownership refusal, to shield the incumbent).
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
@@ -620,6 +630,12 @@ fi
 ORCA_ABORT_CLEANUP=0
 ORCA_WORKTREE_ID=
 ORCA_TERMINAL=
+# Pre-metadata abort cleanup (#1913): the exact tmux window id this spawn
+# created, and the treehouse lease path this script acquired (#1924). Both are
+# cleared once state/<id>.meta is written, because from that point
+# fm-teardown.sh owns the endpoint and the lease.
+TMUX_ABORT_WINDOW=
+TREEHOUSE_LEASE_ABORT_PATH=
 HERDR_PROJECTION_ABORT_CLEANUP=0
 HERDR_PROJECTION_ABORT_SESSION=
 HERDR_PROJECTION_ABORT_TASK_PANE=
@@ -695,6 +711,25 @@ spawn_abort_cleanup() {
         fi
       fi
     fi
+  fi
+  # #1913: a validation refusal or treehouse-entry timeout used to leave the
+  # just-created tmux window alive (re-spawn then failed on "window already
+  # exists" and no metadata existed for teardown to act on). Kill the exact
+  # created window id, tolerating an already-gone window; then release the
+  # lease this spawn itself acquired, so an aborted spawn does not hold a pool
+  # slot forever. The sibling-ownership refusal deliberately clears
+  # TREEHOUSE_LEASE_ABORT_PATH before exiting instead (see
+  # validate_spawn_worktree): returning that slot would hard-reset a live
+  # task's checkout, the exact loss the refusal exists to prevent.
+  if [ -n "${TMUX_ABORT_WINDOW:-}" ]; then
+    fm_backend_tmux_kill_window_id "$TMUX_ABORT_WINDOW" || true
+    TMUX_ABORT_WINDOW=
+  fi
+  if [ -n "${TREEHOUSE_LEASE_ABORT_PATH:-}" ]; then
+    if ! ( cd "${PROJ_ABS:-.}" && treehouse return --force "$TREEHOUSE_LEASE_ABORT_PATH" ) >/dev/null 2>&1; then
+      echo "warning: could not return leased worktree $TREEHOUSE_LEASE_ABORT_PATH during spawn abort; its lease may still be held (release with: treehouse return --force $TREEHOUSE_LEASE_ABORT_PATH)" >&2
+    fi
+    TREEHOUSE_LEASE_ABORT_PATH=
   fi
   if [ "$SPAWN_TASK_LOCK_HELD" = 1 ]; then
     SPAWN_TASK_LOCK_HELD=0
@@ -1147,6 +1182,27 @@ json_escape() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
+# claude_auto_memory_dir <project-root-real>: the auto-memory store directory
+# Claude Code keys for the project clone (#1818). Claude keys the store by the
+# git repository root - every worktree of the clone resolves to the clone's own
+# store - at <config>/projects/<sanitized-root>/memory, sanitizing the root
+# path with [^a-zA-Z0-9] -> '-' (verified against Claude Code 2.1.226). A
+# sanitized path longer than 200 characters gains a hash suffix this script
+# cannot reproduce, so that case returns 1 and the spawn writes no binding
+# (crewmates then fall back to Claude's own implicit keying, exactly as
+# before). Making the binding explicit in the worktree's settings keeps every
+# crewmate of one project on ONE shared store even if the implicit
+# worktree-to-repo keying ever changes, and gives the captain a single place to
+# re-point a project's store.
+claude_auto_memory_dir() {  # <project-root-real>
+  local root=$1 sanitized
+  [ -n "$root" ] || return 1
+  sanitized=$(printf '%s' "$root" | sed 's/[^a-zA-Z0-9]/-/g')
+  [ -n "$sanitized" ] || return 1
+  [ "${#sanitized}" -le 200 ] || return 1
+  printf '%s/projects/%s/memory\n' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" "$sanitized"
+}
+
 resolved_existing_dir() {
   local path=$1
   [ -d "$path" ] || { echo "error: firstmate home does not exist or is not a directory: $path" >&2; return 1; }
@@ -1397,6 +1453,7 @@ real_path_or_raw() {  # <path>
 # per-backend routing (fm_backend_resolve_selector).
 validate_spawn_worktree() {  # <source> <inspect-target>
   local source=$1 inspect_target=$2 wt_real proj_real wt_top wt_top_real
+  local sibling_meta sibling_id sibling_wt sibling_target sibling_alive
   wt_real=
   if ! wt_real=$(cd "$WT" 2>/dev/null && pwd -P); then
     wt_real=
@@ -1411,6 +1468,41 @@ validate_spawn_worktree() {  # <source> <inspect-target>
     echo "error: $source did not yield an isolated worktree (resolved '$WT'; worktree root '${wt_top:-none}'; primary '$PROJ_ABS'); refusing to launch to avoid tangling the primary checkout. Inspect target $inspect_target" >&2
     exit 1
   fi
+  # Sibling-ownership guard (#1573): the pool can hand this spawn a slot that
+  # another LIVE task in this home still records as its own worktree (an idle
+  # incumbent has no process cwd'd there, so process-presence pools misread the
+  # slot as free - #1924). The home already holds the evidence in
+  # state/<id>.meta, so refuse - never repair, relocate, or clean - when the
+  # resolved path is a live sibling's recorded worktree. Liveness comes from
+  # the same endpoint probe supervision uses (fm_backend_agent_alive): only a
+  # confidently dead or missing endpoint frees the slot for reuse, so a stale
+  # meta cannot block a legitimate spawn while an unreadable or unclassifiable
+  # endpoint still fails closed.
+  for sibling_meta in "$STATE"/*.meta; do
+    [ -e "$sibling_meta" ] || continue
+    sibling_id=$(basename "$sibling_meta" .meta)
+    [ "$sibling_id" != "$ID" ] || continue
+    sibling_wt=$(fm_meta_get "$sibling_meta" worktree)
+    [ -n "$sibling_wt" ] || continue
+    [ "$(real_path_or_raw "$sibling_wt")" = "$wt_real" ] || continue
+    sibling_target=$(fm_backend_target_of_meta "$sibling_meta")
+    sibling_alive=unknown
+    if [ -n "$sibling_target" ]; then
+      sibling_alive=$(fm_backend_agent_alive "$(fm_backend_of_meta "$sibling_meta")" "$sibling_target" 2>/dev/null) || sibling_alive=unknown
+    fi
+    if [ "$sibling_alive" != dead ]; then
+      # Keep the just-acquired lease held under fm-<id> rather than returning
+      # it: `treehouse return --force` hard-resets the slot, which is the
+      # incumbent's checkout - the exact loss this refusal prevents. Held, the
+      # lease also shields the incumbent from the pool re-issuing its slot.
+      if [ -n "$TREEHOUSE_LEASE_ABORT_PATH" ]; then
+        echo "note: the lease this spawn acquired on $TREEHOUSE_LEASE_ABORT_PATH is left held (holder fm-$ID) to shield the incumbent's checkout; release it with 'treehouse return $TREEHOUSE_LEASE_ABORT_PATH' once ownership is reconciled" >&2
+        TREEHOUSE_LEASE_ABORT_PATH=
+      fi
+      echo "error: $source resolved '$WT', which live task $sibling_id already records as its worktree (endpoint ${sibling_target:-unrecorded} is $sibling_alive); refusing to launch $ID into a sibling task's checkout. Inspect target $inspect_target" >&2
+      exit 1
+    fi
+  done
 }
 
 herdr_projection_meta_field_exact() {  # <meta> <key>
@@ -1502,6 +1594,9 @@ case "$BACKEND" in
     # stays $T (the name form), which is safe now that rename is disabled.
     WID=$(fm_backend_tmux_create_task "$SES" "$W" "$PROJ_ABS") || exit 1
     WT_TARGET="$WID"
+    # Arm pre-metadata abort cleanup (#1913) on the exact created window id;
+    # cleared once state/<id>.meta is written and teardown owns the endpoint.
+    TMUX_ABORT_WINDOW="$WID"
     ;;
   herdr)
     # fm_backend_herdr_workspace_label resolves the target workspace from
@@ -1819,9 +1914,37 @@ kimi_spawn_fail() {  # <detail>
 }
 
 if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
-  spawn_send_text_line "$WT_TARGET" 'treehouse get'
+  # Worktree acquisition (#1573/#1924): prefer a durable lease acquired by THIS
+  # script, so the pool records the owner (holder fm-<id>) and never re-issues
+  # the slot to a later get while the task is live but momentarily processless
+  # (an idle agent between commands has no process cwd'd in its worktree, which
+  # is exactly how a bare pane-typed `treehouse get` lost slots to later
+  # spawns). The pane then just cd's into the leased path; teardown's existing
+  # `treehouse return --force` releases the lease with the worktree. A
+  # treehouse without --lease support falls back to the historical bare
+  # `treehouse get` typed into the pane, loudly, so the captain knows the pool
+  # still cannot record ownership until treehouse is upgraded.
+  SPAWN_LEASED_WT=
+  if fm_backend_treehouse_supports_lease; then
+    SPAWN_LEASED_WT=$( cd "$PROJ_ABS" && treehouse get --lease --lease-holder "fm-$ID" ) || {
+      echo "error: treehouse get --lease failed to lease a task worktree for $ID; inspect window $T" >&2
+      exit 1
+    }
+    if [ -z "$SPAWN_LEASED_WT" ]; then
+      echo "error: treehouse get --lease did not report a task worktree for $ID; inspect window $T" >&2
+      exit 1
+    fi
+    TREEHOUSE_LEASE_ABORT_PATH=$SPAWN_LEASED_WT
+    WT=$SPAWN_LEASED_WT
+    spawn_send_text_line "$WT_TARGET" "cd $(shell_quote "$SPAWN_LEASED_WT")"
+  else
+    echo "warning: installed treehouse lacks --lease; falling back to an unleased 'treehouse get' typed into the pane, so the pool cannot record this task as its slot's owner (#1924) - upgrade treehouse" >&2
+    spawn_send_text_line "$WT_TARGET" 'treehouse get'
+  fi
 
-  # Wait for the treehouse subshell: the pane's cwd moves from the project to the worktree.
+  # Wait for the pane to enter the worktree: on the lease path its cwd must
+  # settle on the exact leased path just sent; on the fallback path the
+  # treehouse subshell moves it from the project to a pool worktree.
   # Target the stable window id, not the name: if the name is ever lost (e.g. an
   # automatic-rename slips through), display-message -t <bad-name> falls back to the
   # active client's window, which would misread firstmate's OWN pane path as the
@@ -1841,14 +1964,21 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   # a mismatch just becomes the new candidate rather than resetting the wait, so a
   # pane that is already settled by the first real read only costs the one existing
   # inter-poll sleep as confirmation, not a whole extra cycle on top.
+  SPAWN_EXPECTED_WT_REAL=
+  [ -z "$SPAWN_LEASED_WT" ] || SPAWN_EXPECTED_WT_REAL=$(real_path_or_raw "$SPAWN_LEASED_WT")
   candidate=""
+  SPAWN_PANE_ENTERED=0
   for _ in $(seq 1 60); do
     p=$(spawn_current_path "$WT_TARGET" || true)
     if [ -n "$p" ]; then
       p_real=$(real_path_or_raw "$p")
-      if [ "$p_real" != "$PROJ_ABS_REAL" ]; then
+      if { [ -n "$SPAWN_EXPECTED_WT_REAL" ] && [ "$p_real" = "$SPAWN_EXPECTED_WT_REAL" ]; } \
+         || { [ -z "$SPAWN_EXPECTED_WT_REAL" ] && [ "$p_real" != "$PROJ_ABS_REAL" ]; }; then
         if [ -n "$candidate" ] && [ "$p_real" = "$candidate" ]; then
-          WT="$p"
+          # The fallback path learns the worktree from the settled pane; the
+          # lease path already knows it and only needed the entry confirmed.
+          [ -n "$SPAWN_LEASED_WT" ] || WT="$p"
+          SPAWN_PANE_ENTERED=1
           break
         fi
         candidate="$p_real"
@@ -1860,8 +1990,12 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
     fi
     sleep 1
   done
-  if [ -z "$WT" ]; then
-    echo "error: treehouse get did not enter a worktree within 60s; inspect window $T" >&2
+  if [ "$SPAWN_PANE_ENTERED" -ne 1 ]; then
+    if [ -n "$SPAWN_LEASED_WT" ]; then
+      echo "error: the pane did not enter the leased worktree $SPAWN_LEASED_WT within 60s; inspect window $T" >&2
+    else
+      echo "error: treehouse get did not enter a worktree within 60s; inspect window $T" >&2
+    fi
     exit 1
   fi
 
@@ -1943,8 +2077,19 @@ if [ "$KIND" != secondmate ]; then
       j_stop=$(json_escape "touch $(shell_quote "$TURNEND"); $busy_cmd_prefix idle $busy_suffix --event stop 2>/dev/null || true")
       j_stopfail=$(json_escape "$busy_cmd_prefix idle $busy_suffix --event stop-failure 2>/dev/null || true")
       j_sessionend=$(json_escape "$busy_cmd_prefix idle $busy_suffix --event session-end 2>/dev/null || true")
+      # #1818: bind the crewmate's auto-memory to the project clone's own
+      # store (claude_auto_memory_dir above), so every crewmate of this
+      # project shares one store instead of each session depending on
+      # implicit keying. Written to settings.local.json, the scope Claude
+      # honors for autoMemoryDirectory (project-scope settings.json is
+      # ignored for it). Skipped, never guessed, when the store path is not
+      # identifiable.
+      AUTO_MEMORY_JSON=
+      if AUTO_MEMORY_DIR=$(claude_auto_memory_dir "$PROJ_ABS_REAL"); then
+        AUTO_MEMORY_JSON="\"autoMemoryDirectory\":\"$(json_escape "$AUTO_MEMORY_DIR")\","
+      fi
       cat > "$WT/.claude/settings.local.json" <<EOF
-{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"$j_submit"}]}],"Stop":[{"hooks":[{"type":"command","command":"$j_stop"}]}],"StopFailure":[{"hooks":[{"type":"command","command":"$j_stopfail"}]}],"SessionEnd":[{"hooks":[{"type":"command","command":"$j_sessionend"}]}]}}
+{$AUTO_MEMORY_JSON"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"$j_submit"}]}],"Stop":[{"hooks":[{"type":"command","command":"$j_stop"}]}],"StopFailure":[{"hooks":[{"type":"command","command":"$j_stopfail"}]}],"SessionEnd":[{"hooks":[{"type":"command","command":"$j_sessionend"}]}]}}
 EOF
       exclude_path '.claude/settings.local.json'
       ;;
@@ -2228,6 +2373,10 @@ META_WINDOW=$T
   fi
 } > "$STATE/$ID.meta"
 [ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
+# Metadata is published: fm-teardown.sh now owns the endpoint and the lease,
+# so the pre-metadata abort cleanup (#1913) must stand down.
+TMUX_ABORT_WINDOW=
+TREEHOUSE_LEASE_ABORT_PATH=
 
 sq_brief=$(shell_quote "$BRIEF")
 sq_turnend=$(shell_quote "$TURNEND")
