@@ -2174,6 +2174,54 @@ test_endpoint_confirmed_gone_gates_on_structured_presence() {
   pass "endpoint confirmed-gone: only structured not-found permits record removal and ambiguous identity refuses"
 }
 
+test_home_workspace_record_disambiguates_a_label_collision() {
+  local dir out
+  dir="$TMP_ROOT/home-ws-record"; mkdir -p "$dir/state"
+  out=$(FM_STATE_OVERRIDE="$dir/state" bash -c '
+    . "$0/bin/backends/herdr.sh"
+    record="$1/.herdr-home-workspace"
+    # Herdr labels a workspace from its cwd basename, so a captain working in a
+    # directory named firstmate owns a workspace carrying this home container
+    # label. Two matches is the shape that refuses spawns outright by label.
+    # Deliberately NOT named `list`: bash is dynamically scoped, so a stub
+    # referencing $list would resolve to the callee own `local list`.
+    WSLIST="{\"result\":{\"workspaces\":[{\"workspace_id\":\"w5\",\"label\":\"firstmate\"},{\"workspace_id\":\"w9\",\"label\":\"firstmate\"}]}}"
+    check() {  # <label> <expected>
+      got=$(fm_backend_herdr_home_workspace_recorded_in fmtest "$WSLIST" || printf "(none)")
+      [ "$got" = "$2" ] || printf "MISMATCH %s: got=%s expected=%s\n" "$1" "$got" "$2"
+    }
+    rm -f "$record"
+    check no-record "(none)"
+    printf "fmtest\tw9\n" > "$record"
+    check exact-record w9
+    printf "othersession\tw9\n" > "$record"
+    check foreign-session "(none)"
+    printf "fmtest\tw404\n" > "$record"
+    check vanished-workspace "(none)"
+    printf "fmtest\n" > "$record"
+    check malformed "(none)"
+    # An empty snapshot can never validate a record.
+    printf "fmtest\tw9\n" > "$record"
+    got=$(fm_backend_herdr_home_workspace_recorded_in fmtest "" || printf "(none)")
+    [ "$got" = "(none)" ] || printf "MISMATCH empty-list: got=%s\n" "$got"
+    # The record wins over the ambiguous label match, so the collision that
+    # would otherwise refuse a spawn resolves to this home own container.
+    fm_backend_herdr_cli() { printf "%s" "$WSLIST"; }
+    FM_BACKEND_HERDR_WS_ID=""; FM_BACKEND_HERDR_WS_SEEDED_TAB_ID=""
+    got=$(fm_backend_herdr_workspace_ensure_by_label fmtest /tmp 2>/dev/null)
+    [ "$got" = w9 ] || printf "MISMATCH ensure-prefers-record: got=%s\n" "$got"
+    [ -z "$FM_BACKEND_HERDR_WS_SEEDED_TAB_ID" ] \
+      || printf "MISMATCH recorded-container-must-look-adopted: seeded=%s\n" "$FM_BACKEND_HERDR_WS_SEEDED_TAB_ID"
+    # Without the record the historical ambiguity refusal still stands.
+    rm -f "$record"
+    rc=0
+    fm_backend_herdr_workspace_ensure_by_label fmtest /tmp >/dev/null 2>&1 || rc=$?
+    [ "$rc" = 3 ] || printf "MISMATCH ambiguity-refusal-without-record: rc=%s expected=3\n" "$rc"
+  ' "$ROOT" "$dir/state" 2>&1)
+  [ -z "$out" ] || fail "home workspace record matrix mismatch: $out"
+  pass "home workspace record: an exact recorded container beats a colliding label, and no record keeps the ambiguity refusal"
+}
+
 test_pane_foreground_takeover_only_on_positive_evidence() {
   local out
   out=$(bash -c '
@@ -4337,6 +4385,7 @@ test_kill_emptying_non_focused_uses_pane_death
 test_kill_focused_workspace_stays_plain_close
 test_endpoint_confirmed_gone_gates_on_structured_presence
 test_pane_foreground_takeover_only_on_positive_evidence
+test_home_workspace_record_disambiguates_a_label_collision
 test_kill_refuses_when_presentation_lock_is_unavailable
 test_projection_seeded_prune_refuses_active_tab
 test_projection_label_builder_uses_corner_and_strips_owner_prefixes

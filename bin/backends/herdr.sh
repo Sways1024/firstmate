@@ -1576,15 +1576,26 @@ fm_backend_herdr_server_ensure() {  # <session>
 # which one is the caller's, while the read-only recovery path below keeps its
 # historical first-match behavior.
 fm_backend_herdr_workspace_find_all() {  # <session>
-  local session=$1 label list
+  local list
+  list=$(fm_backend_herdr_workspace_list_raw "$1") || return 0
+  fm_backend_herdr_workspace_ids_matching_label "$list"
+}
+
+# The single `workspace list` read, split out so one snapshot can serve both
+# the recorded-id check and the label match without a second round trip.
+fm_backend_herdr_workspace_list_raw() {  # <session>
+  fm_backend_herdr_cli "$1" workspace list 2>/dev/null
+}
+
+fm_backend_herdr_workspace_ids_matching_label() {  # <workspace-list-json>
+  local label
   label=$(fm_backend_herdr_workspace_label)
-  list=$(fm_backend_herdr_cli "$session" workspace list 2>/dev/null) || return 0
   # NOTE: the jq variable is $want, NOT $label - `label` is a jq reserved
   # keyword (label/break), so declaring a jq variable named "label" is a
   # compile error that `2>/dev/null` would silently swallow, making this find
   # ALWAYS return empty and every spawn mint a fresh "firstmate" workspace
   # (the workspace leak).
-  printf '%s' "$list" | jq -r --arg want "$label" \
+  printf '%s' "$1" | jq -r --arg want "$label" \
     '.result.workspaces[]? | select(.label == $want) | .workspace_id' 2>/dev/null
 }
 
@@ -1595,8 +1606,65 @@ fm_backend_herdr_workspace_find_all() {  # <session>
 # identical in spirit to the pre-existing tab duplicate-label check below.
 # NOT the spawn-time resolver: placing a new worker by first label match is
 # exactly the defect fm_backend_herdr_workspace_ensure now refuses.
+# --- this home's OWN container, remembered by exact id -----------------------
+#
+# Herdr labels a workspace from its cwd basename, so a captain working in a
+# directory named `firstmate` gets a personal workspace carrying this home's
+# container label - a collision the adapter cannot resolve by label alone
+# (docs/herdr-backend.md "Watching and task containers"). Left at that, a
+# label-only resolver adopts the captain's workspace when one matches, and
+# refuses spawns outright once two do.
+#
+# So a container this home CREATED is recorded by its exact workspace id and
+# preferred over any label match afterwards. Same created-versus-adopted
+# distinction the seeded-tab prune gate uses: an adopted workspace is never
+# recorded, so this can only ever re-find firstmate's own container.
+# The record is advisory - a missing, foreign-session, or vanished entry falls
+# back to the historical label lookup rather than failing anything.
+fm_backend_herdr_home_workspace_record_path() {
+  local state
+  state=${FM_STATE_OVERRIDE:-$FM_HOME/state}
+  [ -n "$state" ] && [ -d "$state" ] || return 1
+  printf '%s/.herdr-home-workspace' "$state"
+}
+
+# Print the recorded workspace id when it names a workspace present in the
+# GIVEN workspace-list snapshot; fail otherwise. Validating against a snapshot
+# the caller already fetched keeps this free: resolving a container still costs
+# exactly one `workspace list` call, as it did before the record existed.
+fm_backend_herdr_home_workspace_recorded_in() {  # <session> <workspace-list-json>
+  local session=$1 list=$2 record rec_session rec_ws
+  [ -n "$list" ] || return 1
+  record=$(fm_backend_herdr_home_workspace_record_path) || return 1
+  [ -f "$record" ] && [ ! -L "$record" ] || return 1
+  IFS=$(printf '\t') read -r rec_session rec_ws < "$record" 2>/dev/null || return 1
+  [ -n "$rec_session" ] && [ -n "$rec_ws" ] || return 1
+  [ "$rec_session" = "$session" ] || return 1
+  printf '%s' "$list" | jq -e --arg ws "$rec_ws" \
+    '[.result.workspaces[]? | select(.workspace_id == $ws)] | length == 1' >/dev/null 2>&1 || return 1
+  printf '%s' "$rec_ws"
+}
+
+# Record a container this home just created. Never fails a spawn: an
+# unwritable state directory only costs the disambiguation.
+fm_backend_herdr_home_workspace_record_write() {  # <session> <workspace-id>
+  local record tmp
+  [ -n "${1:-}" ] && [ -n "${2:-}" ] || return 0
+  record=$(fm_backend_herdr_home_workspace_record_path) || return 0
+  tmp="$record.tmp.$$"
+  printf '%s\t%s\n' "$1" "$2" > "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 0; }
+  mv -f -- "$tmp" "$record" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+  return 0
+}
+
 fm_backend_herdr_workspace_find() {  # <session>
-  fm_backend_herdr_workspace_find_all "$1" | head -1
+  local list recorded
+  list=$(fm_backend_herdr_workspace_list_raw "$1") || return 0
+  if recorded=$(fm_backend_herdr_home_workspace_recorded_in "$1" "$list"); then
+    printf '%s\n' "$recorded"
+    return 0
+  fi
+  fm_backend_herdr_workspace_ids_matching_label "$list" | head -1
 }
 
 # fm_backend_herdr_launcher_identity: the EXACT herdr workspace that the
@@ -1897,8 +1965,19 @@ fm_backend_herdr_workspace_ensure() {  # <session> <cwd> [<launcher-relationship
 # 3 for a reported refusal, 1 for a failed or unparseable herdr call.
 fm_backend_herdr_workspace_ensure_by_label() {  # <session> <cwd>
   local session=$1 cwd=$2 wsid out label matches count
+  local list
+  list=$(fm_backend_herdr_workspace_list_raw "$session") || list=
+  # This home's own recorded container wins over any label match, so a
+  # captain's personal workspace sharing the label is neither adopted nor
+  # able to make this placement ambiguous. Adopted (never recorded), so the
+  # seeded-tab prune gate still cannot reach it.
+  if wsid=$(fm_backend_herdr_home_workspace_recorded_in "$session" "$list"); then
+    FM_BACKEND_HERDR_WS_ID=$wsid
+    printf '%s' "$wsid"
+    return 0
+  fi
   label=$(fm_backend_herdr_workspace_label)
-  matches=$(fm_backend_herdr_workspace_find_all "$session")
+  matches=$(fm_backend_herdr_workspace_ids_matching_label "$list")
   count=$(printf '%s' "$matches" | grep -c '[^[:space:]]' || true)
   if [ "$count" -gt 1 ]; then
     echo "error: ${count} herdr workspaces in session '$session' are labeled '$label' (${matches//$'\n'/ }) and this spawn has no herdr parent pane to identify which one is its own; rename or close the extras, or run firstmate inside the workspace its workers belong in" >&2
@@ -1922,6 +2001,11 @@ fm_backend_herdr_workspace_ensure_by_label() {  # <session> <cwd>
   # once the first real task tab exists alongside it, and only ever targets
   # this exact captured tab_id.
   FM_BACKEND_HERDR_WS_SEEDED_TAB_ID=$(printf '%s' "$out" | jq -r '.result.tab.tab_id // empty' 2>/dev/null)
+  # The record is written by the CALLER (bin/fm-spawn.sh), not here: this
+  # adapter must not write durable home state, because FM_HOME defaults to the
+  # code root, so an adapter-level write lands in the live primary home during
+  # any test or ad hoc call that never set FM_HOME. The non-empty seeded-tab
+  # id below is exactly the created-versus-adopted signal the caller keys on.
   printf '%s' "$wsid"
 }
 
