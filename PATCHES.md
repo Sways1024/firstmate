@@ -1,11 +1,12 @@
 # Local patches (Sways1024 fork)
 
-`patched` = upstream HEAD `833a9a2` (2026-08-07) plus seven fixes on two branches:
+`patched` = upstream HEAD `833a9a2` (2026-08-07) plus ten fixes on three branches:
 
 | Branch | Upstream issues | Fix |
 | --- | --- | --- |
 | `fix/spawn-lifecycle` | [#1573](https://github.com/kunchenguid/firstmate/issues/1573)/[#1924](https://github.com/kunchenguid/firstmate/issues/1924), [#1913](https://github.com/kunchenguid/firstmate/issues/1913), [#1818](https://github.com/kunchenguid/firstmate/issues/1818) | Spawns lease their worktree (`treehouse get --lease --lease-holder fm-<id>`) and refuse a live sibling's checkout — closes the data-loss window. Aborted spawns kill their tmux window and release the lease. Crewmates share the project's Claude auto-memory store. |
 | `fix/supervision-wakes` | [#1897](https://github.com/kunchenguid/firstmate/issues/1897), [#1769](https://github.com/kunchenguid/firstmate/issues/1769), [#1792](https://github.com/kunchenguid/firstmate/issues/1792), [#1033](https://github.com/kunchenguid/firstmate/issues/1033) | PRs closed without merging produce a needs-decision wake instead of stranding the task. The wedge detector re-consults the busy contract and progress signals before escalating. Stale busy records contradicted by later status-log lines classify unknown. no-mistakes workers drive their own validation run. |
+| `fix/herdr-daily-use` | [#883](https://github.com/kunchenguid/firstmate/issues/883), [#1011](https://github.com/kunchenguid/firstmate/issues/1011), [#1571](https://github.com/kunchenguid/firstmate/issues/1571) (gap A) | Composer glyph stripping is locale-safe (literal patterns, not byte counts) — under `LC_ALL=C` an idle composer no longer reads pending forever, which was the root feeder of the away-mode deferral wedge on herdr. The herdr events probe and socket lookup no longer EPIPE-spam stderr on every watcher start. Every harness Resume row carries the launch's autonomy flags/env (claude gains a Resume row); stuck-crewmate-recovery requires flag-carrying resumes and adds the restore-to-clone trust-dialog hazard. Gap B (respawn re-resolving harness/model/effort from config instead of recorded meta) is follow-up. |
 
 ## Standing captain rules (add to `data/captain.md` on first setup)
 
@@ -23,7 +24,11 @@
 ```sh
 # 1. Prerequisites — BEFORE first firstmate launch, so bootstrap
 #    never offers upstream installers for tools we patch:
-brew install gh git tmux bash shellcheck go node
+#    herdr + jq are for the herdr runtime backend (herdr >= 0.8.0 required:
+#    below it, presentation-space cleanup has a focus-steal defect and the
+#    projection is floor-gated off; python3 comes with CLT and enables the
+#    protocol-16 event push + workspace ordering).
+brew install gh git tmux bash shellcheck go node herdr jq
 gh auth login
 npm install -g tasks-axi
 
@@ -37,6 +42,10 @@ export NO_MISTAKES_TELEMETRY=0   # also put in ~/.zshrc
 # 3. Firstmate itself:
 git clone -b patched https://github.com/Sways1024/firstmate.git ~/dev/firstmate
 cd ~/dev/firstmate
+
+# 3b. Select the herdr runtime backend (our standing choice; tmux stays
+#     installed as the verified fallback — write `tmux` here to revert):
+mkdir -p config && printf 'herdr\n' > config/backend
 
 # 4. Optional continuity from the old machine: copy data/, config/, .env
 #    (NEVER state/ — it is machine-bound). Add the captain rules above
