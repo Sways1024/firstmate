@@ -20,13 +20,26 @@ cat > "$FAKEBIN/herdr" <<'SH'
 set -eu
 printf '%s\n' "$*" >> "$FM_FAKE_HERDR_LOG"
 state=$FM_FAKE_HERDR_STATE
-last=
+# The isolation invariant (#1575): --session <name> must be present and must
+# precede any literal `--` child-argv delimiter (after `--`, herdr would treat
+# it as the child's argv and never apply it). Without `--` this still requires
+# the historical trailing position.
+session=
+prev=
+dd_seen=0
 for arg in "$@"; do
-  previous=$last
-  last=$arg
+  if [ "$prev" = --session ] && [ -z "$session" ]; then
+    [ "$dd_seen" -eq 0 ] || { echo "fake herdr: --session after -- delimiter" >&2; exit 90; }
+    session=$arg
+  fi
+  [ "$arg" != '--' ] || dd_seen=1
+  prev=$arg
 done
-[ "${previous:-}" = --session ] || { echo "fake herdr: missing trailing --session" >&2; exit 90; }
-session=$last
+[ -n "$session" ] || { echo "fake herdr: missing --session" >&2; exit 90; }
+if [ "$dd_seen" -eq 0 ] && [ "$prev" != "$session" ]; then
+  echo "fake herdr: --session must trail when no -- delimiter is present" >&2
+  exit 90
+fi
 default_socket=$(cat "$state/default-socket")
 lab_state=absent
 [ ! -f "$state/$session" ] || lab_state=$(cat "$state/$session")
@@ -234,8 +247,31 @@ SH
   pass "fm-herdr-lab: timed-out provisioning cancels the launch before teardown"
 }
 
+test_child_argv_delimiter_keeps_isolation() {
+  local name status=0 line
+  name="fm-lab-ddsplit-$$"
+  : > "$FAKE_LOG"
+  run_with_fake fm_herdr_lab_provision "$name" || fail "provision failed"
+  # An `agent start ... -- <child argv>` shape previously received --session
+  # AFTER the delimiter: herdr never saw the flag (env-only isolation, which
+  # the brief contract rejects) and the stray tokens joined the child argv,
+  # silently on both counts (#1575).
+  run_with_fake fm_herdr_lab_cli "$name" agent start worker --cwd /tmp -- echo hello >/dev/null || status=$?
+  expect_code 0 "$status" "a -- subcommand must still run"
+  line=$(grep 'agent start' "$FAKE_LOG" | tail -1)
+  case "$line" in
+    *"--session $name -- echo hello")
+      : ;;
+    *)
+      fail "--session must precede the -- delimiter with the child argv intact, got: $line" ;;
+  esac
+  run_with_fake fm_herdr_lab_teardown "$name" || fail "teardown failed"
+  pass "fm-herdr-lab: --session precedes the child-argv delimiter, child argv unchanged"
+}
+
 test_refuses_unsafe_names
 test_provision_run_and_guarded_teardown
+test_child_argv_delimiter_keeps_isolation
 test_missing_tripwire_blocks_destruction
 test_changed_default_trips_after_teardown
 test_stopped_owned_lab_can_reprovision

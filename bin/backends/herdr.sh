@@ -378,9 +378,19 @@ fm_backend_herdr_workspace_label() {
 # fm_backend_herdr_version_check, which is intentionally session-independent
 # (reads only .client.* fields).
 fm_backend_herdr_cli() {  # <session> <herdr-subcommand-and-args...>
-  local session=$1
+  local session=$1 arg seen_dd=0
+  local -a pre=() post=()
   shift
-  HERDR_SESSION="$session" herdr "$@" --session "$session"
+  # The trailing position is only safe while no argument is a literal `--`:
+  # after that delimiter herdr treats everything as the launched child's argv,
+  # so a trailing flag would silently degrade to env-only session selection
+  # AND corrupt the child argv (#1575, same defect as the lab helper). No
+  # current call site passes `--`; this keeps the invariant if one ever does.
+  for arg in "$@"; do
+    [ "$seen_dd" -eq 1 ] || [ "$arg" != '--' ] || seen_dd=1
+    if [ "$seen_dd" -eq 0 ]; then pre+=("$arg"); else post+=("$arg"); fi
+  done
+  HERDR_SESSION="$session" herdr ${pre[@]+"${pre[@]}"} --session "$session" ${post[@]+"${post[@]}"}
 }
 
 # fm_backend_herdr_tool_check: refuse loudly if herdr or jq is missing.
