@@ -2471,12 +2471,20 @@ fi
 # nothing yet proves the created shell still owns the pane. If a shell rc
 # `exec`d another process (e.g. a tmux auto-attach), everything typed below -
 # including the env-laden launch command - would land in whatever process took
-# over, silently. Prove one lone bare idle shell owns the exact pane before
-# the first typed byte; crewmates and scouts keep their stronger cwd-settle
-# gate as the equivalent proof.
+# over, silently. Crewmates and scouts keep their stronger cwd-settle gate as
+# the equivalent proof.
+#
+# This refuses ONLY on positive evidence of a takeover - a readable pane whose
+# sole foreground process is confirmably not a shell, twice in a row. It is
+# deliberately NOT the idle-lone-shell proof used by pane cleanup: that proof
+# requires no child process at all, which docs/herdr-backend.md records as
+# permanently unsatisfiable for a shell running a persistent helper
+# (gitstatusd, zsh-async, direnv), so requiring it here refused legitimate
+# spawns outright. Unreadable, ambiguous, or shell-confirmed all proceed,
+# which is never worse than the historical no-check behavior.
 if [ "$BACKEND" = herdr ] && [ "$KIND" = secondmate ]; then
-  if ! fm_backend_herdr_pane_idle_shell_pid "$HERDR_SES" "$HERDR_PANE_ID" >/dev/null; then
-    echo "error: created herdr pane for $W does not hold a lone idle shell (a shell rc may have replaced it); refusing to type the launch command into an unproven pane" >&2
+  if fm_backend_herdr_pane_foreground_takeover "$HERDR_SES" "$HERDR_PANE_ID"; then
+    echo "error: created herdr pane for $W is running '$FM_BACKEND_HERDR_TAKEOVER_PROCESS' instead of its shell (a shell rc likely exec'd it); refusing to type the launch command into a pane its shell no longer owns" >&2
     exit 1
   fi
 fi

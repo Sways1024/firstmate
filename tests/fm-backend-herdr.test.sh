@@ -2174,6 +2174,60 @@ test_endpoint_confirmed_gone_gates_on_structured_presence() {
   pass "endpoint confirmed-gone: only structured not-found permits record removal and ambiguous identity refuses"
 }
 
+test_pane_foreground_takeover_only_on_positive_evidence() {
+  local out
+  out=$(bash -c '
+    . "$0/bin/backends/herdr.sh"
+    # One canned process-info response per call; two calls per check because
+    # the takeover verdict requires two agreeing samples. The counter lives in
+    # a FILE, not a variable: each sample runs inside a command substitution,
+    # so a variable increment would never survive back to this shell and every
+    # call would replay the first response.
+    counter="$1/takeover-calls"
+    fm_backend_herdr_cli() {
+      local n
+      n=$(( $(cat "$counter" 2>/dev/null || echo 0) + 1 ))
+      printf "%s" "$n" > "$counter"
+      if [ "$n" = 1 ]; then printf "%s\n" "$FM_FAKE_PI_1"; return "${FM_FAKE_PI_1_RC:-0}"; fi
+      printf "%s\n" "$FM_FAKE_PI_2"; return "${FM_FAKE_PI_2_RC:-0}"
+    }
+    pi() {  # <pane> <name> <argv0>
+      printf "{\"result\":{\"type\":\"pane_process_info\",\"process_info\":{\"pane_id\":\"%s\",\"foreground_processes\":[{\"pid\":9,\"name\":\"%s\",\"argv0\":\"%s\"}]}}}" "$1" "$2" "$3"
+    }
+    check() {  # <label> <resp1> <resp2> <expected-rc> [rc1] [rc2]
+      printf 0 > "$counter"
+      FM_FAKE_PI_1=$2 FM_FAKE_PI_2=$3 FM_FAKE_PI_1_RC=${5:-0} FM_FAKE_PI_2_RC=${6:-0}
+      rc=0
+      fm_backend_herdr_pane_foreground_takeover fmtest w1:p1 || rc=$?
+      [ "$rc" = "$4" ] || printf "MISMATCH %s: rc=%s expected=%s\n" "$1" "$rc" "$4"
+      [ "$(cat "$counter")" -ge 2 ] || [ "$4" = 1 ] \
+        || printf "MISMATCH %s: verdict used only one sample\n" "$1"
+    }
+    # Positive evidence: a non-shell owns the pane in both samples (#1912).
+    check exec-tmux "$(pi w1:p1 tmux tmux)" "$(pi w1:p1 tmux tmux)" 0
+    [ "$FM_BACKEND_HERDR_TAKEOVER_PROCESS" = tmux ] \
+      || printf "MISMATCH takeover-name: %s\n" "$FM_BACKEND_HERDR_TAKEOVER_PROCESS"
+    # Ordinary shells never read as a takeover, including a login shell whose
+    # argv0 is spelled "-zsh" and an absolute-path name.
+    check plain-zsh "$(pi w1:p1 zsh zsh)" "$(pi w1:p1 zsh zsh)" 1
+    check login-zsh "$(pi w1:p1 zsh -zsh)" "$(pi w1:p1 zsh -zsh)" 1
+    check abs-path-bash "$(pi w1:p1 /bin/bash /bin/bash)" "$(pi w1:p1 /bin/bash /bin/bash)" 1
+    # A transient rc-startup command must not be mistaken for a permanent exec.
+    check transient "$(pi w1:p1 direnv direnv)" "$(pi w1:p1 zsh zsh)" 1
+    # Everything unreadable or ambiguous proceeds: a missing read must never
+    # invent a blocker (the regression that refused legitimate spawns).
+    check unreadable "" "" 1 1 1
+    check garbage "not json" "not json" 1
+    check wrong-pane "$(pi w9:p9 tmux tmux)" "$(pi w9:p9 tmux tmux)" 1
+    check no-process-info "{\"result\":{\"type\":\"other\"}}" "{\"result\":{\"type\":\"other\"}}" 1
+    check two-foreground \
+      "{\"result\":{\"type\":\"pane_process_info\",\"process_info\":{\"pane_id\":\"w1:p1\",\"foreground_processes\":[{\"pid\":9,\"name\":\"tmux\"},{\"pid\":10,\"name\":\"zsh\"}]}}}" \
+      "{\"result\":{\"type\":\"pane_process_info\",\"process_info\":{\"pane_id\":\"w1:p1\",\"foreground_processes\":[{\"pid\":9,\"name\":\"tmux\"},{\"pid\":10,\"name\":\"zsh\"}]}}}" 1
+  ' "$ROOT" "$TMP_ROOT" 2>&1)
+  [ -z "$out" ] || fail "pane foreground takeover matrix mismatch: $out"
+  pass "pane foreground takeover: refuses only on two agreeing non-shell samples, never on an unreadable or ambiguous read"
+}
+
 test_projection_seeded_prune_refuses_active_tab() {
   local dir log resp fb out status
   dir="$TMP_ROOT/projection-seeded-focus-active-refusal"; mkdir -p "$dir/responses"
@@ -4282,6 +4336,7 @@ test_projection_close_failed_removal_rolls_back_the_reposition
 test_kill_emptying_non_focused_uses_pane_death
 test_kill_focused_workspace_stays_plain_close
 test_endpoint_confirmed_gone_gates_on_structured_presence
+test_pane_foreground_takeover_only_on_positive_evidence
 test_kill_refuses_when_presentation_lock_is_unavailable
 test_projection_seeded_prune_refuses_active_tab
 test_projection_label_builder_uses_corner_and_strips_owner_prefixes
