@@ -3120,10 +3120,20 @@ fm_backend_herdr_kill() {  # <target>
 # unknown presence refuse after every close path, and a missing or malformed
 # target identity is ambiguity that also refuses, never proof of a gone pane.
 fm_backend_herdr_endpoint_confirmed_gone() {  # <target>
-  local presence
+  local presence attempt=0
   fm_backend_herdr_parse_target "$1" || return 1
-  presence=$(fm_backend_herdr_pane_presence_state "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE")
-  [ "$presence" = dead ]
+  # Bounded settle: the focus-safe emptying close removes the pane through
+  # herdr's ASYNCHRONOUS pane-death reap, so a read issued immediately after a
+  # successful close can still see the dying pane. A genuinely live pane reads
+  # `present` on every sample and only costs this window in the failure path;
+  # refusal is still the outcome when nothing turns dead.
+  while :; do
+    presence=$(fm_backend_herdr_pane_presence_state "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE")
+    [ "$presence" != dead ] || return 0
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 10 ] || return 1
+    sleep 0.2
+  done
 }
 
 # fm_backend_herdr_classify_agent_status: map a raw `agent get` agent_status
