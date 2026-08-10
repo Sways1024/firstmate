@@ -43,13 +43,27 @@ pre-existing Pi case and the two load artifacts above.
 ## Standing captain rules (add to `data/captain.md` on first setup)
 
 ```
-- treehouse and no-mistakes on this machine are PATCHED FORKS
-  (github.com/Sways1024/{treehouse,no-mistakes}, branch `patched`).
-  NEVER approve bootstrap install/upgrade/reinstall for either tool —
-  escalate to the captain instead.
+- treehouse, no-mistakes, and firstmate itself on this machine are PATCHED
+  FORKS (github.com/Sways1024/{treehouse,no-mistakes,firstmate}, branch
+  `patched`). The fork is canonical; upstream is never the source of truth.
+  NEVER approve bootstrap install/upgrade/reinstall for any of them, and never
+  run `treehouse update` or `no-mistakes update` — escalate to the captain
+  instead. Their upstream version checks report our builds as older because the
+  `-patched-<sha>` suffix is not understood; accepting one would replace the
+  binary with plain upstream and drop treehouse's `--lease`/`--lease-holder`
+  support that the spawn path depends on. The checks are disabled by
+  TREEHOUSE_NO_UPDATE_CHECK=1 and NO_MISTAKES_NO_UPDATE_CHECK=1 in ~/.zshrc.
+- `/updatefirstmate` is safe only because `origin` is our own fork. Never add or
+  pull from a kunchenguid upstream remote, and never repoint origin at it.
+  `origin/HEAD` is set locally to `origin/patched` so the worktree-tangle guard
+  treats `patched` as this checkout's default branch; that is a per-machine
+  local ref, not something a clone carries.
 - Relay stays disabled. Remote secondmates stay disabled unless the captain
   sets them up in person.
 ```
+
+This block is the authoritative copy; `data/captain.md` on each machine carries
+the same text (it is gitignored, so it is set up per machine).
 
 ## Setup on a new Mac (order matters)
 
@@ -88,10 +102,13 @@ mkdir -p config && printf 'herdr\n' > config/backend
 #     callers, both tangle checks), so sync and merge behavior are unaffected.
 git remote set-head origin patched
 
-# 3d. Optional: silence treehouse's update nag. It offers upstream v2.1.1,
-#     which would REPLACE our patched fork and drop the `--lease` support
-#     bin/fm-spawn.sh depends on. Never accept it; this just stops the prompt.
-export TREEHOUSE_NO_UPDATE_CHECK=1   # also put in ~/.zshrc
+# 3d. Silence both upstream update checks (put these in ~/.zshrc alongside
+#     NO_MISTAKES_TELEMETRY=0). They offer plain upstream builds, which would
+#     REPLACE our patched forks — dropping the treehouse `--lease` support
+#     bin/fm-spawn.sh depends on. We never update these from upstream, so the
+#     check has no upside and one keystroke of downside.
+export TREEHOUSE_NO_UPDATE_CHECK=1
+export NO_MISTAKES_NO_UPDATE_CHECK=1
 
 # 4. Optional continuity from the old machine: copy data/, config/, .env
 #    (NEVER state/ — it is machine-bound). Add the captain rules above
