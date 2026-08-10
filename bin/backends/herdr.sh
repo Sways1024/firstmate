@@ -1241,6 +1241,68 @@ fm_backend_herdr_pane_idle_shell_pid() {  # <session> <pane-id>
   done
 }
 
+# fm_backend_herdr_pane_foreground_takeover: 0 ONLY on positive evidence that
+# the exact pane's sole foreground process is not a recognized shell - the
+# #1912 signature of a shell rc that `exec`d another program (a tmux
+# auto-attach) and now owns the pane firstmate is about to type into.
+# Sets FM_BACKEND_HERDR_TAKEOVER_PROCESS to the observed process name.
+#
+# Every other outcome returns 1 (no evidence): a recognized shell by either
+# name or argv0 spelling, more than one foreground process, an unreadable or
+# unparseable response, a pane-id mismatch, or a herdr without process-info.
+# This is deliberately the INVERSE bias of the idle-shell proof above - that
+# one licenses closing a pane and must fail toward refusal, while this one
+# only gates typing and must not invent a blocker out of a missing read.
+# Two consecutive samples must agree, so a transient rc-startup command is not
+# mistaken for a permanent `exec` takeover.
+fm_backend_herdr_pane_foreground_takeover() {  # <session> <pane-id>
+  local session=$1 pane=$2 attempt=0 observed=''
+  FM_BACKEND_HERDR_TAKEOVER_PROCESS=""
+  while [ "$attempt" -lt 2 ]; do
+    local seen
+    seen=$(fm_backend_herdr_pane_foreground_nonshell_sample "$session" "$pane") || return 1
+    [ -n "$seen" ] || return 1
+    if [ -n "$observed" ] && [ "$observed" != "$seen" ]; then
+      return 1
+    fi
+    observed=$seen
+    attempt=$((attempt + 1))
+    [ "$attempt" -ge 2 ] || sleep 0.3
+  done
+  FM_BACKEND_HERDR_TAKEOVER_PROCESS=$observed
+  return 0
+}
+
+# One instantaneous observation for the takeover check above: prints the sole
+# foreground process's name when it is positively NOT a recognized shell, and
+# fails (no output) for a shell, an ambiguous count, or any unreadable field.
+fm_backend_herdr_pane_foreground_nonshell_sample() {  # <session> <pane-id>
+  local session=$1 pane=$2 info count name argv0 shell_name
+  info=$(fm_backend_herdr_cli "$session" pane process-info --pane "$pane" 2>/dev/null) || return 1
+  printf '%s' "$info" | jq -e --arg pane "$pane" '
+    .result.type == "pane_process_info"
+    and .result.process_info.pane_id == $pane
+  ' >/dev/null 2>&1 || return 1
+  count=$(printf '%s' "$info" | jq -er \
+    '.result.process_info.foreground_processes | select(type == "array") | length' 2>/dev/null) || return 1
+  [ "$count" -eq 1 ] || return 1
+  name=$(printf '%s' "$info" | jq -er \
+    '.result.process_info.foreground_processes[0].name | select(type == "string" and length > 0)' 2>/dev/null) || return 1
+  argv0=$(printf '%s' "$info" | jq -er '
+    .result.process_info.foreground_processes[0] as $process
+    | ($process.argv0 // $process.argv[0] // "")
+    | select(type == "string")
+  ' 2>/dev/null) || argv0=
+  shell_name=${name##*/}
+  argv0=${argv0#-}
+  argv0=${argv0##*/}
+  # EITHER spelling naming a recognized shell clears the pane: a login shell
+  # spelled "-zsh" in argv0 and "zsh" in name must never read as a takeover.
+  case "$shell_name" in sh|bash|zsh|dash|ksh|fish) return 1 ;; esac
+  case "$argv0" in sh|bash|zsh|dash|ksh|fish) return 1 ;; esac
+  printf '%s' "$shell_name"
+}
+
 # fm_backend_herdr_pane_idle_shell_sample: one strict instantaneous
 # observation for fm_backend_herdr_pane_idle_shell_pid, which owns the proof
 # contract and the settle retry.
