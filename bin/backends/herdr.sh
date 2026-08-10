@@ -3263,9 +3263,13 @@ fm_backend_herdr_list_live() {  # <session>
 # ~/.config/herdr/sessions/<name>/herdr.sock). Empty on any failure.
 fm_backend_herdr_socket_path() {  # <session>
   local session=$1
+  # first() inside jq, deliberately not `| head -1`: head exiting after one
+  # line EPIPEs the upstream writer, and that "write error: Broken pipe" stderr
+  # was visible at every watcher start in the field (same class as the events
+  # probe above; upstream #1895/#1949 reports). Verdict identical: first match
+  # or empty.
   herdr session list --json 2>/dev/null \
-    | jq -r --arg name "$session" '.sessions[]? | select(.name == $name) | .socket_path // empty' 2>/dev/null \
-    | head -1
+    | jq -r --arg name "$session" 'first(.sessions[]? | select(.name == $name) | .socket_path // empty)' 2>/dev/null
 }
 
 # fm_backend_herdr_events_capable: the version/capability gate for the event
@@ -3291,8 +3295,13 @@ fm_backend_herdr_events_capable() {  # <session>
   case "$protocol" in ''|*[!0-9]*) return 1 ;; esac
   [ "$protocol" -ge "$FM_BACKEND_HERDR_MIN_EVENTS_PROTOCOL" ] || return 1
   schema=$(herdr api schema --json 2>/dev/null) || return 1
-  printf '%s' "$schema" | grep -Fq 'events.subscribe' || return 1
-  printf '%s' "$schema" | grep -Fq 'pane.agent_status_changed' || return 1
+  # In-process substring match, deliberately not `printf | grep -Fq`: grep -q
+  # exits at first match, the ~220KB schema overfills the pipe buffer, and
+  # printf then reports EPIPE ("printf: write error: Broken pipe") on stderr at
+  # every watcher start (upstream #1011). The verdict was never affected; the
+  # case match removes the pipe entirely and is bash-3.2-safe.
+  case "$schema" in *'events.subscribe'*) ;; *) return 1 ;; esac
+  case "$schema" in *'pane.agent_status_changed'*) ;; *) return 1 ;; esac
   return 0
 }
 

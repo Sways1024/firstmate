@@ -174,6 +174,7 @@ The shared symptom is a healthy-looking pane with no work in progress, so each a
 | Exit command | `/exit` |
 | Interrupt | single Escape |
 | Skill invocation | `/<skill>` (e.g. `/no-mistakes`) |
+| Resume | `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions --resume <session-id>` - a resume NEVER inherits the original launch flags or env, so a bare `claude --resume` returns in interactive-approval mode with ghost text re-enabled and stalls unattended (the #1571 restore-stall shape; a herdr server restart reconstructs exactly that bare command). Carry every autonomy flag and env prefix from the recorded launch. |
 
 First launch in a fresh worktree, or first ever on a machine, may show a trust or bypass-permissions confirmation.
 After every spawn, peek the pane within about 20 seconds.
@@ -215,8 +216,10 @@ Directory trust dialog on first run per repo root: "Do you trust the contents of
 Accept with Enter.
 The decision persists for the repo, so later worktrees of the same project skip it.
 
-Resume after exit with `codex resume <session-id>`.
+Resume after exit with `codex resume --dangerously-bypass-approvals-and-sandbox <session-id>`.
 The session id is printed on quit.
+A resume never inherits the original launch flags: a bare `codex resume` returns in interactive-approval mode and an unattended crewmate stalls on its first tool call, presenting as a wedge.
+Carry the same autonomy flag the launch template used (and the `-c notify=...` turn-end hook for a crewmate whose task still supervises through it).
 
 **Primary-session guard fact (verified 2026-07-08, codex-cli 0.142.1).**
 The firstmate PRIMARY's own `.codex/hooks.json` registers a Stop hook that pipes Codex's Stop payload to `bin/fm-turnend-guard.sh`.
@@ -237,7 +240,7 @@ The checkpoint is deliberately foreground and bounded so Codex regains control r
 
 No trust dialog.
 Opencode can auto-upgrade itself in the background and the running TUI can exit mid-task, observed live from 1.15.7 to 1.17.3.
-If a pane shows the exit banner, relaunch with `--continue` to resume the session.
+If a pane shows the exit banner, relaunch with `OPENCODE_CONFIG_CONTENT='{"permission":{"*":"allow"}}' opencode --continue` to resume the session - the permission env is a per-launch prefix, so a bare `opencode --continue` returns with approvals re-enabled and stalls unattended.
 `--prompt` does not auto-submit alongside `--continue`, so send the next instruction via `fm-send` once the TUI is up.
 
 **Busy-queued Enter (opencode 1.18.4, tmux backend fix, herdr known gap).**
@@ -311,7 +314,7 @@ For Grok's supported reasoning-effort values and omission behavior, see the [lau
 | Skill invocation | `/<skill>` (e.g. `/no-mistakes`), same as claude. Opens a slash-autocomplete popup, so a too-fast Enter selects the popup entry instead of sending. For an argument-taking command that first Enter does not submit at all - it expands the selection into an argument-hint placeholder in the composer (e.g. `/compact` -> `/compact compaction instructions`, live-verified), leaving real text still sitting there unsubmitted; a genuine second Enter is required. `fm-send`'s retried Enter lands it on BOTH backends, but only because each backend's own submit-verification correctly recognizes that placeholder-filled text as still-pending - see the incident below. |
 | Autonomy | `--always-approve` (footer shows `· always-approve`); auto-approves every tool execution, verified to run fully unattended. `--permission-mode bypassPermissions` is the stronger equivalent. |
 | Env marker | `GROK_AGENT=1`, set for child/tool processes on grok 0.2.73. grok does NOT set `CLAUDECODE` despite Claude compatibility, so the marker is unambiguous WHEN PRESENT, but it is not guaranteed present: a grok 1.0.0 hook process carries `GROK_HOOK_EVENT`, `GROK_HOOK_NAME`, `GROK_SESSION_ID`, and `GROK_WORKSPACE_ROOT` with no `GROK_AGENT`. Treat it as a fast path only; `bin/fm-harness.sh`'s ancestry walk is what guarantees grok identification, and any rule that must be reliable under grok has to test the hook markers too (owner: `docs/turnend-guard.md` "Harness integrations"). |
-| Resume | `grok --resume <session-id>` (id printed on exit) or `grok -c` / `--continue` (most recent for the cwd); `--fork-session` branches a new session id. |
+| Resume | `grok --always-approve --resume <session-id>` (id printed on exit) or `grok --always-approve -c` / `--continue` (most recent for the cwd); `--fork-session` branches a new session id. A resume never inherits the launch's `--always-approve`, so omitting it returns the crewmate to the permission gate and stalls unattended. |
 
 **Incident (2026-07-03, herdr backend only, grok 0.2.82):** two grok/herdr crewmates were sent `/no-mistakes` via `fm-send`; both left it fully typed but unsubmitted in the composer for minutes (footer still `Enter:send`), and `fm-send` exited 0 with no error.
 Reproduced live: the herdr adapter's submit-verification at the time treated ANY pane-content change after Enter as "submitted", and the popup-close-with-placeholder-fill described above IS a visible content change even though nothing was actually sent.
@@ -413,7 +416,7 @@ Muse Code is a CREWMATE and SCOUT adapter only.
 | Environment marker | None. Detection is process ancestry on the anchored prefix `muse-bin-*`. The launch clears foreign primary markers before Muse starts so their higher detection precedence cannot override that ancestry. `MUSE_CURRENT_SESSION_LOG` is a session-log PATH rather than an identity, and its export to tool subprocesses is unverified. |
 | Composer | Bordered box whose prompt glyph is `⟩` (U+27E9) in truecolor `38;2;90;160;255`, luminance ~149.9 - the narrowest margin over the 128 ghost threshold in the fleet. Typed text is `38;2;204;211;219` (~209.8). No idle placeholder or ghost text was observed. |
 | Effort | `--reasoning-effort`, default `high`; see the launch-profile table above for the mapping. |
-| Resume | `muse resume --last` or `muse resume <session-uuid>`; bare `muse resume` opens a picker. |
+| Resume | `muse resume --last` or `muse resume <session-uuid>`; bare `muse resume` opens a picker. A resume never inherits the launch's env prefix or flags: re-apply the full recorded prefix (`env -u` marker clears, the task's `XDG_CONFIG_HOME`/`XDG_DATA_HOME` roots - without them muse cannot even find the session or its credential - and `MUSE_EXPERIMENTAL_FOREIGN_PERSONAL_CONTEXT_KILL=on`) plus `--yolo`, or the crewmate returns sandboxed behind approval and trust dialogs with the operator's foreign personal context re-enabled. |
 
 ### Credentials are a spawn preflight, not a screen check
 

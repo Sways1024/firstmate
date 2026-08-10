@@ -133,8 +133,30 @@ test_real_text_is_pending() {
   pass "fm_composer_classify_content: real unsubmitted text reads pending (including a popup argument-hint fill)"
 }
 
+test_glyph_strip_is_locale_safe() {
+  local idle='^Type a message\.\.\.$' g out
+  # Under a C/POSIX locale bash's `?` matches one BYTE, so a positional
+  # ${content#??} strip leaves the tail byte of a 3-byte UTF-8 agent glyph
+  # prefixed to the content; the idle re-match then fails and an idle composer
+  # reads pending forever, deferring away-mode injection (upstream #883). The
+  # literal-pattern strip must hold in both locales.
+  for g in '❯' '›' '⟩'; do
+    out=$(LC_ALL=C classify 0 "$g Type a message..." "$idle")
+    [ "$out" = empty ] \
+      || fail "C locale: idle placeholder after '$g' must read empty, got '$out'"
+    out=$(LC_ALL=C classify 0 "$g fix findings 1 and 3")
+    [ "$out" = pending ] \
+      || fail "C locale: real text after '$g' must read pending, got '$out'"
+  done
+  out=$(LC_ALL=C classify 1 '> Type a message...' "$idle")
+  [ "$out" = empty ] \
+    || fail "C locale: bordered shell-glyph idle placeholder must read empty, got '$out'"
+  pass "fm_composer_classify_content: glyph stripping is locale-independent (LC_ALL=C)"
+}
+
 test_bare_shell_glyphs_are_unknown
 test_stripped_unbordered_content_uses_plain_content
+test_glyph_strip_is_locale_safe
 test_bare_shell_prompt_with_command_is_not_empty
 test_bordered_shell_glyph_is_empty
 test_agent_glyphs_are_empty_bordered_and_bare
