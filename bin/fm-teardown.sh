@@ -2280,6 +2280,7 @@ fi
 
 HERDR_PRESENTATION_JOURNAL="$STATE/$ID.herdr-presentation"
 HERDR_PRESENTATION_RETIRE_CANDIDATE=0
+HERDR_PRESENTATION_RETIRE_IF_GONE=0
 HERDR_PRESENTATION_SESSION=
 HERDR_PRESENTATION_PANE=
 if [ "$BACKEND" = herdr ] \
@@ -2296,6 +2297,24 @@ if [ "$BACKEND" = herdr ] \
        "$HERDR_PRESENTATION_SESSION" "$HERDR_PRESENTATION_WORKSPACE" \
        "$HERDR_PRESENTATION_JOURNAL" "$ID"; then
     HERDR_PRESENTATION_RETIRE_CANDIDATE=1
+  elif [ -n "$HERDR_PRESENTATION_SESSION" ] \
+       && [ -n "$HERDR_PRESENTATION_PANE" ] \
+       && [ "$T" = "$HERDR_PRESENTATION_SESSION:$HERDR_PRESENTATION_PANE" ] \
+       && fm_backend_herdr_projection_journal_snapshot "$HERDR_PRESENTATION_JOURNAL" "$ID" \
+       && [ "$FM_BACKEND_HERDR_JOURNAL_VERSION" = 2 ] \
+       && [ "$FM_BACKEND_HERDR_JOURNAL_SESSION" = "$HERDR_PRESENTATION_SESSION" ] \
+       && [ "$FM_BACKEND_HERDR_JOURNAL_WORKSPACE_ID" = "${HERDR_PRESENTATION_WORKSPACE:-}" ] \
+       && [ "$FM_BACKEND_HERDR_JOURNAL_PANE_ID" = "$HERDR_PRESENTATION_PANE" ] \
+       && [ "$FM_BACKEND_HERDR_JOURNAL_HOME" = "$(cd "$FM_HOME" 2>/dev/null && pwd -P)" ]; then
+    # A projection whose pane died BEFORE teardown (a crashed harness, or this
+    # teardown's own leaked-process reap emptying the workspace through
+    # herdr's pane-death removal) has no live labeled workspace left for the
+    # live-endpoint match above - the exact #1337 quarantine-forever shape.
+    # When the version 2 journal binds THIS home, task, session, workspace,
+    # and pane - the same endpoint identity the confirmed-gone gate below
+    # proves structurally absent - the journal may retire with the other
+    # durable records. Any binding mismatch keeps the conservative quarantine.
+    HERDR_PRESENTATION_RETIRE_IF_GONE=1
   fi
 fi
 
@@ -2326,12 +2345,18 @@ elif [ "$BACKEND" != orca ]; then
   fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
 fi
 if [ "$HERDR_PRESENTATION_RETIRE_CANDIDATE" = 1 ]; then
-  if [ "$(fm_backend_herdr_pane_agent_state "$HERDR_PRESENTATION_SESSION" "$HERDR_PRESENTATION_PANE")" = dead ]; then
-    rm -f "$HERDR_PRESENTATION_JOURNAL"
-  else
-    echo "warning: exact herdr task-pane close could not be confirmed for $ID; retaining the presentation journal and attempting no workspace cleanup" >&2
-  fi
-elif [ "$BACKEND" = herdr ] \
+  # Retirement is decided by the same structured confirmed-gone gate that
+  # guards every durable-record removal below, not by a one-shot state read
+  # here. The focus-safe emptying close removes the pane through herdr's
+  # ASYNCHRONOUS pane-death reap, so an immediate read can still see the
+  # closing pane mid-reap; the old one-shot check then quarantined the journal
+  # forever even though the gate below proved the pane gone moments later and
+  # every other durable record was removed (upstream #1337's inversion, still
+  # reachable through this timing on herdr 0.8.0's pane-death removal path).
+  # A genuinely refused or failed close still retains the journal: the gate
+  # exits before the retirement below.
+  :
+elif [ "$BACKEND" = herdr ] && [ "$HERDR_PRESENTATION_RETIRE_IF_GONE" != 1 ] \
      && { [ -e "$HERDR_PRESENTATION_JOURNAL" ] || [ -L "$HERDR_PRESENTATION_JOURNAL" ]; }; then
   echo "warning: herdr presentation journal for $ID remains quarantined; no workspace cleanup was attempted" >&2
 fi
@@ -2348,8 +2373,16 @@ if [ "$BACKEND" = herdr ]; then
     exit 1
   fi
   if ! fm_backend_herdr_endpoint_confirmed_gone "$T"; then
+    [ "$HERDR_PRESENTATION_RETIRE_CANDIDATE" != 1 ] || \
+      echo "warning: exact herdr task-pane close could not be confirmed for $ID; retaining the presentation journal and attempting no workspace cleanup" >&2
     echo "error: herdr pane $T for $ID is not confirmed gone after its close was refused, skipped, or failed; retaining every durable task record - rerun teardown once the close can run under the session lock" >&2
     exit 1
+  fi
+  # The exact pane is now structurally confirmed gone, the only evidence that
+  # authorizes removing durable records - retire the presentation journal on
+  # that same evidence (see the retire-candidate and pre-dead comments above).
+  if [ "$HERDR_PRESENTATION_RETIRE_CANDIDATE" = 1 ] || [ "$HERDR_PRESENTATION_RETIRE_IF_GONE" = 1 ]; then
+    rm -f "$HERDR_PRESENTATION_JOURNAL"
   fi
 fi
 if [ "$KIND" = secondmate ]; then

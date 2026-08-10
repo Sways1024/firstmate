@@ -640,6 +640,8 @@ HERDR_PROJECTION_ABORT_CLEANUP=0
 HERDR_PROJECTION_ABORT_SESSION=
 HERDR_PROJECTION_ABORT_TASK_PANE=
 HERDR_PROJECTION_ABORT_SEEDED_PANE=
+HERDR_FLAT_ABORT_SESSION=
+HERDR_FLAT_ABORT_PANE=
 HERDR_PRESENTATION_ORDER_LOCK=
 HERDR_PRESENTATION_ORDER_LOCK_HELD=0
 SPAWN_TASK_LOCK=
@@ -725,6 +727,16 @@ spawn_abort_cleanup() {
     fm_backend_tmux_kill_window_id "$TMUX_ABORT_WINDOW" || true
     TMUX_ABORT_WINDOW=
   fi
+  # The flat-herdr analog of the tmux branch above (#1912's adjacent gap): an
+  # aborted flat spawn used to leave its just-created tab alive as an orphan
+  # shell pane sitting in the primary checkout, invisible to teardown because
+  # no metadata was ever written. fm_backend_herdr_kill serializes under the
+  # session presentation lock and tolerates an already-gone pane.
+  if [ -n "${HERDR_FLAT_ABORT_PANE:-}" ]; then
+    fm_backend_herdr_kill "$HERDR_FLAT_ABORT_SESSION:$HERDR_FLAT_ABORT_PANE" 2>/dev/null || true
+    HERDR_FLAT_ABORT_PANE=
+    HERDR_FLAT_ABORT_SESSION=
+  fi
   if [ -n "${TREEHOUSE_LEASE_ABORT_PATH:-}" ]; then
     if ! ( cd "${PROJ_ABS:-.}" && treehouse return --force "$TREEHOUSE_LEASE_ABORT_PATH" ) >/dev/null 2>&1; then
       echo "warning: could not return leased worktree $TREEHOUSE_LEASE_ABORT_PATH during spawn abort; its lease may still be held (release with: treehouse return --force $TREEHOUSE_LEASE_ABORT_PATH)" >&2
@@ -752,7 +764,14 @@ spawn_herdr_presentation_order_lock_acquire() {
   lock_path=$(fm_backend_herdr_presentation_session_lock_path "$session") || return 1
   HERDR_PRESENTATION_ORDER_LOCK="$lock_path"
   attempt=0
-  while [ "$attempt" -lt 50 ]; do
+  # Sized to outlast a sibling spawn's whole lock-held section: the lock is
+  # held through launch handoff, and a sibling's ordinary post-create abort
+  # holds it ~6.5s (projected create -> pane-entry wait -> focus-preserving
+  # abort cleanup, ~10 herdr calls). The previous 5s bound lost that race,
+  # so the loser fell back flat under exactly the concurrency the lock exists
+  # to serialize. A crashed holder is still stolen immediately by
+  # pid-liveness; only a live holder is waited out.
+  while [ "$attempt" -lt "${FM_SPAWN_HERDR_PRESENTATION_LOCK_ATTEMPTS:-300}" ]; do
     if fm_lock_try_acquire "$HERDR_PRESENTATION_ORDER_LOCK"; then
       HERDR_PRESENTATION_ORDER_LOCK_HELD=1
       return 0
@@ -936,6 +955,26 @@ case "$ARG3" in
     if [ "$KIND" = secondmate ]; then
       HARNESS=$("$FM_ROOT/bin/fm-harness.sh" secondmate)
       harness_src='config/secondmate-harness (falling back to config/crew-harness)'
+    elif RESPAWN_HARNESS=$(fm_meta_get "$STATE/$ID.meta" harness) && [ -n "$RESPAWN_HARNESS" ] \
+         && launch_template "$RESPAWN_HARNESS" "$KIND" >/dev/null; then
+      # #1571 gap B: a RESPAWN of an existing task returns the worker with the
+      # task's own recorded launch profile, not whatever config resolves
+      # today - otherwise recovery after a backend restart silently re-launches
+      # on a different harness/model/effort than the one supervising records
+      # and the brief were written for. Config and the dispatch-file backstop
+      # still govern genuinely new tasks (no meta yet); secondmates above
+      # deliberately keep re-resolving from config so a changed pin takes
+      # effect across restarts. An explicit --model/--effort still wins.
+      HARNESS=$RESPAWN_HARNESS
+      harness_src="the task's recorded metadata (respawn)"
+      if [ "${MODEL_SET:-0}" -eq 0 ]; then
+        RESPAWN_MODEL=$(fm_meta_get "$STATE/$ID.meta" model)
+        [ -z "$RESPAWN_MODEL" ] || [ "$RESPAWN_MODEL" = default ] || MODEL=$RESPAWN_MODEL
+      fi
+      if [ "${EFFORT_SET:-0}" -eq 0 ]; then
+        RESPAWN_EFFORT=$(fm_meta_get "$STATE/$ID.meta" effort)
+        [ -z "$RESPAWN_EFFORT" ] || [ "$RESPAWN_EFFORT" = default ] || EFFORT=$RESPAWN_EFFORT
+      fi
     else
       if [ -f "$CONFIG/crew-dispatch.json" ]; then
         echo "error: config/crew-dispatch.json is active - pass an explicit harness resolved from the dispatch rules (the consultation backstop, so the rules are never silently skipped)." >&2
@@ -1758,6 +1797,11 @@ case "$BACKEND" in
       read -r HERDR_TAB_ID HERDR_PANE_ID <<EOF
 $HERDR_TASK_IDS
 EOF
+      # Pre-metadata abort cleanup for the flat tab (#1912 adjacent gap; the
+      # herdr twin of TMUX_ABORT_WINDOW). Stood down once state/<id>.meta is
+      # published, from which point teardown owns the endpoint.
+      HERDR_FLAT_ABORT_SESSION=$HERDR_SES
+      HERDR_FLAT_ABORT_PANE=$HERDR_PANE_ID
     fi
     if [ -z "$HERDR_TAB_ID" ] || [ -z "$HERDR_PANE_ID" ]; then
       echo "error: herdr did not return a tab/pane id for $W" >&2
@@ -2374,8 +2418,10 @@ META_WINDOW=$T
 } > "$STATE/$ID.meta"
 [ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
 # Metadata is published: fm-teardown.sh now owns the endpoint and the lease,
-# so the pre-metadata abort cleanup (#1913) must stand down.
+# so the pre-metadata abort cleanup (#1913, flat-herdr #1912) must stand down.
 TMUX_ABORT_WINDOW=
+HERDR_FLAT_ABORT_SESSION=
+HERDR_FLAT_ABORT_PANE=
 TREEHOUSE_LEASE_ABORT_PATH=
 
 sq_brief=$(shell_quote "$BRIEF")
@@ -2419,6 +2465,20 @@ if [ "$KIND" = secondmate ]; then
   # Reuse the single frozen decision from the carrier resolution above so the
   # injected carrier and this on/off snapshot are guaranteed to agree.
   LAUNCH="FM_ROOT_OVERRIDE= FM_STATE_OVERRIDE= FM_DATA_OVERRIDE= FM_PROJECTS_OVERRIDE= FM_CONFIG_OVERRIDE= FM_PUBLIC_FOLLOWUP_PRIMARY_HOME=$sq_primary_home FM_HOME=$sq_home FM_TRACE_CONTEXT=$SPAWN_TRACE_EFFECTIVE FM_SUPERVISION_MODEL=$supervision_model $LAUNCH"
+fi
+# #1912: a herdr pane is created as a bare shell with no command, and the
+# secondmate path skips the crewmate worktree cwd-settle gate entirely, so
+# nothing yet proves the created shell still owns the pane. If a shell rc
+# `exec`d another process (e.g. a tmux auto-attach), everything typed below -
+# including the env-laden launch command - would land in whatever process took
+# over, silently. Prove one lone bare idle shell owns the exact pane before
+# the first typed byte; crewmates and scouts keep their stronger cwd-settle
+# gate as the equivalent proof.
+if [ "$BACKEND" = herdr ] && [ "$KIND" = secondmate ]; then
+  if ! fm_backend_herdr_pane_idle_shell_pid "$HERDR_SES" "$HERDR_PANE_ID" >/dev/null; then
+    echo "error: created herdr pane for $W does not hold a lone idle shell (a shell rc may have replaced it); refusing to type the launch command into an unproven pane" >&2
+    exit 1
+  fi
 fi
 # Export GOTMPDIR into the crewmate's pane shell so the agent and every child
 # process (go build, go test, ...) inherit it. Sent before the launch command so

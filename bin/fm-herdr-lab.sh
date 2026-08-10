@@ -49,9 +49,19 @@ fm_herdr_lab_tripwire_path() { # <session>
 }
 
 fm_herdr_lab_raw() { # <session> <herdr arguments...>
-  local name=$1
+  local name=$1 arg seen_dd=0
+  local -a pre=() post=()
   shift
-  HERDR_SESSION="$name" herdr "$@" --session "$name"
+  # --session must land BEFORE any literal `--` delimiter: everything after
+  # `--` is the launched child's argv, so a trailing flag would (a) never reach
+  # herdr, silently degrading isolation to the env var alone - which is not
+  # reliable when another herdr server is running - and (b) corrupt the child's
+  # argv with the stray `--session fm-lab-...` tokens (#1575).
+  for arg in "$@"; do
+    [ "$seen_dd" -eq 1 ] || [ "$arg" != '--' ] || seen_dd=1
+    if [ "$seen_dd" -eq 0 ]; then pre+=("$arg"); else post+=("$arg"); fi
+  done
+  HERDR_SESSION="$name" herdr ${pre[@]+"${pre[@]}"} --session "$name" ${post[@]+"${post[@]}"}
 }
 
 fm_herdr_lab_session_list() { # <session>

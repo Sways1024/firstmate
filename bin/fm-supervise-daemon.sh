@@ -1152,6 +1152,27 @@ inject_msg() {  # <message> [state]
     log "inject deferred: supervisor composer not confirmed-empty (state=${composer:-unknown}: pending input, dead-shell prompt, or unreadable pane)"
     return 1
   fi
+  #   c) Duplicate-digest guard (#1859's residual): a submit that actually
+  #      LANDED but returned `unknown` (pane unreadable at confirm time) left
+  #      the buffer preserved, and the next flush retyped the identical digest
+  #      as a duplicate turn - the measured 16h incident was 59 repeat
+  #      deliveries of unchanged payloads. If the exact digest we last typed
+  #      with an unconfirmed submit reaches an EMPTY composer within the dedup
+  #      window, the earlier Enter was accepted (swallowed text would still be
+  #      sitting in the composer and defer above) - treat it as delivered.
+  #      A different digest always passes; a confirmed submit clears the marker.
+  local dedup_marker last_hash last_ts
+  dedup_marker="$state/.subsuper-last-unconfirmed-inject"
+  if [ -f "$dedup_marker" ]; then
+    read -r last_hash last_ts < "$dedup_marker" 2>/dev/null || { last_hash=; last_ts=; }
+    if [ "$last_hash" = "$(_hash_text "$msg")" ] \
+       && [ -n "$last_ts" ] \
+       && [ $(( $(_now) - last_ts )) -le "${FM_INJECT_DEDUP_SECS:-3600}" ]; then
+      rm -f "$dedup_marker"
+      log "inject deduped: identical digest already typed with an unconfirmed submit and the composer is now empty; treating the earlier submit as delivered"
+      return 0
+    fi
+  fi
   # (4) Type the digest ONCE, then submit with Enter (retry Enter only, never
   # retype) via the shared submit primitive. Success = the backend confirms
   # submit. An unconfirmed/unknown pane does NOT count as delivered, so the
@@ -1163,7 +1184,14 @@ inject_msg() {  # <message> [state]
   sleep_s=${FM_INJECT_CONFIRM_SLEEP:-$INJECT_CONFIRM_SLEEP_DEFAULT}
   verdict=$(fm_backend_send_text_submit "$backend" "$target" "$msg" "$retries" "$sleep_s" "$sleep_s")
   if [ "$verdict" = empty ]; then
+    rm -f "$dedup_marker"
     return 0  # Backend confirmed the submit.
+  fi
+  if [ "$verdict" = unknown ]; then
+    # Typed once, Enter retried, confirmation unreadable: arm the
+    # duplicate-digest guard above so a retype of THIS exact digest into a
+    # later empty composer is recognized as already delivered.
+    printf '%s %s\n' "$(_hash_text "$msg")" "$(_now)" > "$dedup_marker" 2>/dev/null || true
   fi
   log "inject failed: submit unconfirmed after $retries retries (verdict=$verdict, text may be in composer)"
   return 1

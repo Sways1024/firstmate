@@ -1920,8 +1920,42 @@ test_pane_is_busy_herdr_native_busy_state
 test_primary_busy_guard_is_harness_scoped
 test_pane_is_busy_defaults_to_tmux_when_backend_omitted
 test_pane_input_pending_herdr_dispatch
+test_inject_msg_dedups_identical_digest_after_unknown_submit() {
+  local dir state
+  dir=$(make_supercase inject-dedup)
+  state="$dir/state"
+  afk_enter "$state"
+  (
+    fm_backend_target_exists() { return 0; }
+    pane_is_busy() { return 1; }
+    fm_backend_composer_state() { printf 'empty'; }
+    # First attempt: typed once, submit confirmation unreadable (#1859's
+    # residual - the 16h incident was 59 repeat deliveries of unchanged
+    # payloads after exactly this verdict).
+    fm_backend_send_text_submit() { printf 'unknown'; }
+    if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "digest one" "$state"; then
+      fail "an unknown submit verdict must report undelivered"
+    fi
+    [ -f "$state/.subsuper-last-unconfirmed-inject" ] \
+      || fail "an unknown submit verdict must arm the duplicate-digest marker"
+    # Retry of the IDENTICAL digest into an empty composer: the earlier Enter
+    # was accepted (swallowed text would still read pending) - no retype.
+    fm_backend_send_text_submit() { fail "an identical unconfirmed digest must not be retyped into an empty composer"; }
+    FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "digest one" "$state" \
+      || fail "the deduped identical digest must report delivered"
+    [ ! -f "$state/.subsuper-last-unconfirmed-inject" ] \
+      || fail "a deduped delivery must clear the duplicate-digest marker"
+    # A DIFFERENT digest still types and submits normally.
+    fm_backend_send_text_submit() { printf 'empty'; }
+    FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "digest two" "$state" \
+      || fail "a different digest must submit normally"
+  ) || fail "dedup inject_msg subshell failed"
+  pass "inject_msg: an identical digest after an unknown submit dedups instead of retyping"
+}
+
 test_inject_msg_herdr_busy_guard_defers
 test_inject_msg_herdr_composer_guard_defers
+test_inject_msg_dedups_identical_digest_after_unknown_submit
 test_inject_msg_herdr_pane_gone_defers
 test_inject_msg_herdr_submits_through_backend_dispatch
 test_inject_msg_defers_on_dead_shell_unknown
