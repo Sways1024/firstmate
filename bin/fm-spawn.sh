@@ -752,7 +752,14 @@ spawn_herdr_presentation_order_lock_acquire() {
   lock_path=$(fm_backend_herdr_presentation_session_lock_path "$session") || return 1
   HERDR_PRESENTATION_ORDER_LOCK="$lock_path"
   attempt=0
-  while [ "$attempt" -lt 50 ]; do
+  # Sized to outlast a sibling spawn's whole lock-held section: the lock is
+  # held through launch handoff, and a sibling's ordinary post-create abort
+  # holds it ~6.5s (projected create -> pane-entry wait -> focus-preserving
+  # abort cleanup, ~10 herdr calls). The previous 5s bound lost that race,
+  # so the loser fell back flat under exactly the concurrency the lock exists
+  # to serialize. A crashed holder is still stolen immediately by
+  # pid-liveness; only a live holder is waited out.
+  while [ "$attempt" -lt "${FM_SPAWN_HERDR_PRESENTATION_LOCK_ATTEMPTS:-300}" ]; do
     if fm_lock_try_acquire "$HERDR_PRESENTATION_ORDER_LOCK"; then
       HERDR_PRESENTATION_ORDER_LOCK_HELD=1
       return 0
