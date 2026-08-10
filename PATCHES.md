@@ -28,6 +28,17 @@ one case; likely Node 26 vs upstream's runtime — irrelevant unless Pi becomes
 a crew harness. (The presentation e2e's abort-cleanup and journal-retirement
 failures previously listed here are fixed by `fix/herdr-followups`.)
 
+Load-sensitive under a full parallel `--changed` run, all three pass solo on an
+idle machine — rerun individually before investigating:
+`tests/fm-vendor-auth-probe.test.sh` (wall-clock bound assertions; measured
+312s against a 20s bound while the suite saturated the machine),
+`tests/fm-watcher-lock.test.sh` (exit 124), and
+`tests/fm-backend-herdr-presentation-e2e.test.sh` (real-herdr lab timing).
+
+Last full verification: 2026-08-10 on herdr 0.8.0 / protocol 19 —
+111 test files, 1,905 assertions green; the only failures were the
+pre-existing Pi case and the two load artifacts above.
+
 ## Standing captain rules (add to `data/captain.md` on first setup)
 
 ```
