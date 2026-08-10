@@ -8,6 +8,20 @@
 | `fix/supervision-wakes` | [#1897](https://github.com/kunchenguid/firstmate/issues/1897), [#1769](https://github.com/kunchenguid/firstmate/issues/1769), [#1792](https://github.com/kunchenguid/firstmate/issues/1792), [#1033](https://github.com/kunchenguid/firstmate/issues/1033) | PRs closed without merging produce a needs-decision wake instead of stranding the task. The wedge detector re-consults the busy contract and progress signals before escalating. Stale busy records contradicted by later status-log lines classify unknown. no-mistakes workers drive their own validation run. |
 | `fix/herdr-daily-use` | [#883](https://github.com/kunchenguid/firstmate/issues/883), [#1011](https://github.com/kunchenguid/firstmate/issues/1011), [#1571](https://github.com/kunchenguid/firstmate/issues/1571) (gap A) | Composer glyph stripping is locale-safe (literal patterns, not byte counts) — under `LC_ALL=C` an idle composer no longer reads pending forever, which was the root feeder of the away-mode deferral wedge on herdr. The herdr events probe and socket lookup no longer EPIPE-spam stderr on every watcher start. Every harness Resume row carries the launch's autonomy flags/env (claude gains a Resume row); stuck-crewmate-recovery requires flag-carrying resumes and adds the restore-to-clone trust-dialog hazard. Gap B (respawn re-resolving harness/model/effort from config instead of recorded meta) is follow-up. |
 
+Direct on `patched` (fork infrastructure, no upstream issue): PATCHES.md is
+registered in `bin/fm-test-run.sh`'s changed-test map and in
+`docs/documentation-audiences.json`, because `--changed` verification dies on
+any unmapped/unclassified file — it previously aborted before selecting a
+single test, so earlier "verified with --changed" runs never actually ran.
+
+Known pre-existing failures on this machine (reproduced at pristine upstream
+`833a9a2`, not caused by our patches): `tests/fm-pi-watch-extension.test.sh`
+(one case; likely Node 26 vs upstream's runtime — irrelevant unless Pi becomes
+a crew harness) and `tests/fm-backend-herdr-presentation-e2e.test.sh`'s
+concurrent post-create abort-cleanup lock assertion (upstream defect; worst
+case is a stray workspace needing manual cleanup — queued with the follow-up
+herdr fixes).
+
 ## Standing captain rules (add to `data/captain.md` on first setup)
 
 ```
