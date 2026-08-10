@@ -640,6 +640,8 @@ HERDR_PROJECTION_ABORT_CLEANUP=0
 HERDR_PROJECTION_ABORT_SESSION=
 HERDR_PROJECTION_ABORT_TASK_PANE=
 HERDR_PROJECTION_ABORT_SEEDED_PANE=
+HERDR_FLAT_ABORT_SESSION=
+HERDR_FLAT_ABORT_PANE=
 HERDR_PRESENTATION_ORDER_LOCK=
 HERDR_PRESENTATION_ORDER_LOCK_HELD=0
 SPAWN_TASK_LOCK=
@@ -724,6 +726,16 @@ spawn_abort_cleanup() {
   if [ -n "${TMUX_ABORT_WINDOW:-}" ]; then
     fm_backend_tmux_kill_window_id "$TMUX_ABORT_WINDOW" || true
     TMUX_ABORT_WINDOW=
+  fi
+  # The flat-herdr analog of the tmux branch above (#1912's adjacent gap): an
+  # aborted flat spawn used to leave its just-created tab alive as an orphan
+  # shell pane sitting in the primary checkout, invisible to teardown because
+  # no metadata was ever written. fm_backend_herdr_kill serializes under the
+  # session presentation lock and tolerates an already-gone pane.
+  if [ -n "${HERDR_FLAT_ABORT_PANE:-}" ]; then
+    fm_backend_herdr_kill "$HERDR_FLAT_ABORT_SESSION:$HERDR_FLAT_ABORT_PANE" 2>/dev/null || true
+    HERDR_FLAT_ABORT_PANE=
+    HERDR_FLAT_ABORT_SESSION=
   fi
   if [ -n "${TREEHOUSE_LEASE_ABORT_PATH:-}" ]; then
     if ! ( cd "${PROJ_ABS:-.}" && treehouse return --force "$TREEHOUSE_LEASE_ABORT_PATH" ) >/dev/null 2>&1; then
@@ -1765,6 +1777,11 @@ case "$BACKEND" in
       read -r HERDR_TAB_ID HERDR_PANE_ID <<EOF
 $HERDR_TASK_IDS
 EOF
+      # Pre-metadata abort cleanup for the flat tab (#1912 adjacent gap; the
+      # herdr twin of TMUX_ABORT_WINDOW). Stood down once state/<id>.meta is
+      # published, from which point teardown owns the endpoint.
+      HERDR_FLAT_ABORT_SESSION=$HERDR_SES
+      HERDR_FLAT_ABORT_PANE=$HERDR_PANE_ID
     fi
     if [ -z "$HERDR_TAB_ID" ] || [ -z "$HERDR_PANE_ID" ]; then
       echo "error: herdr did not return a tab/pane id for $W" >&2
@@ -2381,8 +2398,10 @@ META_WINDOW=$T
 } > "$STATE/$ID.meta"
 [ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
 # Metadata is published: fm-teardown.sh now owns the endpoint and the lease,
-# so the pre-metadata abort cleanup (#1913) must stand down.
+# so the pre-metadata abort cleanup (#1913, flat-herdr #1912) must stand down.
 TMUX_ABORT_WINDOW=
+HERDR_FLAT_ABORT_SESSION=
+HERDR_FLAT_ABORT_PANE=
 TREEHOUSE_LEASE_ABORT_PATH=
 
 sq_brief=$(shell_quote "$BRIEF")
@@ -2426,6 +2445,20 @@ if [ "$KIND" = secondmate ]; then
   # Reuse the single frozen decision from the carrier resolution above so the
   # injected carrier and this on/off snapshot are guaranteed to agree.
   LAUNCH="FM_ROOT_OVERRIDE= FM_STATE_OVERRIDE= FM_DATA_OVERRIDE= FM_PROJECTS_OVERRIDE= FM_CONFIG_OVERRIDE= FM_PUBLIC_FOLLOWUP_PRIMARY_HOME=$sq_primary_home FM_HOME=$sq_home FM_TRACE_CONTEXT=$SPAWN_TRACE_EFFECTIVE FM_SUPERVISION_MODEL=$supervision_model $LAUNCH"
+fi
+# #1912: a herdr pane is created as a bare shell with no command, and the
+# secondmate path skips the crewmate worktree cwd-settle gate entirely, so
+# nothing yet proves the created shell still owns the pane. If a shell rc
+# `exec`d another process (e.g. a tmux auto-attach), everything typed below -
+# including the env-laden launch command - would land in whatever process took
+# over, silently. Prove one lone bare idle shell owns the exact pane before
+# the first typed byte; crewmates and scouts keep their stronger cwd-settle
+# gate as the equivalent proof.
+if [ "$BACKEND" = herdr ] && [ "$KIND" = secondmate ]; then
+  if ! fm_backend_herdr_pane_idle_shell_pid "$HERDR_SES" "$HERDR_PANE_ID" >/dev/null; then
+    echo "error: created herdr pane for $W does not hold a lone idle shell (a shell rc may have replaced it); refusing to type the launch command into an unproven pane" >&2
+    exit 1
+  fi
 fi
 # Export GOTMPDIR into the crewmate's pane shell so the agent and every child
 # process (go build, go test, ...) inherit it. Sent before the launch command so
