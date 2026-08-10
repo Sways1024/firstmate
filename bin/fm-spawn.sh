@@ -955,6 +955,26 @@ case "$ARG3" in
     if [ "$KIND" = secondmate ]; then
       HARNESS=$("$FM_ROOT/bin/fm-harness.sh" secondmate)
       harness_src='config/secondmate-harness (falling back to config/crew-harness)'
+    elif RESPAWN_HARNESS=$(fm_meta_get "$STATE/$ID.meta" harness) && [ -n "$RESPAWN_HARNESS" ] \
+         && launch_template "$RESPAWN_HARNESS" "$KIND" >/dev/null; then
+      # #1571 gap B: a RESPAWN of an existing task returns the worker with the
+      # task's own recorded launch profile, not whatever config resolves
+      # today - otherwise recovery after a backend restart silently re-launches
+      # on a different harness/model/effort than the one supervising records
+      # and the brief were written for. Config and the dispatch-file backstop
+      # still govern genuinely new tasks (no meta yet); secondmates above
+      # deliberately keep re-resolving from config so a changed pin takes
+      # effect across restarts. An explicit --model/--effort still wins.
+      HARNESS=$RESPAWN_HARNESS
+      harness_src="the task's recorded metadata (respawn)"
+      if [ "${MODEL_SET:-0}" -eq 0 ]; then
+        RESPAWN_MODEL=$(fm_meta_get "$STATE/$ID.meta" model)
+        [ -z "$RESPAWN_MODEL" ] || [ "$RESPAWN_MODEL" = default ] || MODEL=$RESPAWN_MODEL
+      fi
+      if [ "${EFFORT_SET:-0}" -eq 0 ]; then
+        RESPAWN_EFFORT=$(fm_meta_get "$STATE/$ID.meta" effort)
+        [ -z "$RESPAWN_EFFORT" ] || [ "$RESPAWN_EFFORT" = default ] || EFFORT=$RESPAWN_EFFORT
+      fi
     else
       if [ -f "$CONFIG/crew-dispatch.json" ]; then
         echo "error: config/crew-dispatch.json is active - pass an explicit harness resolved from the dispatch rules (the consultation backstop, so the rules are never silently skipped)." >&2
