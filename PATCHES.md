@@ -1,12 +1,13 @@
 # Local patches (Sways1024 fork)
 
-`patched` = upstream HEAD `833a9a2` (2026-08-07) plus sixteen fixes on four branches:
+`patched` = upstream HEAD `833a9a2` (2026-08-07) plus eighteen fixes on five branches:
 
 | Branch | Upstream issues | Fix |
 | --- | --- | --- |
 | `fix/spawn-lifecycle` | [#1573](https://github.com/kunchenguid/firstmate/issues/1573)/[#1924](https://github.com/kunchenguid/firstmate/issues/1924), [#1913](https://github.com/kunchenguid/firstmate/issues/1913), [#1818](https://github.com/kunchenguid/firstmate/issues/1818) | Spawns lease their worktree (`treehouse get --lease --lease-holder fm-<id>`) and refuse a live sibling's checkout — closes the data-loss window. Aborted spawns kill their tmux window and release the lease. Crewmates share the project's Claude auto-memory store. |
 | `fix/supervision-wakes` | [#1897](https://github.com/kunchenguid/firstmate/issues/1897), [#1769](https://github.com/kunchenguid/firstmate/issues/1769), [#1792](https://github.com/kunchenguid/firstmate/issues/1792), [#1033](https://github.com/kunchenguid/firstmate/issues/1033) | PRs closed without merging produce a needs-decision wake instead of stranding the task. The wedge detector re-consults the busy contract and progress signals before escalating. Stale busy records contradicted by later status-log lines classify unknown. no-mistakes workers drive their own validation run. |
 | `fix/herdr-daily-use` | [#883](https://github.com/kunchenguid/firstmate/issues/883), [#1011](https://github.com/kunchenguid/firstmate/issues/1011), [#1571](https://github.com/kunchenguid/firstmate/issues/1571) (gap A) | Composer glyph stripping is locale-safe (literal patterns, not byte counts) — under `LC_ALL=C` an idle composer no longer reads pending forever, which was the root feeder of the away-mode deferral wedge on herdr. The herdr events probe and socket lookup no longer EPIPE-spam stderr on every watcher start. Every harness Resume row carries the launch's autonomy flags/env (claude gains a Resume row); stuck-crewmate-recovery requires flag-carrying resumes and adds the restore-to-clone trust-dialog hazard. |
+| `fix/herdr-operability` | [#1912](https://github.com/kunchenguid/firstmate/issues/1912)-adjacent (dialogs), workspace-label collision | Claude's two first-launch dialogs are documented with their exact options: the workspace-trust prompt preselects "Yes", but the bypass-permissions prompt preselects **"No, exit"**, so the blind `--key Enter` the skill used to recommend killed the crewmate before it read its brief. Firstmate resolves its own herdr container by a recorded exact workspace id (`state/.herdr-home-workspace`) instead of the mutable label, so a captain's personal workspace that herdr auto-labeled `firstmate` from its directory name is neither adopted nor able to refuse spawns. |
 | `fix/herdr-followups` | [#730](https://github.com/kunchenguid/firstmate/issues/730), [#1337](https://github.com/kunchenguid/firstmate/issues/1337), [#1571](https://github.com/kunchenguid/firstmate/issues/1571) (gap B), [#1575](https://github.com/kunchenguid/firstmate/issues/1575), [#1859](https://github.com/kunchenguid/firstmate/issues/1859), [#1912](https://github.com/kunchenguid/firstmate/issues/1912) | Lab helper places `--session` before a `--` child-argv delimiter (isolation no longer silently degrades; production wrapper hardened identically). Per-home workspace find+create serializes under a session+label mint lock (no duplicate-workspace race). Presentation-lock wait raised 5s→30s (`FM_SPAWN_HERDR_PRESENTATION_LOCK_ATTEMPTS`) so concurrent abort cleanup actually serializes instead of falling back flat. Journal retirement rides the confirmed-gone gate with a bounded reap settle — a pane that died before teardown no longer quarantines its journal forever. Herdr secondmate spawns refuse only on positive evidence that a non-shell took the pane over (two agreeing samples; unreadable or ambiguous reads proceed); aborted flat spawns close their orphan tab (herdr twin of the #1913 tmux fix). Respawns keep the task's recorded harness/model/effort. Away-mode dedups an identical digest whose submit went unconfirmed. With these, `tests/fm-backend-herdr-presentation-e2e.test.sh` passes fully on herdr 0.8.0/protocol 19 for the first time on this machine. |
 
 Direct on `patched` (fork infrastructure, no upstream issue): PATCHES.md is
@@ -77,6 +78,20 @@ cd ~/dev/firstmate
 # 3b. Select the herdr runtime backend (our standing choice; tmux stays
 #     installed as the verified fallback — write `tmux` here to revert):
 mkdir -p config && printf 'herdr\n' > config/backend
+
+# 3c. Point origin/HEAD at our canonical branch. This is a LOCAL git ref, so it
+#     does not travel with the clone and must be set on every machine.
+#     Without it the worktree-tangle guard resolves the default branch as
+#     `main` and warns on every command that this checkout is "stranded" on
+#     `patched` — which is where our work correctly lives. It feeds nothing but
+#     that guard (bin/fm-tangle-lib.sh's fm_default_branch has exactly two
+#     callers, both tangle checks), so sync and merge behavior are unaffected.
+git remote set-head origin patched
+
+# 3d. Optional: silence treehouse's update nag. It offers upstream v2.1.1,
+#     which would REPLACE our patched fork and drop the `--lease` support
+#     bin/fm-spawn.sh depends on. Never accept it; this just stops the prompt.
+export TREEHOUSE_NO_UPDATE_CHECK=1   # also put in ~/.zshrc
 
 # 4. Optional continuity from the old machine: copy data/, config/, .env
 #    (NEVER state/ — it is machine-bound). Add the captain rules above

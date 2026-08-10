@@ -178,7 +178,19 @@ The shared symptom is a healthy-looking pane with no work in progress, so each a
 
 First launch in a fresh worktree, or first ever on a machine, may show a trust or bypass-permissions confirmation.
 After every spawn, peek the pane within about 20 seconds.
-If such a dialog is showing, accept it from an active firstmate session using `FM_HOME=<this-firstmate-home> bin/fm-send.sh <window> --key Enter`, or the choice the dialog requires, unless `FM_HOME` is already set to the active firstmate home; verify the brief started processing.
+Accept from an active firstmate session with `FM_HOME=<this-firstmate-home> bin/fm-send.sh <window> --key <choice>`, unless `FM_HOME` is already set to the active firstmate home; then verify the brief started processing.
+
+**Never send a blind Enter to a Claude dialog: read the pane and send the accepting option's own number.**
+There are two distinct dialogs and their defaults point opposite ways (live-verified 2026-08-10, Claude Code 2.1.226, herdr backend):
+
+| Dialog | Options | Preselected | Accept with |
+|---|---|---|---|
+| `Accessing workspace: <path>` / "Is this a project you created or one you trust?" | `1. Yes, I trust this folder` / `2. No, exit` | 1 (accepts) | `--key Enter` |
+| `Bypass Permissions mode` / "you accept all responsibility" | `1. No, exit` / `2. Yes, I accept` | **1 (EXITS)** | `--key 2` then `--key Enter` |
+
+On the bypass dialog a bare Enter selects `No, exit` and kills the crewmate before it ever reads its brief, leaving a task whose endpoint dies seconds after a successful-looking spawn.
+The bypass dialog appears once per machine rather than once per worktree, so it is easy to forget and it always fires on a newly set-up machine.
+Confirm acceptance by peeking for the composer footer `⏵⏵ bypass permissions on` rather than assuming the keys landed; if the dialog is still rendered, send the accepting number again before Enter.
 
 Claude renders a predicted-next-prompt suggestion as dim/faint text inside an otherwise-empty composer after a turn completes.
 A plain `tmux capture-pane` cannot tell that ghost text apart from typed text.

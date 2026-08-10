@@ -1802,6 +1802,18 @@ EOF
       # published, from which point teardown owns the endpoint.
       HERDR_FLAT_ABORT_SESSION=$HERDR_SES
       HERDR_FLAT_ABORT_PANE=$HERDR_PANE_ID
+      # A non-empty seeded default tab id means container_ensure CREATED a
+      # workspace rather than adopting one, so record it by exact id. Later
+      # lookups then resolve this home's own container without trusting the
+      # mutable label, which herdr derives from a directory basename and a
+      # captain working in a directory named `firstmate` collides with.
+      # Only ever record OUR OWN container: a --secondmate spawn ensures the
+      # SECONDMATE's labeled workspace (HERDR_LABEL_HOME is its home, not
+      # ours), and recording that id here would point this home's recovery and
+      # list-live at the secondmate's workspace instead of its own.
+      if [ -n "$HERDR_SEEDED_DEFAULT_TAB_ID" ] && [ "$HERDR_LABEL_HOME" = "$FM_HOME" ]; then
+        fm_backend_herdr_home_workspace_record_write "$HERDR_SES" "$HERDR_WORKSPACE_ID"
+      fi
     fi
     if [ -z "$HERDR_TAB_ID" ] || [ -z "$HERDR_PANE_ID" ]; then
       echo "error: herdr did not return a tab/pane id for $W" >&2
