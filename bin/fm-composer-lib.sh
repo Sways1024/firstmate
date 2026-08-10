@@ -215,10 +215,21 @@ fm_composer_classify_content() {  # <bordered> <content> [idle_re] [idle_case] [
   if fm_composer_idle_matches "$content" "$idle_re" "$idle_case"; then
     printf 'empty'; return 0
   fi
-  # Strip a leading prompt glyph, then re-judge the remainder.
+  # Strip a leading prompt glyph, then re-judge the remainder. The multibyte
+  # agent glyphs are removed as literal patterns because under a C/POSIX locale
+  # `?` matches one BYTE: ${content#??} would strip only two of a UTF-8 glyph's
+  # three bytes, the stray tail byte then breaks the idle-placeholder re-match
+  # below, and an idle composer misreads as pending forever (upstream #883).
+  # The single-byte ASCII shell glyphs keep the positional strip.
   case "$content" in
-    '❯ '*|'› '*|'⟩ '*|'> '*|'$ '*|'% '*|'# '*) content=${content#??} ;;
-    '❯'*|'›'*|'⟩'*|'>'*|'$'*|'%'*|'#'*) content=${content#?} ;;
+    '❯ '*) content=${content#'❯ '} ;;
+    '› '*) content=${content#'› '} ;;
+    '⟩ '*) content=${content#'⟩ '} ;;
+    '> '*|'$ '*|'% '*|'# '*) content=${content#??} ;;
+    '❯'*) content=${content#'❯'} ;;
+    '›'*) content=${content#'›'} ;;
+    '⟩'*) content=${content#'⟩'} ;;
+    '>'*|'$'*|'%'*|'#'*) content=${content#?} ;;
   esac
   content="${content#"${content%%[![:space:]]*}"}"
   content="${content%"${content##*[![:space:]]}"}"
