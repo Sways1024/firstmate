@@ -738,6 +738,35 @@ fm_backend_herdr_presentation_session_socket_path() {  # <session>
   fm_backend_herdr_canonical_socket_path "$socket"
 }
 
+# fm_backend_herdr_workspace_mint_lock_path: machine-private lock serializing
+# the per-home workspace find+create pair (#730). Keyed on session name plus
+# home label - deliberately NOT on the resolved socket, so it needs no herdr
+# round-trip and exists even while the session is still starting. Two herdr
+# servers sharing a session name on one machine over-serialize harmlessly
+# (bounded wait); under-serialization is what mints duplicate workspaces.
+fm_backend_herdr_workspace_mint_lock_path() {  # <session> <label>
+  local session=$1 label=$2 key dir hash
+  [ -n "$session" ] && [ -n "$label" ] || return 1
+  if command -v shasum >/dev/null 2>&1; then
+    hash=$(printf '%s\0%s' "$session" "$label" | shasum -a 256 2>/dev/null | awk '{print $1}')
+  elif command -v sha256sum >/dev/null 2>&1; then
+    hash=$(printf '%s\0%s' "$session" "$label" | sha256sum 2>/dev/null | awk '{print $1}')
+  else
+    return 1
+  fi
+  [ -n "$hash" ] || return 1
+  key=${hash:0:32}
+  dir=$(fm_backend_herdr_presentation_lock_namespace) || return 1
+  [ -n "$dir" ] || return 1
+  if [ ! -e "$dir" ] && [ ! -L "$dir" ]; then
+    if ! mkdir -m 700 "$dir" 2>/dev/null; then
+      fm_backend_herdr_presentation_lock_namespace_valid "$dir" || return 1
+    fi
+  fi
+  fm_backend_herdr_presentation_lock_namespace_valid "$dir" || return 1
+  printf '%s/mint-%s.lock' "$dir" "$key"
+}
+
 fm_backend_herdr_presentation_session_lock_path() {  # <session>
   local session=$1 socket key dir hash
   [ -n "$session" ] || return 1
@@ -1773,6 +1802,39 @@ fm_backend_herdr_workspace_ensure() {  # <session> <cwd> [<launcher-relationship
       *) return 3 ;;
     esac
   fi
+  # Serialize the label find+create pair per session+label (#730): two
+  # concurrent FIRST spawns from a home with no launcher pane identity both
+  # read zero matches and both create, minting duplicate same-labeled home
+  # workspaces - which every later no-identity spawn then refuses (the count>1
+  # error in the helper below) until a human deletes one. The mint lock needs
+  # no herdr round-trip; an unresolvable lock path degrades to the historical
+  # unlocked behavior with a warning rather than failing the spawn.
+  local lock_path='' lock_held=0 attempt=0
+  if ! declare -F fm_lock_try_acquire >/dev/null 2>&1; then
+    # shellcheck source=bin/fm-wake-lib.sh
+    . "$FM_BACKEND_HERDR_ROOT/bin/fm-wake-lib.sh"
+  fi
+  if lock_path=$(fm_backend_herdr_workspace_mint_lock_path "$session" "$(fm_backend_herdr_workspace_label)"); then
+    while [ "$attempt" -lt 50 ]; do
+      if fm_lock_try_acquire "$lock_path"; then
+        lock_held=1
+        break
+      fi
+      sleep 0.1
+      attempt=$((attempt + 1))
+    done
+  fi
+  [ "$lock_held" = 1 ] || echo "warning: herdr workspace ensure could not acquire its workspace-mint lock; a concurrent first spawn could mint a duplicate home workspace" >&2
+  fm_backend_herdr_workspace_ensure_by_label "$session" "$cwd" && status=0 || status=$?
+  [ "$lock_held" -eq 0 ] || fm_lock_release "$lock_path" || true
+  return "$status"
+}
+
+# The label-lookup half of fm_backend_herdr_workspace_ensure, run under the
+# per-session lock above. Same return contract: 0 with the wsid on stdout,
+# 3 for a reported refusal, 1 for a failed or unparseable herdr call.
+fm_backend_herdr_workspace_ensure_by_label() {  # <session> <cwd>
+  local session=$1 cwd=$2 wsid out label matches count
   label=$(fm_backend_herdr_workspace_label)
   matches=$(fm_backend_herdr_workspace_find_all "$session")
   count=$(printf '%s' "$matches" | grep -c '[^[:space:]]' || true)
