@@ -339,17 +339,55 @@ PRESD_ORDER=$(lab workspace list 2>/dev/null | jq -r --arg dup "$WS_PRIMARY_DUP"
 [ "$(focused_workspace)" = "$WS_OTHER" ] || fail "a projected spawn stole focus from the captain's workspace"
 pass "real herdr E2E: with a duplicated home label, a projected worker still hangs off the launcher's exact workspace and the sibling stays untouched"
 
-# --- 4. duplicate label with NO launcher identity refuses before publishing --
+# --- 4. duplicate label with NO launcher identity: the RECORDED container
+#        resolves it, and only its absence falls back to the refusal ----------
+# Section 1's spawn created this home's own workspace, so fm-spawn recorded it
+# by exact id (state/.herdr-home-workspace). A second workspace carrying the
+# same label - what a captain gets for free by working in a directory named
+# `firstmate` - therefore no longer makes the placement ambiguous: firstmate
+# knows which one it created. The safety property is unchanged and asserted
+# below: it must place into its OWN recorded workspace and leave the captain's
+# same-labeled workspace untouched.
 
+HOME_WS_RECORD="$PRIMARY_HOME/state/.herdr-home-workspace"
+[ -f "$HOME_WS_RECORD" ] || fail "section 1's created container was never recorded"
+[ "$(cut -f2 < "$HOME_WS_RECORD")" = "$WS_PRIMARY" ] \
+  || fail "the recorded container is not the workspace section 1 created"$'\n'"$(cat "$HOME_WS_RECORD")"
+
+DUP_TABS_BEFORE=$(tab_labels_of_workspace "$WS_PRIMARY_DUP")
 spawn_from_launcher "" "$PRIMARY_HOME" dupD "$PROJ" --mode no-mistakes --yolo off
-[ "$SPAWN_RC" -ne 0 ] || fail "a duplicate-labeled home workspace with no herdr parent must refuse, not guess"
-assert_contains_local "$(cat "$SPAWN_ERR")" "labeled 'firstmate'" \
-  "the refusal did not name the duplicated home label"
-[ ! -e "$PRIMARY_HOME/state/dupD.meta" ] || fail "a refused spawn must not publish task metadata"
-DUP_TABS=$(lab tab list --workspace "$WS_PRIMARY" 2>/dev/null | jq -r '[.result.tabs[]? | select(.label == "fm-dupD")] | length')
-DUP_TABS2=$(lab tab list --workspace "$WS_PRIMARY_DUP" 2>/dev/null | jq -r '[.result.tabs[]? | select(.label == "fm-dupD")] | length')
+[ "$SPAWN_RC" -eq 0 ] \
+  || fail "a recorded container must resolve a duplicated home label instead of refusing"$'\n'"$(cat "$SPAWN_ERR")"
+DUPD_META="$PRIMARY_HOME/state/dupD.meta"
+record_worktree "$DUPD_META"
+DUPD_PANE=$(grep '^herdr_pane_id=' "$DUPD_META" | cut -d= -f2-)
+[ -n "$DUPD_PANE" ] || fail "dupD meta is missing herdr_pane_id"
+DUPD_PARENT=$(journal_field "$PRIMARY_HOME/state/dupD.herdr-presentation" parent_workspace_id)
+[ "${DUPD_PARENT:-$(workspace_of_pane "$DUPD_PANE")}" = "$WS_PRIMARY" ] \
+  || fail "the worker hung off '$DUPD_PARENT', not this home's own recorded workspace '$WS_PRIMARY'"
+[ "$(tab_labels_of_workspace "$WS_PRIMARY_DUP")" = "$DUP_TABS_BEFORE" ] \
+  || fail "the captain's same-labeled workspace was mutated by the spawn"
+[ "$(focused_workspace)" = "$WS_OTHER" ] || fail "the spawn stole focus from the captain's workspace"
+pass "real herdr E2E: a recorded container resolves a duplicated home label and never touches the captain's same-labeled workspace"
+
+# 4b. WITHOUT the record, the historical ambiguity refusal still stands: two
+#     workspaces firstmate cannot tell apart must never be guessed between.
+mv "$HOME_WS_RECORD" "$HOME_WS_RECORD.parked" || fail "could not park the container record"
+spawn_from_launcher "" "$PRIMARY_HOME" dupE "$PROJ" --mode no-mistakes --yolo off
+# Refusing is the contract; WHICH layer refuses is not. With presentation
+# spaces on, the projection parent lookup finds the label ambiguous first and
+# degrades to the flat path, which then refuses - so the exact wording depends
+# on layer ordering. The unit matrix in tests/fm-backend-herdr.test.sh pins the
+# container-layer message and its rc=3; here we assert the outcome that
+# actually protects the captain: no guess, no endpoint, no metadata.
+[ "$SPAWN_RC" -ne 0 ] \
+  || fail "with no record, a duplicate-labeled home workspace must refuse, not guess"$'\n'"stderr: $(cat "$SPAWN_ERR")"
+[ ! -e "$PRIMARY_HOME/state/dupE.meta" ] || fail "a refused spawn must not publish task metadata"
+DUP_TABS=$(lab tab list --workspace "$WS_PRIMARY" 2>/dev/null | jq -r '[.result.tabs[]? | select(.label == "fm-dupE")] | length')
+DUP_TABS2=$(lab tab list --workspace "$WS_PRIMARY_DUP" 2>/dev/null | jq -r '[.result.tabs[]? | select(.label == "fm-dupE")] | length')
 [ "$DUP_TABS" = 0 ] && [ "$DUP_TABS2" = 0 ] || fail "a refused spawn created a worker endpoint anyway"
-pass "real herdr E2E: an ambiguous home label with no launcher identity refuses before any worker endpoint exists"
+mv "$HOME_WS_RECORD.parked" "$HOME_WS_RECORD" || fail "could not restore the container record"
+pass "real herdr E2E: with no recorded container, an ambiguous home label still refuses before any worker endpoint exists"
 
 # --- 5. a STALE launcher pane refuses, even though the home label is
 #        unambiguous from the launcher's own (now closed) workspace -----------
