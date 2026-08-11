@@ -87,13 +87,14 @@ SH
 
 # run_send <fakebin> <home> <send-log> <fm-send args...>: run the real fm-send
 # with the stubs on PATH against the given home. Guard noise goes to stderr,
-# captured per test when the diagnostic matters.
+# captured per test when the diagnostic matters. Stdin is closed so a send-path
+# subprocess can never eat input a caller is reading in a loop.
 run_send() {
   local fb=$1 home=$2 log=$3; shift 3
   : > "$log"
   env PATH="$fb:$PATH" \
     FM_ROOT_OVERRIDE="$home" FM_HOME="$home" FM_SEND_LOG="$log" FM_SEND_SETTLE=0 \
-    "$SEND" "$@" 2>/dev/null
+    "$SEND" "$@" </dev/null 2>/dev/null
 }
 
 setup_home() {  # <name> -> echoes a fresh home dir with an empty state/
