@@ -1262,10 +1262,17 @@ fm_backend_herdr_pane_idle_shell_pid() {  # <session> <pane-id>
 # the idle-shell proof above - that one licenses closing a pane and must fail
 # toward refusal, while this one only gates typing and must not invent a
 # blocker out of a missing read or a slow rc.
+#
+# The window is bounded by FM_BACKEND_HERDR_PANE_SETTLE_POLLS, defaulting to 60
+# polls (~8s of wall time, measured on real herdr 0.8.0). Real panes on a
+# saturated machine reached rest within 14 polls, so the default leaves room for
+# a heavier rc; a settled pane costs about two polls, less than the fixed wait
+# this replaced. A secondmate spawn holds no presentation lock here (fm-spawn.sh
+# gates projection on KIND != secondmate), so the wait blocks no sibling spawn.
 fm_backend_herdr_pane_foreground_takeover() {  # <session> <pane-id>
   local session=$1 pane=$2 attempt=0 max_attempts state observed=''
   FM_BACKEND_HERDR_TAKEOVER_PROCESS=""
-  max_attempts=${FM_BACKEND_HERDR_PANE_SETTLE_POLLS:-30}
+  max_attempts=${FM_BACKEND_HERDR_PANE_SETTLE_POLLS:-60}
   while [ "$attempt" -lt "$max_attempts" ]; do
     state=$(fm_backend_herdr_pane_foreground_state "$session" "$pane") || state=''
     if [ -n "$state" ] && [ "$state" = "$observed" ]; then
