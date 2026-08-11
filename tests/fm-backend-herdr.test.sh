@@ -2109,7 +2109,8 @@ test_kill_refuses_when_presentation_lock_is_unavailable() {
   for mode in unresolved contended; do
     : > "$dir/cli.log"
     : > "$dir/attempts"
-    out=$(ROOT="$ROOT" MODE="$mode" CLI_LOG="$dir/cli.log" ATTEMPTS="$dir/attempts" bash -c '
+    out=$(ROOT="$ROOT" MODE="$mode" CLI_LOG="$dir/cli.log" ATTEMPTS="$dir/attempts" \
+      FM_HERDR_PRESENTATION_LOCK_ATTEMPTS=17 bash -c '
       . "$ROOT/bin/backends/herdr.sh"
       fm_backend_herdr_target_ready() { fm_backend_herdr_parse_target "$1"; }
       fm_backend_herdr_presentation_session_lock_path() {
@@ -2118,6 +2119,7 @@ test_kill_refuses_when_presentation_lock_is_unavailable() {
       }
       fm_lock_try_acquire() {
         printf "x\n" >> "$ATTEMPTS"
+        FM_LOCK_HELD_PID=4242
         return 1
       }
       fm_backend_herdr_cli() {
@@ -2134,12 +2136,208 @@ test_kill_refuses_when_presentation_lock_is_unavailable() {
       "$mode presentation lock refusal did not report the deferred close"
     attempts=$(wc -l < "$dir/attempts" | tr -d ' ')
     if [ "$mode" = contended ]; then
-      [ "$attempts" = 50 ] || fail "contended presentation lock did not use the bounded wait: $attempts attempts"
+      # The bound comes from the shared owner, not from a number written here.
+      [ "$attempts" = 17 ] || fail "contended presentation lock did not use the shared bounded wait: $attempts attempts"
+      assert_contains "$out" "held by pid 4242" \
+        "the contended kill refusal did not name the lock holder"
     else
       [ "$attempts" = 0 ] || fail "unresolved presentation lock path attempted acquisition: $attempts"
+      assert_contains "$out" "the lock path could not be resolved" \
+        "the unresolved kill refusal did not state its own cause"
     fi
   done
-  pass "fm_backend_herdr_kill: unavailable session locks defer every pane close"
+  pass "fm_backend_herdr_kill: unavailable session locks defer every pane close and name the holder"
+}
+
+# The four presentation-lock waiters drifted to 5s, 5s, 30s, and a single try
+# while their common holder ran past 60s, so kill leaked orphan tabs and
+# teardown failed for reasons unrelated to the task being torn down. They now
+# read one shared bound; these cases pin that bound against the holder's own
+# window and pin the holder diagnosis every expiry message carries.
+test_presentation_lock_bound_outlasts_its_holder() {
+  local attempts overridden
+  attempts=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_presentation_lock_attempts' "$ROOT")
+  case "$attempts" in
+    ''|*[!0-9]*) fail "the shared presentation-lock bound is not a poll count: '$attempts'" ;;
+  esac
+  # The holder is a projected spawn: roughly 6.5s of measured projection calls
+  # plus bin/fm-spawn.sh's unconditional 60-poll worktree-entry wait, so a
+  # healthy holder legitimately passes 66s. At 0.1s per poll a waiter must
+  # exceed 660 polls to outlast it rather than refusing mid-hold.
+  [ "$attempts" -gt 660 ] \
+    || fail "the shared presentation-lock bound ($attempts polls) expires inside a healthy holder's own window"
+  overridden=$(FM_HERDR_PRESENTATION_LOCK_ATTEMPTS=9 \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_presentation_lock_attempts' "$ROOT")
+  [ "$overridden" = 9 ] || fail "the shared presentation-lock bound ignored its override: '$overridden'"
+  pass "presentation lock: one shared bound outlasts its holder's own hold window"
+}
+
+test_presentation_lock_wait_names_a_live_holder() {
+  local dir lock ready release holder_pid out waited
+  dir="$TMP_ROOT/presentation-lock-holder"; mkdir -p "$dir"
+  lock="$dir/order.lock"
+  ready="$dir/ready"; release="$dir/release"
+  ROOT="$ROOT" LOCK="$lock" READY="$ready" RELEASE="$release" bash -c '
+    . "$ROOT/bin/fm-wake-lib.sh"
+    fm_lock_try_acquire "$LOCK" || exit 1
+    : > "$READY"
+    while [ ! -e "$RELEASE" ]; do sleep 0.1; done
+    fm_lock_release "$LOCK"
+  ' &
+  holder_pid=$!
+  waited=0
+  while [ ! -e "$ready" ] && [ "$waited" -lt 100 ]; do sleep 0.1; waited=$((waited + 1)); done
+  [ -e "$ready" ] || { : > "$release"; fail "the contending lock holder never started"; }
+
+  out=$(ROOT="$ROOT" LOCK="$lock" FM_HERDR_PRESENTATION_LOCK_ATTEMPTS=3 bash -c '
+    . "$ROOT/bin/backends/herdr.sh"
+    if fm_backend_herdr_presentation_lock_wait "$LOCK"; then
+      printf "acquired\n"
+    else
+      printf "%s\n" "$FM_BACKEND_HERDR_PRESENTATION_LOCK_HOLDER"
+    fi
+  ')
+  case "$out" in
+    "held by pid $holder_pid for "*s) ;;
+    *)
+      : > "$release"
+      fail "a live holder was not named with its pid and the lock's age: '$out'"
+      ;;
+  esac
+
+  : > "$release"
+  wait "$holder_pid" 2>/dev/null || true
+  out=$(ROOT="$ROOT" LOCK="$lock" FM_HERDR_PRESENTATION_LOCK_ATTEMPTS=3 bash -c '
+    . "$ROOT/bin/backends/herdr.sh"
+    fm_backend_herdr_presentation_lock_wait "$LOCK" && printf "acquired\n"
+  ')
+  [ "$out" = acquired ] || fail "the released lock was not acquired by the shared waiter: '$out'"
+  pass "presentation lock: an expired wait names the live holder and the lock's age"
+}
+
+# make_mint_fakebin: a `herdr` stub for the concurrent workspace-mint cases.
+# Unlike make_herdr_fakebin it answers by CONTENT rather than by call order,
+# because two genuinely concurrent processes share it and interleave. The
+# workspace list is built from a shared state file every create appends to, and
+# the list read is deliberately slowed so an unserialized find+create pair
+# really does race rather than passing by luck of scheduling.
+make_mint_fakebin() {  # <dir> -> echoes fakebin dir
+  local dir=$1 fb="$1/fakebin"
+  mkdir -p "$fb"
+  cat > "$fb/herdr" <<'SH'
+#!/usr/bin/env bash
+set -u
+STATE="${FM_MINT_STATE:?}"
+if [ "${1:-}" = workspace ] && [ "${2:-}" = list ]; then
+  sleep "${FM_MINT_LIST_DELAY:-0.5}"
+  sep=''
+  printf '{"result":{"workspaces":['
+  while IFS= read -r ws; do
+    [ -n "$ws" ] || continue
+    printf '%s{"workspace_id":"%s","label":"firstmate"}' "$sep" "$ws"
+    sep=','
+  done < "$STATE"
+  printf ']}}\n'
+  exit 0
+fi
+if [ "${1:-}" = workspace ] && [ "${2:-}" = create ]; then
+  ws="w$$"
+  printf '%s\n' "$ws" >> "$STATE"
+  printf '%s\n' "$ws" >> "${FM_MINT_CREATES:?}"
+  printf '{"result":{"workspace":{"workspace_id":"%s"},"tab":{"tab_id":"%s:t1"}}}\n' "$ws" "$ws"
+  exit 0
+fi
+exit 0
+SH
+  chmod +x "$fb/herdr"
+  printf '%s\n' "$fb"
+}
+
+# #730: two concurrent FIRST spawns from a home with no launcher pane identity
+# both read zero label matches and both create, leaving two same-labeled home
+# workspaces that block every later no-identity spawn until a human deletes
+# one. The mint lock closes that window, and it shipped with no coverage at
+# all - which is why an unusable lock namespace silently reopened the defect.
+test_workspace_mint_lock_serializes_concurrent_first_spawns() {
+  local dir ns fb home creates out_a out_b rc_a rc_b created
+  dir="$TMP_ROOT/workspace-mint-serialized"; mkdir -p "$dir"
+  ns="$dir/namespace"
+  home="$dir/home"; mkdir -p "$home/state"
+  : > "$dir/state"
+  creates="$dir/creates"; : > "$creates"
+  fb=$(make_mint_fakebin "$dir")
+
+  # The namespace is created by the adapter itself at mode 700, the shape its
+  # own validity check demands.
+  PATH="$fb:$PATH" ROOT="$ROOT" FM_HOME="$home" FM_MINT_STATE="$dir/state" \
+    FM_MINT_CREATES="$creates" FM_MINT_NAMESPACE="$ns" bash -c '
+      . "$ROOT/bin/backends/herdr.sh"
+      fm_backend_herdr_presentation_lock_namespace() { printf "%s" "$FM_MINT_NAMESPACE"; }
+      fm_backend_herdr_workspace_ensure fmtest "$PWD" launcher-home >/dev/null
+    ' > "$dir/a.out" 2> "$dir/a.err" &
+  local pid_a=$!
+  PATH="$fb:$PATH" ROOT="$ROOT" FM_HOME="$home" FM_MINT_STATE="$dir/state" \
+    FM_MINT_CREATES="$creates" FM_MINT_NAMESPACE="$ns" bash -c '
+      . "$ROOT/bin/backends/herdr.sh"
+      fm_backend_herdr_presentation_lock_namespace() { printf "%s" "$FM_MINT_NAMESPACE"; }
+      fm_backend_herdr_workspace_ensure fmtest "$PWD" launcher-home >/dev/null
+    ' > "$dir/b.out" 2> "$dir/b.err" &
+  local pid_b=$!
+  rc_a=0; wait "$pid_a" || rc_a=$?
+  rc_b=0; wait "$pid_b" || rc_b=$?
+  out_a=$(cat "$dir/a.err"); out_b=$(cat "$dir/b.err")
+
+  [ "$rc_a" -eq 0 ] || fail "a serialized first spawn failed: rc=$rc_a $out_a"
+  [ "$rc_b" -eq 0 ] || fail "a serialized first spawn failed: rc=$rc_b $out_b"
+  created=$(grep -c '[^[:space:]]' "$creates" || true)
+  [ "$created" = 1 ] \
+    || fail "the mint lock did not serialize find+create: $created workspaces minted for one home (#730)"
+  pass "herdr workspace mint: two concurrent first spawns mint exactly one home workspace"
+}
+
+# The mint lock's whole value is serialization, so an unusable lock must refuse
+# rather than fall through to the unserialized find+create it exists to
+# prevent. Proceeding unlocked fails later and far more confusingly, as a
+# permanent ambiguity refusal a human has to resolve by deleting a workspace.
+test_workspace_mint_refuses_when_its_lock_is_unusable() {
+  local dir ns fb home creates rc_a rc_b created err
+  dir="$TMP_ROOT/workspace-mint-unusable"; mkdir -p "$dir"
+  ns="$dir/namespace"
+  # Mode 755 is one of the shapes the namespace validity check rejects, and it
+  # is what any other local uid creating this shared path first would leave.
+  mkdir -m 755 "$ns"
+  home="$dir/home"; mkdir -p "$home/state"
+  : > "$dir/state"
+  creates="$dir/creates"; : > "$creates"
+  fb=$(make_mint_fakebin "$dir")
+
+  PATH="$fb:$PATH" ROOT="$ROOT" FM_HOME="$home" FM_MINT_STATE="$dir/state" \
+    FM_MINT_CREATES="$creates" FM_MINT_NAMESPACE="$ns" bash -c '
+      . "$ROOT/bin/backends/herdr.sh"
+      fm_backend_herdr_presentation_lock_namespace() { printf "%s" "$FM_MINT_NAMESPACE"; }
+      fm_backend_herdr_workspace_ensure fmtest "$PWD" launcher-home >/dev/null
+    ' > "$dir/a.out" 2> "$dir/a.err" &
+  local pid_a=$!
+  PATH="$fb:$PATH" ROOT="$ROOT" FM_HOME="$home" FM_MINT_STATE="$dir/state" \
+    FM_MINT_CREATES="$creates" FM_MINT_NAMESPACE="$ns" bash -c '
+      . "$ROOT/bin/backends/herdr.sh"
+      fm_backend_herdr_presentation_lock_namespace() { printf "%s" "$FM_MINT_NAMESPACE"; }
+      fm_backend_herdr_workspace_ensure fmtest "$PWD" launcher-home >/dev/null
+    ' > "$dir/b.out" 2> "$dir/b.err" &
+  local pid_b=$!
+  rc_a=0; wait "$pid_a" || rc_a=$?
+  rc_b=0; wait "$pid_b" || rc_b=$?
+
+  [ "$rc_a" -eq 3 ] || fail "an unusable mint lock did not refuse the spawn: rc=$rc_a"
+  [ "$rc_b" -eq 3 ] || fail "an unusable mint lock did not refuse the spawn: rc=$rc_b"
+  created=$(grep -c '[^[:space:]]' "$creates" || true)
+  [ "$created" = 0 ] \
+    || fail "an unusable mint lock still ran the unserialized find+create: $created workspaces minted (#730)"
+  err=$(cat "$dir/a.err")
+  assert_contains "$err" "$ns" "the mint-lock refusal did not name the unusable lock namespace"
+  assert_contains "$err" "mode 700" "the mint-lock refusal did not state the namespace requirement"
+  assert_contains "$err" "sha256sum" "the mint-lock refusal did not state the hashing-tool requirement"
+  pass "herdr workspace mint: an unusable lock namespace refuses instead of minting duplicates"
 }
 
 test_endpoint_confirmed_gone_gates_on_structured_presence() {
@@ -4604,6 +4802,10 @@ test_home_workspace_record_never_captures_a_foreign_workspace
 test_home_workspace_record_two_match_stale_residual_is_pinned
 test_home_workspace_record_reader_and_writer_are_silent_on_unreadable_state
 test_kill_refuses_when_presentation_lock_is_unavailable
+test_presentation_lock_bound_outlasts_its_holder
+test_presentation_lock_wait_names_a_live_holder
+test_workspace_mint_lock_serializes_concurrent_first_spawns
+test_workspace_mint_refuses_when_its_lock_is_unusable
 test_projection_seeded_prune_refuses_active_tab
 test_projection_label_builder_uses_corner_and_strips_owner_prefixes
 test_projection_order_moves_only_exact_new_workspace_and_preserves_relative_order

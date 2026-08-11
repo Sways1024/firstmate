@@ -1905,7 +1905,8 @@ teardown_herdr_require_prerequisites() {  # <task-id>
     fm_backend_herdr_workspace_presence_state \
     fm_backend_herdr_endpoint_confirmed_gone \
     fm_backend_herdr_explicit_close_pane_confirmed \
-    fm_backend_herdr_presentation_session_lock_path; do
+    fm_backend_herdr_presentation_session_lock_path \
+    fm_backend_herdr_presentation_lock_wait; do
     if ! declare -F "$prerequisite" >/dev/null 2>&1; then
       echo "error: herdr teardown prerequisites are unavailable for $task_id; nothing was changed - restore the adapter and rerun teardown" >&2
       return 1
@@ -1923,7 +1924,7 @@ teardown_herdr_require_prerequisites() {  # <task-id>
 }
 
 teardown_herdr_preflight_target() {  # <target> <task-id>
-  local target=$1 task_id=$2 session pane presence lock_path verified_lock_path lock_session held_path attempt
+  local target=$1 task_id=$2 session pane presence lock_path verified_lock_path lock_session held_path
   teardown_herdr_require_prerequisites "$task_id" || return 1
   if ! fm_backend_herdr_parse_target "$target"; then
     echo "error: herdr endpoint $target for $task_id could not be parsed exactly; nothing was changed - repair the endpoint metadata and rerun teardown" >&2
@@ -1956,29 +1957,27 @@ teardown_herdr_preflight_target() {  # <target> <task-id>
 $TEARDOWN_HERDR_LOCK_RECORDS
 FMEOF
   fi
-  attempt=0
-  while [ "$attempt" -lt 50 ]; do
-    if fm_lock_try_acquire "$lock_path"; then
-      if ! verified_lock_path=$(fm_backend_herdr_presentation_session_lock_path "$session") \
-        || [ "$verified_lock_path" != "$lock_path" ]; then
-        fm_lock_release "$lock_path" || true
-        echo "error: herdr session presentation lock changed during preflight for $task_id; nothing was changed - rerun teardown once session identity is stable" >&2
-        return 1
-      fi
-      if [ -n "$TEARDOWN_HERDR_LOCK_RECORDS" ]; then
-        TEARDOWN_HERDR_LOCK_RECORDS="$TEARDOWN_HERDR_LOCK_RECORDS
+  # bin/backends/herdr.sh owns the shared bound: a teardown sized below a live
+  # projected spawn's hold window used to fail here for a reason that had
+  # nothing to do with the task being torn down.
+  if ! fm_backend_herdr_presentation_lock_wait "$lock_path"; then
+    echo "error: herdr session presentation lock is contended for $task_id ($FM_BACKEND_HERDR_PRESENTATION_LOCK_HOLDER); nothing was changed - rerun teardown once the contention clears" >&2
+    return 1
+  fi
+  if ! verified_lock_path=$(fm_backend_herdr_presentation_session_lock_path "$session") \
+    || [ "$verified_lock_path" != "$lock_path" ]; then
+    fm_lock_release "$lock_path" || true
+    echo "error: herdr session presentation lock changed during preflight for $task_id; nothing was changed - rerun teardown once session identity is stable" >&2
+    return 1
+  fi
+  if [ -n "$TEARDOWN_HERDR_LOCK_RECORDS" ]; then
+    TEARDOWN_HERDR_LOCK_RECORDS="$TEARDOWN_HERDR_LOCK_RECORDS
 $session	$lock_path"
-      else
-        TEARDOWN_HERDR_LOCK_RECORDS="$session	$lock_path"
-      fi
-      trap teardown_release_herdr_locks EXIT
-      return 0
-    fi
-    sleep 0.1
-    attempt=$((attempt + 1))
-  done
-  echo "error: herdr session presentation lock is contended for $task_id; nothing was changed - rerun teardown once the contention clears" >&2
-  return 1
+  else
+    TEARDOWN_HERDR_LOCK_RECORDS="$session	$lock_path"
+  fi
+  trap teardown_release_herdr_locks EXIT
+  return 0
 }
 
 preflight_firstmate_home_herdr_children() {  # <home>

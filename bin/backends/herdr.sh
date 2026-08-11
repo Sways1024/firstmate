@@ -791,6 +791,78 @@ fm_backend_herdr_presentation_session_lock_path() {  # <session>
   printf '%s/order-%s.lock' "$dir" "$key"
 }
 
+# fm_backend_herdr_presentation_lock_attempts: the one 0.1s-poll bound every
+# presentation-lock waiter uses, so the four contending call sites (spawn, task
+# kill, teardown preflight, session-start cleanup) cannot drift apart again.
+# A waiter sized below the holder's own window turns ordinary contention into a
+# refusal: kill leaks the orphan tab it exists to close, and teardown fails for
+# a reason that has nothing to do with the task being torn down.
+# The holder is a projected spawn, which keeps this lock from the projected
+# create through launch handoff. That window contains roughly 6.5s of measured
+# projection calls plus the unconditional 60-poll worktree-entry wait in
+# bin/fm-spawn.sh, so a healthy holder legitimately runs past 60s; 1200 polls
+# clears that with headroom for a loaded machine. Only a LIVE holder is ever
+# waited out this long, because fm_lock_try_acquire steals a crashed holder's
+# lock immediately on pid-liveness (bin/fm-wake-lib.sh).
+fm_backend_herdr_presentation_lock_attempts() {
+  printf '%s' "${FM_HERDR_PRESENTATION_LOCK_ATTEMPTS:-1200}"
+}
+
+# fm_backend_herdr_presentation_lock_holder_note: one clause naming who holds a
+# contended lock and how long they have held it, so a genuine wedge reads
+# differently from ordinary contention instead of producing the identical
+# single warning line. <pid> is fm_lock_try_acquire's FM_LOCK_HELD_PID, which is
+# empty when the holder identity could not be read.
+# It reads fm_path_mtime rather than fm_path_age because that helper reports an
+# unreadable path as a 999999s sentinel, which here would print a fabricated age
+# for a lock its holder released mid-read.
+fm_backend_herdr_presentation_lock_holder_note() {  # <lock-path> <pid>
+  local lock_path=$1 pid=$2 age='' mtime
+  case "$pid" in
+    ''|*[!0-9]*) pid='' ;;
+  esac
+  mtime=$(fm_path_mtime "$lock_path" 2>/dev/null || true)
+  case "$mtime" in
+    ''|*[!0-9]*) ;;
+    *) age=$(( $(date +%s) - mtime )) ;;
+  esac
+  if [ -n "$pid" ] && [ -n "$age" ]; then
+    printf 'held by pid %s for %ss' "$pid" "$age"
+  elif [ -n "$pid" ]; then
+    printf 'held by pid %s' "$pid"
+  elif [ -n "$age" ]; then
+    printf 'holder pid unreadable, lock %ss old' "$age"
+  else
+    printf 'holder unidentified'
+  fi
+}
+
+# fm_backend_herdr_presentation_lock_wait: the one bounded acquire shared by
+# every presentation-lock waiter. On expiry it publishes
+# FM_BACKEND_HERDR_PRESENTATION_LOCK_HOLDER so each caller's own refusal names
+# the holder. <attempts> defaults to the shared bound above; pass an explicit
+# one only where the call site documents a different contract.
+fm_backend_herdr_presentation_lock_wait() {  # <lock-path> [<attempts>]
+  local lock_path=$1 attempts=${2:-} n=0
+  FM_BACKEND_HERDR_PRESENTATION_LOCK_HOLDER=''
+  [ -n "$attempts" ] || attempts=$(fm_backend_herdr_presentation_lock_attempts)
+  if ! declare -F fm_lock_try_acquire >/dev/null 2>&1; then
+    # shellcheck source=bin/fm-wake-lib.sh
+    . "$FM_BACKEND_HERDR_ROOT/bin/fm-wake-lib.sh"
+  fi
+  while [ "$n" -lt "$attempts" ]; do
+    if fm_lock_try_acquire "$lock_path"; then
+      return 0
+    fi
+    sleep 0.1
+    n=$((n + 1))
+  done
+  FM_BACKEND_HERDR_PRESENTATION_LOCK_HOLDER=$(
+    fm_backend_herdr_presentation_lock_holder_note "$lock_path" "${FM_LOCK_HELD_PID:-}"
+  )
+  return 1
+}
+
 # fm_backend_herdr_projection_focus_snapshot: print the exact active
 # workspace and tab ids as one tab-separated record.
 # Presentation mutations use this read-only snapshot as their sole focus
@@ -2041,27 +2113,28 @@ fm_backend_herdr_workspace_ensure() {  # <session> <cwd> [<launcher-relationship
   # concurrent FIRST spawns from a home with no launcher pane identity both
   # read zero matches and both create, minting duplicate same-labeled home
   # workspaces - which every later no-identity spawn then refuses (the count>1
-  # error in the helper below) until a human deletes one. The mint lock needs
-  # no herdr round-trip; an unresolvable lock path degrades to the historical
-  # unlocked behavior with a warning rather than failing the spawn.
-  local lock_path='' lock_held=0 attempt=0
-  if ! declare -F fm_lock_try_acquire >/dev/null 2>&1; then
-    # shellcheck source=bin/fm-wake-lib.sh
-    . "$FM_BACKEND_HERDR_ROOT/bin/fm-wake-lib.sh"
+  # error in the helper below) until a human deletes one.
+  # An unusable or contended mint lock is therefore a REFUSAL, never a
+  # fall-through: proceeding unlocked IS the unserialized find+create #730 was
+  # about, and it fails later and far more confusingly - two same-labeled
+  # workspaces that block every subsequent no-identity spawn until a human
+  # deletes one - than refusing this spawn does.
+  # The mint lock needs no herdr round-trip, so its holder is only the two calls
+  # in the helper below. 300 polls is generous for those even on a loaded
+  # machine, which makes expiry evidence of real trouble rather than of load.
+  local lock_path='' namespace
+  if ! lock_path=$(fm_backend_herdr_workspace_mint_lock_path "$session" "$(fm_backend_herdr_workspace_label)"); then
+    namespace=$(fm_backend_herdr_presentation_lock_namespace)
+    echo "error: the herdr workspace-mint lock is unusable, so this spawn refuses an unserialized workspace find+create that could mint a duplicate home workspace (#730); '$namespace' must be a non-symlink directory owned by this user with mode 700, and shasum or sha256sum must be on PATH" >&2
+    return 3
   fi
-  if lock_path=$(fm_backend_herdr_workspace_mint_lock_path "$session" "$(fm_backend_herdr_workspace_label)"); then
-    while [ "$attempt" -lt 50 ]; do
-      if fm_lock_try_acquire "$lock_path"; then
-        lock_held=1
-        break
-      fi
-      sleep 0.1
-      attempt=$((attempt + 1))
-    done
+  if ! fm_backend_herdr_presentation_lock_wait "$lock_path" \
+    "${FM_HERDR_WORKSPACE_MINT_LOCK_ATTEMPTS:-300}"; then
+    echo "error: the herdr workspace-mint lock stayed contended ($FM_BACKEND_HERDR_PRESENTATION_LOCK_HOLDER), so this spawn refuses an unserialized workspace find+create that could mint a duplicate home workspace (#730)" >&2
+    return 3
   fi
-  [ "$lock_held" = 1 ] || echo "warning: herdr workspace ensure could not acquire its workspace-mint lock; a concurrent first spawn could mint a duplicate home workspace" >&2
   fm_backend_herdr_workspace_ensure_by_label "$session" "$cwd" && status=0 || status=$?
-  [ "$lock_held" -eq 0 ] || fm_lock_release "$lock_path" || true
+  fm_lock_release "$lock_path" || true
   return "$status"
 }
 
@@ -3340,26 +3413,14 @@ fm_backend_herdr_kill_serialized() {  # <session> <pane>
 fm_backend_herdr_kill() {  # <target>
   fm_backend_herdr_target_ready "$1" || return 0
   local session=$FM_BACKEND_HERDR_SESSION pane=$FM_BACKEND_HERDR_PANE
-  local lock_path attempt=0 lock_held=0
-  if ! declare -F fm_lock_try_acquire >/dev/null 2>&1; then
-    # shellcheck source=bin/fm-wake-lib.sh
-    . "$FM_BACKEND_HERDR_ROOT/bin/fm-wake-lib.sh"
-  fi
-  if lock_path=$(fm_backend_herdr_presentation_session_lock_path "$session"); then
-    while [ "$attempt" -lt 50 ]; do
-      if fm_lock_try_acquire "$lock_path"; then
-        lock_held=1
-        break
-      fi
-      sleep 0.1
-      attempt=$((attempt + 1))
-    done
-  fi
-  if [ "$lock_held" = 1 ]; then
+  local lock_path
+  FM_BACKEND_HERDR_PRESENTATION_LOCK_HOLDER=''
+  if lock_path=$(fm_backend_herdr_presentation_session_lock_path "$session") \
+    && fm_backend_herdr_presentation_lock_wait "$lock_path"; then
     fm_backend_herdr_kill_serialized "$session" "$pane"
     fm_lock_release "$lock_path" || true
   else
-    echo "warning: herdr task kill could not acquire its session presentation lock; refusing an unlocked pane close" >&2
+    echo "warning: herdr task kill could not acquire its session presentation lock (${FM_BACKEND_HERDR_PRESENTATION_LOCK_HOLDER:-the lock path could not be resolved}); refusing an unlocked pane close" >&2
   fi
 }
 

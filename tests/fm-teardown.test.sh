@@ -1459,7 +1459,10 @@ SH
   [ -e "$ready" ] || fail "herdr-orphan-refusal: the contending lock holder never started"
 
   rc=0
-  FM_FAKE_HERDR_LOG="$log" FM_FAKE_HERDR_CLOSED="$closed" \
+  # The production bound now outlasts a live projected spawn's whole hold
+  # window, which is the point of the fix; this case only needs the refusal
+  # itself, not the wait that precedes it.
+  FM_FAKE_HERDR_LOG="$log" FM_FAKE_HERDR_CLOSED="$closed" FM_HERDR_PRESENTATION_LOCK_ATTEMPTS=5 \
     run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
   if [ "$rc" -eq 0 ]; then
     : > "$release"; wait "$holder_pid" 2>/dev/null || true

@@ -224,9 +224,17 @@ fm_herdr_cleanup_one() { # <session> <workspace> <title> <home-real>
     fm_herdr_cleanup_warn "$id skipped because the shared presentation lock is unavailable"
     return 0
   }
-  if ! fm_lock_try_acquire "$presentation_lock"; then
+  # This waiter deliberately does NOT use the shared bound that kill and
+  # teardown use. It runs once per candidate on session start's blocking path,
+  # and a skipped husk is simply retired at the next session start with nothing
+  # lost, so waiting out a live projected spawn would trade a real startup
+  # delay for a cleanup that costs nothing to defer. The short wait exists only
+  # to absorb momentary contention - a lock handoff, one herdr round trip -
+  # that a single try lost to for no reason.
+  if ! fm_backend_herdr_presentation_lock_wait "$presentation_lock" \
+    "${FM_HERDR_SESSION_CLEANUP_LOCK_ATTEMPTS:-50}"; then
     fm_lock_release "$task_lock" || true
-    fm_herdr_cleanup_warn "$id skipped because the shared presentation lock is busy"
+    fm_herdr_cleanup_warn "$id skipped because the shared presentation lock is busy ($FM_BACKEND_HERDR_PRESENTATION_LOCK_HOLDER)"
     return 0
   fi
 

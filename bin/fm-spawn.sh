@@ -649,6 +649,7 @@ HERDR_FLAT_ABORT_SESSION=
 HERDR_FLAT_ABORT_PANE=
 HERDR_PRESENTATION_ORDER_LOCK=
 HERDR_PRESENTATION_ORDER_LOCK_HELD=0
+HERDR_PRESENTATION_ORDER_LOCK_HOLDER=
 SPAWN_TASK_LOCK=
 SPAWN_TASK_LOCK_HELD=0
 CONFIG_INHERIT_LOCK=
@@ -676,7 +677,7 @@ spawn_abort_cleanup() {
   if [ "$HERDR_PROJECTION_ABORT_CLEANUP" = 1 ] \
      && [ "$HERDR_PRESENTATION_ORDER_LOCK_HELD" != 1 ]; then
     if ! spawn_herdr_presentation_order_lock_acquire "${HERDR_PROJECTION_ABORT_SESSION:-}"; then
-      echo "warning: herdr presentation focus lock unavailable; retaining the projection journal and refusing concurrent abort cleanup" >&2
+      echo "warning: herdr presentation focus lock unavailable; retaining the projection journal and refusing concurrent abort cleanup ($HERDR_PRESENTATION_ORDER_LOCK_HOLDER)" >&2
       HERDR_PROJECTION_ABORT_CLEANUP=0
     fi
   fi
@@ -764,26 +765,22 @@ trap spawn_abort_cleanup EXIT
 # <session> is required so secondmate and primary spawns serialize against the
 # same session without writing any other home's state directory.
 spawn_herdr_presentation_order_lock_acquire() {
-  local session=${1:-} attempt lock_path
+  local session=${1:-} lock_path
+  # Every expiry message below names the holder from this variable, so the
+  # unresolved-path case (which never reaches the waiter) states its own cause.
+  HERDR_PRESENTATION_ORDER_LOCK_HOLDER='the lock path could not be resolved'
   [ -n "$session" ] || session=$(fm_backend_herdr_session)
   lock_path=$(fm_backend_herdr_presentation_session_lock_path "$session") || return 1
   HERDR_PRESENTATION_ORDER_LOCK="$lock_path"
-  attempt=0
-  # Sized to outlast a sibling spawn's whole lock-held section: the lock is
-  # held through launch handoff, and a sibling's ordinary post-create abort
-  # holds it ~6.5s (projected create -> pane-entry wait -> focus-preserving
-  # abort cleanup, ~10 herdr calls). The previous 5s bound lost that race,
-  # so the loser fell back flat under exactly the concurrency the lock exists
-  # to serialize. A crashed holder is still stolen immediately by
-  # pid-liveness; only a live holder is waited out.
-  while [ "$attempt" -lt "${FM_SPAWN_HERDR_PRESENTATION_LOCK_ATTEMPTS:-300}" ]; do
-    if fm_lock_try_acquire "$HERDR_PRESENTATION_ORDER_LOCK"; then
-      HERDR_PRESENTATION_ORDER_LOCK_HELD=1
-      return 0
-    fi
-    sleep 0.1
-    attempt=$((attempt + 1))
-  done
+  # bin/backends/herdr.sh owns the shared bound and the holder diagnosis; this
+  # waiter must not size itself independently of the other three, which is how
+  # the 5s-versus-30s split arose. The env override stays for tests only.
+  if fm_backend_herdr_presentation_lock_wait "$HERDR_PRESENTATION_ORDER_LOCK" \
+    "${FM_SPAWN_HERDR_PRESENTATION_LOCK_ATTEMPTS:-}"; then
+    HERDR_PRESENTATION_ORDER_LOCK_HELD=1
+    return 0
+  fi
+  HERDR_PRESENTATION_ORDER_LOCK_HOLDER=$FM_BACKEND_HERDR_PRESENTATION_LOCK_HOLDER
   return 1
 }
 
@@ -1692,7 +1689,7 @@ case "$BACKEND" in
           exit 1
         }
         spawn_herdr_presentation_order_lock_acquire "$HERDR_SES" || {
-          echo "error: herdr presentation recovery could not acquire its session lock; refusing a concurrent resume" >&2
+          echo "error: herdr presentation recovery could not acquire its session lock ($HERDR_PRESENTATION_ORDER_LOCK_HOLDER); refusing a concurrent resume" >&2
           exit 1
         }
         if [ -e "$STATE/$ID.meta" ] || [ -L "$STATE/$ID.meta" ]; then
@@ -1796,7 +1793,7 @@ case "$BACKEND" in
             fi
           fi
         else
-          echo "warning: herdr presentation focus lock unavailable; using the ordinary flat layout without projection" >&2
+          echo "warning: herdr presentation focus lock unavailable; using the ordinary flat layout without projection ($HERDR_PRESENTATION_ORDER_LOCK_HOLDER)" >&2
         fi
       fi
     fi
