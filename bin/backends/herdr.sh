@@ -1617,11 +1617,50 @@ fm_backend_herdr_workspace_ids_matching_label() {  # <workspace-list-json>
 # refuses spawns outright once two do.
 #
 # So a container this home CREATED is recorded by its exact workspace id and
-# preferred over any label match afterwards. Same created-versus-adopted
-# distinction the seeded-tab prune gate uses: an adopted workspace is never
-# recorded, so this can only ever re-find firstmate's own container.
-# The record is advisory - a missing, foreign-session, or vanished entry falls
-# back to the historical label lookup rather than failing anything.
+# used to pick this home's own container out of the label matches afterwards.
+# Same created-versus-adopted distinction the seeded-tab prune gate uses: an
+# adopted workspace is never recorded.
+#
+# The recorded id alone is NOT proof of ownership, because herdr restarts its
+# workspace-id counter when a session is deleted and recreated under the same
+# name (verified on 0.8.0; ids are not recycled by `workspace close` and they
+# survive a plain session stop/restart unchanged). A record written before such
+# a recreate can therefore name a workspace the captain now owns. Nothing in
+# herdr 0.8.0 can settle that. Measured on 0.8.0, do not re-attempt these:
+# `workspace report-metadata --token` does round-trip through `workspace list`
+# and `workspace get`, but the tokens are dropped on session restart, so a
+# stamp written at create time is gone exactly when the record still has to be
+# trusted; `session list` exposes only `session_dir` and `socket_path`, both
+# derived from the session NAME and therefore identical across a recreate, and
+# the default session's session_dir is the config root, which no session delete
+# removes. A workspace itself exposes only active_tab_id, agent_status,
+# focused, label, number, pane_count, tab_count, and workspace_id - no creation
+# stamp, no owner, nothing that separates a container firstmate created from
+# one the captain created. So there is no durable stamp firstmate can write and
+# no session-incarnation identity it can read.
+#
+# The record is therefore validated against this home's LABEL as well as the
+# id, which bounds it to the one job it exists for: choosing between workspaces
+# the label lookup already considers this home's own.
+#
+# KNOWN RESIDUAL, deliberately left open because 0.8.0 offers nothing to close
+# it with. Where exactly one workspace carries the label, the record cannot
+# change the outcome - the label lookup resolves that same workspace by itself.
+# Where TWO carry it, the record decides, and that is both the case the feature
+# exists for and the case where a stale record is strictly WORSE than no
+# record: with no record the count>1 ambiguity refusal below stops the spawn
+# loudly, whereas a record whose id herdr has since reassigned to the captain's
+# same-labeled workspace passes this check and places a task tab there. It
+# takes a session delete-and-recreate to get there, and the next container this
+# home creates rewrites the record, but the hole is real - do not restate this
+# as never-worse. Trusting the record only as the SOLE label match would make
+# it never-worse, at the cost of every case it was built for: it would then
+# confirm what the label lookup already resolved and restore the refusal on the
+# collision itself. That trade was rejected, not overlooked.
+#
+# The record is advisory - a missing, foreign-session, vanished, or
+# wrong-labeled entry falls back to the label lookup rather than failing
+# anything.
 fm_backend_herdr_home_workspace_record_path() {
   local state
   state=${FM_STATE_OVERRIDE:-$FM_HOME/state}
@@ -1629,20 +1668,28 @@ fm_backend_herdr_home_workspace_record_path() {
   printf '%s/.herdr-home-workspace' "$state"
 }
 
-# Print the recorded workspace id when it names a workspace present in the
-# GIVEN workspace-list snapshot; fail otherwise. Validating against a snapshot
-# the caller already fetched keeps this free: resolving a container still costs
-# exactly one `workspace list` call, as it did before the record existed.
+# Print the recorded workspace id when it names a workspace that is present in
+# the GIVEN workspace-list snapshot AND still carries this home's label; fail
+# otherwise. Validating against a snapshot the caller already fetched keeps
+# this free: resolving a container still costs exactly one `workspace list`
+# call, as it did before the record existed.
 fm_backend_herdr_home_workspace_recorded_in() {  # <session> <workspace-list-json>
-  local session=$1 list=$2 record rec_session rec_ws
+  local session=$1 list=$2 record rec_session rec_ws label
   [ -n "$list" ] || return 1
   record=$(fm_backend_herdr_home_workspace_record_path) || return 1
   [ -f "$record" ] && [ ! -L "$record" ] || return 1
-  IFS=$(printf '\t') read -r rec_session rec_ws < "$record" 2>/dev/null || return 1
+  # 2>/dev/null must precede the input redirection: the shell reports a failed
+  # redirection on the stderr in force when it runs, so a trailing suppression
+  # never covers the redirection it is written for.
+  IFS=$(printf '\t') read -r rec_session rec_ws 2>/dev/null < "$record" || return 1
   [ -n "$rec_session" ] && [ -n "$rec_ws" ] || return 1
   [ "$rec_session" = "$session" ] || return 1
-  printf '%s' "$list" | jq -e --arg ws "$rec_ws" \
-    '[.result.workspaces[]? | select(.workspace_id == $ws)] | length == 1' >/dev/null 2>&1 || return 1
+  label=$(fm_backend_herdr_workspace_label)
+  # NOTE: the jq variable is $want, NOT $label - `label` is a jq reserved
+  # keyword, and declaring one named "label" is a compile error that the
+  # 2>/dev/null here would swallow into a silent permanent refusal.
+  printf '%s' "$list" | jq -e --arg ws "$rec_ws" --arg want "$label" \
+    '[.result.workspaces[]? | select(.workspace_id == $ws and .label == $want)] | length == 1' >/dev/null 2>&1 || return 1
   printf '%s' "$rec_ws"
 }
 
@@ -1653,7 +1700,10 @@ fm_backend_herdr_home_workspace_record_write() {  # <session> <workspace-id>
   [ -n "${1:-}" ] && [ -n "${2:-}" ] || return 0
   record=$(fm_backend_herdr_home_workspace_record_path) || return 0
   tmp="$record.tmp.$$"
-  printf '%s\t%s\n' "$1" "$2" > "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 0; }
+  # 2>/dev/null precedes the output redirection for the same reason as the
+  # reader above: an unwritable state directory must cost the disambiguation
+  # silently, not print a redirection error on every spawn.
+  printf '%s\t%s\n' "$1" "$2" 2>/dev/null > "$tmp" || { rm -f "$tmp" 2>/dev/null; return 0; }
   mv -f -- "$tmp" "$record" 2>/dev/null || rm -f "$tmp" 2>/dev/null
   return 0
 }
@@ -1968,7 +2018,7 @@ fm_backend_herdr_workspace_ensure_by_label() {  # <session> <cwd>
   local session=$1 cwd=$2 wsid out label matches count
   local list
   list=$(fm_backend_herdr_workspace_list_raw "$session") || list=
-  # This home's own recorded container wins over any label match, so a
+  # This home's own recorded container is picked out of the label matches, so a
   # captain's personal workspace sharing the label is neither adopted nor
   # able to make this placement ambiguous. Adopted (never recorded), so the
   # seeded-tab prune gate still cannot reach it.

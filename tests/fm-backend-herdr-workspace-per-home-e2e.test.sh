@@ -138,6 +138,18 @@ CM1_WS_LABEL=$(herdr workspace list --session "$SESSION" 2>&1 | jq -r --arg id "
 [ "$CM1_WS_LABEL" = "firstmate" ] || fail "a primary-shaped home's crewmate should land in the 'firstmate' workspace, got '$CM1_WS_LABEL'"
 pass "real herdr E2E: the primary-shaped home's crewmate landed in the 'firstmate' workspace"
 
+# This spawn CREATED the primary's container, so the created-versus-adopted
+# gate in bin/fm-spawn.sh must record it by exact id. The sections below assert
+# the two ways that gate must stay shut.
+PRIMARY_WS_RECORD="$PRIMARY_HOME/state/.herdr-home-workspace"
+SM_WS_RECORD="$SM_HOME/state/.herdr-home-workspace"
+[ -f "$PRIMARY_WS_RECORD" ] || fail "a spawn that CREATED this home's container must record it"
+[ "$(cut -f1 < "$PRIMARY_WS_RECORD")" = "$SESSION" ] \
+  || fail "the container record names another session"$'\n'"$(cat "$PRIMARY_WS_RECORD")"
+[ "$(cut -f2 < "$PRIMARY_WS_RECORD")" = "$CM1_WSID" ] \
+  || fail "the container record does not name the workspace this spawn created"$'\n'"$(cat "$PRIMARY_WS_RECORD")"
+pass "real herdr E2E: a spawn that created this home's own container records it by exact id"
+
 # --- 2. the PRIMARY spawns a secondmate: its tab lands in the SECONDMATE's own space ---
 # (fm-spawn.sh's herdr case arm shadows FM_HOME to the secondmate's home for
 # exactly this call - AGENTS.md task herdr-sm-spaces-k4, requirement 3.)
@@ -165,6 +177,16 @@ SM_WS_LABEL=$(herdr workspace list --session "$SESSION" 2>&1 | jq -r --arg id "$
 [ "$SM_WS_LABEL" = "2ndmate-e2esm1" ] || fail "a --secondmate spawn should land in '2ndmate-<id>', got '$SM_WS_LABEL'"
 pass "real herdr E2E: a --secondmate spawn by the PRIMARY lands in the SECONDMATE's own labeled workspace, distinct from the primary's"
 
+# This spawn CREATED a container, but for the SECONDMATE's home, not the
+# primary's. Recording it against the primary would point the primary's own
+# recovery and list-live at the secondmate's workspace, so the gate must stay
+# shut for both homes.
+[ "$(cut -f2 < "$PRIMARY_WS_RECORD")" = "$CM1_WSID" ] \
+  || fail "a --secondmate spawn repointed the primary's container record at the secondmate's workspace"$'\n'"$(cat "$PRIMARY_WS_RECORD")"
+[ ! -e "$SM_WS_RECORD" ] \
+  || fail "a container the PRIMARY created was recorded in the secondmate's home"$'\n'"$(cat "$SM_WS_RECORD")"
+pass "real herdr E2E: a --secondmate spawn records the created container in neither home"
+
 # --- 3. a crewmate spawned FROM the secondmate-shaped home lands in the SAME
 # secondmate workspace (this exact path has never run before this test) -----
 
@@ -191,6 +213,14 @@ CM2_WSID=$(herdr pane get "$CM2_PANE" --session "$SESSION" 2>/dev/null | jq -r '
 [ "$CM2_WSID" = "$SM_WSID" ] || fail "a crewmate spawned FROM the secondmate home should land in the SAME workspace as the secondmate's own task ($SM_WSID), got '$CM2_WSID'"
 [ "$CM2_WSID" != "$CM1_WSID" ] || fail "a crewmate spawned FROM the secondmate home must NOT land in the primary's workspace"
 pass "real herdr E2E: a crewmate spawned FROM the secondmate-shaped home lands in the secondmate's OWN workspace - falls out of per-home resolution, no glue needed"
+
+# cm2 ADOPTED the workspace section 2 created rather than creating one, so the
+# gate must stay shut even though this spawn ran as the secondmate's own home.
+# Only a created container is ever recorded, which is what keeps the record
+# from ever naming a workspace this home did not make.
+[ ! -e "$SM_WS_RECORD" ] \
+  || fail "a spawn that ADOPTED an existing container recorded it anyway"$'\n'"$(cat "$SM_WS_RECORD")"
+pass "real herdr E2E: a spawn that adopted an existing container records nothing"
 
 # --- 4. list-live recovery: each home sees only its own tabs ---------------
 

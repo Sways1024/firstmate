@@ -2222,6 +2222,104 @@ test_home_workspace_record_disambiguates_a_label_collision() {
   pass "home workspace record: an exact recorded container beats a colliding label, and no record keeps the ambiguity refusal"
 }
 
+test_home_workspace_record_never_captures_a_foreign_workspace() {
+  local dir out
+  dir="$TMP_ROOT/home-ws-record-stale"; mkdir -p "$dir/state" "$dir/home"
+  out=$(FM_HOME="$dir/home" FM_STATE_OVERRIDE="$dir/state" bash -c '
+    . "$0/bin/backends/herdr.sh"
+    record="$1/.herdr-home-workspace"
+    # Herdr restarts its workspace-id counter when a session is deleted and
+    # recreated under the same name, so a record written before that recreate
+    # can name a workspace the CAPTAIN now owns. Here w1 is the captain own
+    # workspace and w2 is this home own correctly labeled container.
+    WSLIST="{\"result\":{\"workspaces\":[{\"workspace_id\":\"w1\",\"label\":\"captains-notes\"},{\"workspace_id\":\"w2\",\"label\":\"firstmate\"}]}}"
+    printf "fmtest\tw1\n" > "$record"
+    got=$(fm_backend_herdr_home_workspace_recorded_in fmtest "$WSLIST" || printf "(none)")
+    [ "$got" = "(none)" ] \
+      || printf "MISMATCH stale-record-resolves-foreign-workspace: got=%s\n" "$got"
+    # And the record must never beat a label match that was unique and correct:
+    # placement has to land in w2, this home own container.
+    fm_backend_herdr_cli() { printf "%s" "$WSLIST"; }
+    FM_BACKEND_HERDR_WS_ID=""; FM_BACKEND_HERDR_WS_SEEDED_TAB_ID=""
+    got=$(fm_backend_herdr_workspace_ensure_by_label fmtest /tmp 2>/dev/null)
+    [ "$got" = w2 ] || printf "MISMATCH stale-record-captures-placement: got=%s expected=w2\n" "$got"
+    # Adopting must stay indistinguishable from adopting by label, so the
+    # seeded-tab prune gate still cannot reach a workspace this home did not
+    # create.
+    [ -z "$FM_BACKEND_HERDR_WS_SEEDED_TAB_ID" ] \
+      || printf "MISMATCH adopted-must-not-look-created: seeded=%s\n" "$FM_BACKEND_HERDR_WS_SEEDED_TAB_ID"
+    # The same id carrying this home own label is still trusted - that is the
+    # collision the record exists to break.
+    OWNLIST="{\"result\":{\"workspaces\":[{\"workspace_id\":\"w1\",\"label\":\"firstmate\"},{\"workspace_id\":\"w2\",\"label\":\"firstmate\"}]}}"
+    got=$(fm_backend_herdr_home_workspace_recorded_in fmtest "$OWNLIST" || printf "(none)")
+    [ "$got" = w1 ] || printf "MISMATCH own-labeled-record-refused: got=%s expected=w1\n" "$got"
+  ' "$ROOT" "$dir/state" 2>&1)
+  [ -z "$out" ] || fail "stale home workspace record mismatch: $out"
+  pass "home workspace record: a stale record naming a foreign-labeled workspace is refused and never beats a correct label match"
+}
+
+# Pins the KNOWN RESIDUAL documented at the record helpers in
+# bin/backends/herdr.sh: with two same-labeled workspaces, a stale record is
+# strictly worse than no record, because no record refuses the spawn and a
+# stale one places into whichever same-labeled workspace herdr reassigned the
+# id to. Herdr 0.8.0 exposes nothing that could tell those two apart. This is
+# an accepted trade, not an oversight, so it is asserted rather than left
+# incidental - a change that closes it must update this test deliberately.
+test_home_workspace_record_two_match_stale_residual_is_pinned() {
+  local dir out
+  dir="$TMP_ROOT/home-ws-record-residual"; mkdir -p "$dir/state" "$dir/home"
+  out=$(FM_HOME="$dir/home" FM_STATE_OVERRIDE="$dir/state" bash -c '
+    . "$0/bin/backends/herdr.sh"
+    record="$1/.herdr-home-workspace"
+    # Both workspaces carry this home label, which is the collision the record
+    # exists to break. w1 is the captain own; the record is stale and names it.
+    WSLIST="{\"result\":{\"workspaces\":[{\"workspace_id\":\"w1\",\"label\":\"firstmate\"},{\"workspace_id\":\"w2\",\"label\":\"firstmate\"}]}}"
+    fm_backend_herdr_cli() { printf "%s" "$WSLIST"; }
+    # With NO record the ambiguity refusal stops the spawn - loud and safe.
+    rm -f "$record"
+    rc=0
+    fm_backend_herdr_workspace_ensure_by_label fmtest /tmp >/dev/null 2>&1 || rc=$?
+    [ "$rc" = 3 ] || printf "MISMATCH no-record-must-refuse: rc=%s expected=3\n" "$rc"
+    # With a stale record the spawn PROCEEDS into w1 instead. Strictly worse
+    # than the refusal above: that is the documented residual.
+    printf "fmtest\tw1\n" > "$record"
+    FM_BACKEND_HERDR_WS_ID=""; FM_BACKEND_HERDR_WS_SEEDED_TAB_ID=""
+    got=$(fm_backend_herdr_workspace_ensure_by_label fmtest /tmp 2>/dev/null)
+    [ "$got" = w1 ] \
+      || printf "MISMATCH two-match-residual-changed: got=%s expected=w1 (if this now refuses or resolves w2, the residual was closed - update the contract comment in bin/backends/herdr.sh and this test together)\n" "$got"
+  ' "$ROOT" "$dir/state" 2>&1)
+  [ -z "$out" ] || fail "two-match stale record residual mismatch: $out"
+  pass "home workspace record: the two-match stale-record residual is pinned - no record refuses, a stale record still resolves the recorded same-labeled workspace"
+}
+
+test_home_workspace_record_reader_and_writer_are_silent_on_unreadable_state() {
+  local dir out rc
+  dir="$TMP_ROOT/home-ws-record-quiet"; mkdir -p "$dir/state" "$dir/home"
+  printf 'fmtest\tw1\n' > "$dir/state/.herdr-home-workspace"
+  chmod 000 "$dir/state/.herdr-home-workspace"
+  out=$(FM_HOME="$dir/home" FM_STATE_OVERRIDE="$dir/state" bash -c '
+    . "$0/bin/backends/herdr.sh"
+    WSLIST="{\"result\":{\"workspaces\":[{\"workspace_id\":\"w1\",\"label\":\"firstmate\"}]}}"
+    fm_backend_herdr_home_workspace_recorded_in fmtest "$WSLIST" >/dev/null || true
+  ' "$ROOT" 2>&1)
+  chmod 600 "$dir/state/.herdr-home-workspace"
+  [ -z "$out" ] || fail "an unreadable container record must resolve silently, got: $out"
+
+  mkdir -p "$dir/ro-state"
+  chmod 500 "$dir/ro-state"
+  rc=0
+  out=$(FM_HOME="$dir/home" FM_STATE_OVERRIDE="$dir/ro-state" bash -c '
+    . "$0/bin/backends/herdr.sh"
+    fm_backend_herdr_home_workspace_record_write fmtest w1
+  ' "$ROOT" 2>&1) || rc=$?
+  chmod 700 "$dir/ro-state"
+  [ "$rc" = 0 ] || fail "an unwritable state directory must never fail a spawn: rc=$rc"
+  [ -z "$out" ] || fail "an unwritable state directory must record silently, got: $out"
+  [ -z "$(find "$dir/ro-state" -name '.herdr-home-workspace.tmp.*' 2>/dev/null)" ] \
+    || fail "a refused container record write left a temp file behind"
+  pass "home workspace record: an unreadable record and an unwritable state directory both stay silent"
+}
+
 test_pane_foreground_takeover_only_on_positive_evidence() {
   local out
   out=$(bash -c '
@@ -4386,6 +4484,9 @@ test_kill_focused_workspace_stays_plain_close
 test_endpoint_confirmed_gone_gates_on_structured_presence
 test_pane_foreground_takeover_only_on_positive_evidence
 test_home_workspace_record_disambiguates_a_label_collision
+test_home_workspace_record_never_captures_a_foreign_workspace
+test_home_workspace_record_two_match_stale_residual_is_pinned
+test_home_workspace_record_reader_and_writer_are_silent_on_unreadable_state
 test_kill_refuses_when_presentation_lock_is_unavailable
 test_projection_seeded_prune_refuses_active_tab
 test_projection_label_builder_uses_corner_and_strips_owner_prefixes
