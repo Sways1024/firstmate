@@ -2350,8 +2350,10 @@ rm -rf "$RESPDIR"; mkdir -p "$RESPDIR"
 COUNTER="$RESPDIR/.calls"
 # Detached from this shell's stdout, which a case body's own command
 # substitution would otherwise wait on until every standin process exited.
-sleep 30 >/dev/null 2>&1 & RESTING=$!
-sleep 30 >/dev/null 2>&1 & OTHER=$!
+# Long enough to outlive the whole matrix on a saturated machine: a standin that
+# exited mid-run would silently stop being a real sleeping process.
+sleep 300 >/dev/null 2>&1 & RESTING=$!
+sleep 300 >/dev/null 2>&1 & OTHER=$!
 bash -c 'e=$((SECONDS+120)); while [ $SECONDS -lt $e ]; do :; done' >/dev/null 2>&1 & BUSY=$!
 trap 'kill "$RESTING" "$OTHER" "$BUSY" 2>/dev/null' EXIT
 BUDGET=6
