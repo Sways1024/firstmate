@@ -120,10 +120,13 @@ print_blockers() {  # <file>
   done < "$file"
 }
 
+# The duplicate-digest marker is cleared with the buffer whose delivery attempt
+# it describes; bin/fm-afk-start.sh's fm_afk_clear_stale_artifacts owns why.
 clear_delivery_artifacts() {
   rm -f \
     "$STATE/.subsuper-escalations" \
     "$STATE/.subsuper-escalations.since" \
+    "$STATE/.subsuper-last-unconfirmed-inject" \
     "$STATE/.subsuper-inject-wedged"
 }
 

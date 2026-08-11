@@ -41,7 +41,10 @@ GLOBAL_CLEANUP() {
 trap GLOBAL_CLEANUP EXIT
 
 # ---------------------------------------------------------------------------
-# UNIT 1: fm_afk_clear_stale_artifacts removes exactly the three stale artifacts.
+# UNIT 1: fm_afk_clear_stale_artifacts removes exactly the four stale artifacts.
+# The duplicate-digest marker is one of them: it claims a specific delivery
+# buffer reached the captain, so leaving it behind after that buffer is gone lets
+# it suppress the next escalation whose digest renders identically.
 # ---------------------------------------------------------------------------
 unit_clear_stale() {
   local st
@@ -49,6 +52,7 @@ unit_clear_stale() {
   mkdir -p "$st/state"
   : > "$st/state/.subsuper-escalations"
   : > "$st/state/.subsuper-escalations.since"
+  : > "$st/state/.subsuper-last-unconfirmed-inject"
   : > "$st/state/.subsuper-inject-wedged"
   : > "$st/state/.wake-queue"          # durable queue must be untouched
   # Source fm-afk-start.sh inside a child bash (it sets `set -eu` and would
@@ -61,6 +65,11 @@ unit_clear_stale() {
     pass "clear-stale: removes escalations buffer, sidecar, and wedge marker"
   else
     fail "clear-stale: stale artifacts survived"
+  fi
+  if [ ! -e "$st/state/.subsuper-last-unconfirmed-inject" ]; then
+    pass "clear-stale: disarms the duplicate-digest marker with the buffer it describes"
+  else
+    fail "clear-stale: the duplicate-digest marker outlived the cleared delivery buffer"
   fi
   if [ -e "$st/state/.wake-queue" ]; then
     pass "clear-stale: leaves the durable wake-queue intact (no pending work dropped)"

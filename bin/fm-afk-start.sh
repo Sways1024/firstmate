@@ -59,10 +59,25 @@ fm_afk_start_usage() {
 # lifecycle" and bin/fm-supervise-daemon.sh's escalate_add/inject_wedge_alarm).
 # NOT called on a refresh (daemon already alive), so the current session's own
 # buffered escalations are preserved.
+#
+# MARKER LIFECYCLE (this comment owns the rule; every site that clears the
+# delivery buffer clears the marker in the same step, and cross-references here).
+# state/.subsuper-last-unconfirmed-inject is inject_msg's duplicate-digest
+# marker: it records that one specific digest was typed with an unconfirmed
+# submit, so a later identical digest can be recognized as already delivered.
+# That claim describes exactly one buffer's delivery attempt and is meaningless
+# once that buffer is gone. A marker allowed to outlive its buffer matches the
+# next escalation whose digest happens to render identically - an unchanged
+# fleet renders the same text - and reports it delivered without typing it.
+# The cost is total rather than cosmetic: escalate_flush truncates the buffer on
+# that false success, so nothing retries the escalation and the captain never
+# hears it. Clearing the marker is always the safe direction, because its
+# absence can only cost a duplicate delivery, never a lost one.
 fm_afk_clear_stale_artifacts() {  # <state-dir>
   local state=$1
   rm -f "$state/.subsuper-escalations" \
         "$state/.subsuper-escalations.since" \
+        "$state/.subsuper-last-unconfirmed-inject" \
         "$state/.subsuper-inject-wedged" 2>/dev/null
 }
 

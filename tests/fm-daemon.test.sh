@@ -2198,6 +2198,59 @@ test_escalate_flush_redelivers_an_escalation_proven_undelivered() {
   pass "escalate_flush: an escalation proven undelivered is redelivered, never truncated as a deduped false positive"
 }
 
+# The marker claims one specific buffer reached the captain, so it must not
+# survive the buffer it describes. The away-mode return path clears the delivery
+# buffer; a marker left behind then matches the NEXT escalation whose digest
+# renders identically - an unchanged fleet renders the same text - reports it
+# delivered without typing it, and escalate_flush truncates the buffer on that
+# false success, so the captain never hears it and nothing retries.
+test_afk_return_clears_dedup_marker_with_the_buffer_it_describes() {
+  local dir state out rc
+  dir=$(make_supercase inject-dedup-outlives-buffer)
+  state="$dir/state"
+  afk_enter "$state"
+
+  # An away-mode escalation is buffered, typed once, and its submit confirmation
+  # comes back unreadable: the buffer is preserved and the marker is armed.
+  escalate_add "$state" "merge-task.status: needs-decision captain must merge PR 4242"
+  (
+    fm_backend_target_exists() { return 0; }
+    pane_is_busy() { return 1; }
+    fm_backend_composer_state() { printf 'empty'; }
+    fm_backend_send_text_submit() { printf 'unknown'; }
+    if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" escalate_flush "$state"; then
+      fail "an unconfirmed submit must leave the escalation buffered"
+    fi
+  ) || fail "arming subshell failed"
+  [ -f "$state/.subsuper-last-unconfirmed-inject" ] \
+    || fail "an unconfirmed submit did not arm the duplicate-digest marker"
+
+  # The captain returns: away mode stops and the return catch-up clears the
+  # delivery buffer that the marker was describing.
+  out=$(FM_HOME="$dir" FM_STATE_OVERRIDE="$state" "$ROOT/bin/fm-afk-return.sh" begin 2>&1)
+  rc=$?
+  [ "$rc" -eq 0 ] || fail "return catch-up should clear with no open blocker (rc=$rc): $out"
+  [ ! -e "$state/.subsuper-escalations" ] || fail "the return path left the delivery buffer behind"
+  [ ! -e "$state/.subsuper-last-unconfirmed-inject" ] \
+    || fail "the duplicate-digest marker outlived the buffer whose delivery it describes"
+
+  # A later away session raises a genuinely NEW escalation that happens to render
+  # the identical digest. It must be typed, not matched against the stale marker.
+  afk_enter "$state"
+  escalate_add "$state" "merge-task.status: needs-decision captain must merge PR 4242"
+  (
+    fm_backend_target_exists() { return 0; }
+    pane_is_busy() { return 1; }
+    fm_backend_composer_state() { printf 'empty'; }
+    fm_backend_send_text_submit() { printf '%s\n' "$3" >> "$dir/typed"; printf 'empty'; }
+    FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" escalate_flush "$state" \
+      || fail "the new escalation must be delivered"
+  ) || fail "redelivery subshell failed"
+  grep -F 'captain must merge PR 4242' "$dir/typed" >/dev/null 2>&1 \
+    || fail "the new escalation was suppressed by a marker that outlived its buffer, not typed"
+  pass "away-mode return: clearing the delivery buffer disarms the duplicate-digest marker with it"
+}
+
 test_inject_msg_herdr_busy_guard_defers
 test_inject_msg_herdr_composer_guard_defers
 test_inject_msg_dedups_identical_digest_after_unknown_submit
@@ -2206,6 +2259,7 @@ test_inject_msg_unproven_pending_composer_revokes_dedup_marker
 test_inject_msg_dedup_marker_is_bound_to_its_supervisor_target
 test_inject_msg_dedup_marker_expires_after_consecutive_unreadable_reads
 test_escalate_flush_redelivers_an_escalation_proven_undelivered
+test_afk_return_clears_dedup_marker_with_the_buffer_it_describes
 test_inject_msg_herdr_pane_gone_defers
 test_inject_msg_herdr_submits_through_backend_dispatch
 test_inject_msg_defers_on_dead_shell_unknown
