@@ -66,14 +66,17 @@ export FM_BACKEND_HERDR_PANE_SETTLE_POLLS=200
 
 CHECKED=0
 
-new_pane() {  # <label> -> pane id
+# Prints the new pane's id, or nothing when any step fails. It never calls fail
+# itself: it runs inside a command substitution, where an exit would end only
+# the subshell and a teardown would run there and again in the real one. Each
+# caller checks the printed id instead.
+new_pane() {  # <label> -> pane id, empty on failure
   local out ws
-  out=$(fm_backend_herdr_cli "$SESSION" workspace create --cwd /tmp --label "$1" 2>/dev/null) \
-    || fail "$BACKEND_ID: workspace create failed for $1"
+  out=$(fm_backend_herdr_cli "$SESSION" workspace create --cwd /tmp --label "$1" 2>/dev/null) || return 1
   ws=$(printf '%s' "$out" | jq -r '.result.workspace.workspace_id // .result.workspace_id // empty' 2>/dev/null)
   [ -n "$ws" ] || ws=$(fm_backend_herdr_cli "$SESSION" workspace list 2>/dev/null \
     | jq -r --arg l "$1" '.result.workspaces[] | select(.label == $l) | .workspace_id' 2>/dev/null | tail -1)
-  [ -n "$ws" ] || fail "$BACKEND_ID: could not resolve the workspace created for $1"
+  [ -n "$ws" ] || return 1
   fm_backend_herdr_cli "$SESSION" pane list --workspace "$ws" 2>/dev/null \
     | jq -r '.result.panes[0].pane_id // empty' 2>/dev/null
 }
