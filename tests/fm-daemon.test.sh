@@ -1953,9 +1953,132 @@ test_inject_msg_dedups_identical_digest_after_unknown_submit() {
   pass "inject_msg: an identical digest after an unknown submit dedups instead of retyping"
 }
 
+# The duplicate-digest guard infers delivery from an empty composer, and a wrong
+# inference DESTROYS the escalation (escalate_flush truncates the buffer on
+# success). These three cases pin the two observations that revoke that
+# inference, and the buffer's survival when one of them fires.
+
+# A 'pending' composer is the daemon reading its OWN text still unsent - direct
+# proof the Enter was swallowed. Poll 3 then finds the composer empty because
+# something (a context reset, an interrupt, a trust dialog) discarded the text,
+# not because it was submitted, so the digest must be retyped.
+test_inject_msg_pending_composer_revokes_dedup_marker() {
+  local dir state marker
+  dir=$(make_supercase inject-dedup-pending-revoke)
+  state="$dir/state"
+  marker="$state/.subsuper-last-unconfirmed-inject"
+  afk_enter "$state"
+  (
+    fm_backend_target_exists() { return 0; }
+    pane_is_busy() { return 1; }
+    fm_backend_composer_state() { printf 'empty'; }
+    fm_backend_send_text_submit() { printf 'unknown'; }
+    if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "digest one" "$state"; then
+      fail "an unknown submit verdict must report undelivered"
+    fi
+    [ -f "$marker" ] || fail "an unknown submit verdict must arm the duplicate-digest marker"
+    fm_backend_composer_state() { printf 'pending'; }
+    fm_backend_send_text_submit() { fail "send_text_submit must not run while the composer is pending"; }
+    if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "digest one" "$state"; then
+      fail "a pending composer must still defer"
+    fi
+    [ ! -f "$marker" ] \
+      || fail "a pending composer proves the digest was never submitted and must revoke the duplicate-digest marker"
+    fm_backend_composer_state() { printf 'empty'; }
+    fm_backend_send_text_submit() { printf 'typed\n' >> "$dir/typed"; printf 'empty'; }
+    FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "digest one" "$state" \
+      || fail "the retyped digest must report delivered once the submit confirms"
+    [ -s "$dir/typed" ] \
+      || fail "a digest observed as still-pending was declared delivered without ever being submitted"
+  ) || fail "pending-revoke inject_msg subshell failed"
+  pass "inject_msg: a pending composer revokes the duplicate-digest marker, so a later empty composer retypes instead of dropping"
+}
+
+# The marker is bound to the supervisor target it was typed into. A supervisor
+# pane recreated and re-discovered between polls (daemon restart, backend server
+# restart, the captain closing and reopening it) reads empty because it is NEW.
+test_inject_msg_dedup_marker_is_bound_to_its_supervisor_target() {
+  local dir state marker
+  dir=$(make_supercase inject-dedup-target-bound)
+  state="$dir/state"
+  marker="$state/.subsuper-last-unconfirmed-inject"
+  afk_enter "$state"
+  (
+    fm_backend_target_exists() { return 0; }
+    pane_is_busy() { return 1; }
+    fm_backend_composer_state() { printf 'empty'; }
+    fm_backend_send_text_submit() { printf 'unknown'; }
+    if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "digest one" "$state"; then
+      fail "an unknown submit verdict must report undelivered"
+    fi
+    [ -f "$marker" ] || fail "an unknown submit verdict must arm the duplicate-digest marker"
+    fm_backend_send_text_submit() { printf 'typed\n' >> "$dir/typed"; printf 'empty'; }
+    FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w9:p7" inject_msg "digest one" "$state" \
+      || fail "the digest must be delivered to the re-discovered supervisor target"
+    [ -s "$dir/typed" ] \
+      || fail "a marker armed against default:w1:p2 was honoured against never-typed pane default:w9:p7"
+    # A marker armed by an older daemon records only "<hash> <timestamp>". It
+    # cannot prove which pane received the digest, so it must never dedup.
+    fm_backend_send_text_submit() { printf 'unknown'; }
+    if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "digest two" "$state"; then
+      fail "an unknown submit verdict must report undelivered"
+    fi
+    awk '{print $1, $2}' "$marker" > "$marker.trimmed" || fail "could not rewrite the marker as a legacy record"
+    mv "$marker.trimmed" "$marker"
+    : > "$dir/typed"
+    fm_backend_send_text_submit() { printf 'typed\n' >> "$dir/typed"; printf 'empty'; }
+    FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "digest two" "$state" \
+      || fail "the digest must be delivered when the marker cannot prove which pane received it"
+    [ -s "$dir/typed" ] \
+      || fail "a marker with no recorded target was treated as proof of delivery"
+  ) || fail "target-bound dedup inject_msg subshell failed"
+  pass "inject_msg: the duplicate-digest marker only dedups on the supervisor target it was armed against"
+}
+
+# The cost of a wrong dedup is total, so drive the whole flush path: the
+# escalation buffer must survive every deferral and be truncated only after the
+# payload was really submitted.
+test_escalate_flush_redelivers_an_escalation_proven_undelivered() {
+  local dir state buf
+  dir=$(make_supercase escalate-flush-dedup-loss)
+  state="$dir/state"
+  buf="$state/.subsuper-escalations"
+  afk_enter "$state"
+  printf 'needs-decision: PR 4242 needs the captain merge decision\n' > "$buf"
+  (
+    fm_backend_target_exists() { return 0; }
+    pane_is_busy() { return 1; }
+    fm_backend_composer_state() { printf 'empty'; }
+    fm_backend_send_text_submit() { printf 'unknown'; }
+    if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" escalate_flush "$state"; then
+      fail "an unconfirmed submit must not report the escalation flushed"
+    fi
+    [ -s "$buf" ] || fail "an unconfirmed submit must preserve the escalation buffer"
+    fm_backend_composer_state() { printf 'pending'; }
+    fm_backend_send_text_submit() { fail "send_text_submit must not run while the composer is pending"; }
+    if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" escalate_flush "$state"; then
+      fail "a pending composer must not report the escalation flushed"
+    fi
+    [ -s "$buf" ] || fail "a deferred flush must preserve the escalation buffer"
+    fm_backend_composer_state() { printf 'empty'; }
+    fm_backend_send_text_submit() { printf '%s' "$3" > "$dir/submitted"; printf 'empty'; }
+    FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" escalate_flush "$state" \
+      || fail "the escalation must flush once the submit confirms"
+    [ -f "$dir/submitted" ] \
+      || fail "the escalation buffer was cleared by a deduped false positive - the captain's merge decision is lost"
+    assert_contains "$(cat "$dir/submitted")" "PR 4242 needs the captain merge decision" \
+      "the flushed digest did not carry the captain's merge decision"
+    [ ! -s "$buf" ] || fail "a confirmed delivery must clear the escalation buffer"
+  ) || fail "escalate_flush dedup-loss subshell failed"
+  pass "escalate_flush: an escalation proven undelivered is redelivered, never truncated as a deduped false positive"
+}
+
 test_inject_msg_herdr_busy_guard_defers
 test_inject_msg_herdr_composer_guard_defers
 test_inject_msg_dedups_identical_digest_after_unknown_submit
+test_inject_msg_pending_composer_revokes_dedup_marker
+test_inject_msg_dedup_marker_is_bound_to_its_supervisor_target
+test_escalate_flush_redelivers_an_escalation_proven_undelivered
 test_inject_msg_herdr_pane_gone_defers
 test_inject_msg_herdr_submits_through_backend_dispatch
 test_inject_msg_defers_on_dead_shell_unknown

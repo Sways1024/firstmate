@@ -1147,8 +1147,21 @@ inject_msg() {  # <message> [state]
   #      target - typing the escalation into a shell could execute it - so defer
   #      on anything that is not affirmatively 'empty'. A deferred escalation
   #      stays buffered for the next cycle or the catch-up flush.
+  #      A 'pending' composer also REVOKES the duplicate-digest marker before
+  #      this guard returns, so the marker is resolved here rather than at (c);
+  #      (c) owns that contract.
+  local dedup_marker last_hash last_ts last_target msg_hash
+  dedup_marker="$state/.subsuper-last-unconfirmed-inject"
+  msg_hash=$(_hash_text "$msg")
   composer=$(fm_backend_composer_state "$backend" "$target" 2>/dev/null)
   if [ "$composer" != empty ]; then
+    if [ "$composer" = pending ] && [ -f "$dedup_marker" ]; then
+      read -r last_hash last_ts last_target < "$dedup_marker" 2>/dev/null || last_hash=
+      if [ "$last_hash" = "$msg_hash" ]; then
+        rm -f "$dedup_marker"
+        log "inject dedup marker revoked: this exact digest is still sitting unsent in the supervisor composer, so the earlier submit was never accepted"
+      fi
+    fi
     log "inject deferred: supervisor composer not confirmed-empty (state=${composer:-unknown}: pending input, dead-shell prompt, or unreadable pane)"
     return 1
   fi
@@ -1156,20 +1169,30 @@ inject_msg() {  # <message> [state]
   #      LANDED but returned `unknown` (pane unreadable at confirm time) left
   #      the buffer preserved, and the next flush retyped the identical digest
   #      as a duplicate turn - the measured 16h incident was 59 repeat
-  #      deliveries of unchanged payloads. If the exact digest we last typed
-  #      with an unconfirmed submit reaches an EMPTY composer within the dedup
-  #      window, the earlier Enter was accepted (swallowed text would still be
-  #      sitting in the composer and defer above) - treat it as delivered.
+  #      deliveries of unchanged payloads. The marker records the digest hash,
+  #      the arming time, and the supervisor target it was typed into; the dedup
+  #      fires only when all three still hold, because a false positive DESTROYS
+  #      the escalation rather than retrying it (escalate_flush truncates the
+  #      buffer on success). So: the exact digest we last typed with an
+  #      unconfirmed submit, reaching an EMPTY composer on the SAME target,
+  #      within the dedup window, had its earlier Enter accepted - treat it as
+  #      delivered. Two observations instead prove NON-delivery and revoke the
+  #      marker so the digest is retyped (a possible duplicate, never a silent
+  #      loss): a 'pending' composer holding that same digest, which is our own
+  #      text still unsent (revoked at (b) above, which returns before this
+  #      block); and a DIFFERENT supervisor target, since a pane recreated or
+  #      re-discovered between polls was never typed into and reads empty only
+  #      because it is new. A marker with no recorded target (armed by an older
+  #      daemon) cannot prove either, so it never dedups.
   #      A different digest always passes; a confirmed submit clears the marker.
-  local dedup_marker last_hash last_ts
-  dedup_marker="$state/.subsuper-last-unconfirmed-inject"
   if [ -f "$dedup_marker" ]; then
-    read -r last_hash last_ts < "$dedup_marker" 2>/dev/null || { last_hash=; last_ts=; }
-    if [ "$last_hash" = "$(_hash_text "$msg")" ] \
+    read -r last_hash last_ts last_target < "$dedup_marker" 2>/dev/null || { last_hash=; last_ts=; last_target=; }
+    if [ "$last_hash" = "$msg_hash" ] \
        && [ -n "$last_ts" ] \
+       && [ -n "$last_target" ] && [ "$last_target" = "$target" ] \
        && [ $(( $(_now) - last_ts )) -le "${FM_INJECT_DEDUP_SECS:-3600}" ]; then
       rm -f "$dedup_marker"
-      log "inject deduped: identical digest already typed with an unconfirmed submit and the composer is now empty; treating the earlier submit as delivered"
+      log "inject deduped: identical digest already typed into this same supervisor target with an unconfirmed submit and the composer is now empty; treating the earlier submit as delivered"
       return 0
     fi
   fi
@@ -1190,8 +1213,9 @@ inject_msg() {  # <message> [state]
   if [ "$verdict" = unknown ]; then
     # Typed once, Enter retried, confirmation unreadable: arm the
     # duplicate-digest guard above so a retype of THIS exact digest into a
-    # later empty composer is recognized as already delivered.
-    printf '%s %s\n' "$(_hash_text "$msg")" "$(_now)" > "$dedup_marker" 2>/dev/null || true
+    # later empty composer ON THIS SAME TARGET is recognized as already
+    # delivered. The target is recorded last so it may contain spaces.
+    printf '%s %s %s\n' "$msg_hash" "$(_now)" "$target" > "$dedup_marker" 2>/dev/null || true
   fi
   log "inject failed: submit unconfirmed after $retries retries (verdict=$verdict, text may be in composer)"
   return 1
