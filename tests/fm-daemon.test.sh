@@ -2080,6 +2080,73 @@ test_inject_msg_dedup_marker_is_bound_to_its_supervisor_target() {
   pass "inject_msg: the duplicate-digest marker only dedups on the supervisor target it was armed against"
 }
 
+# The marker is armed precisely when the submit's last composer read was
+# 'unknown', and an 'unknown' read defers without revoking, so an unreadable
+# composer can keep the marker alive across polls. The dedup window is what
+# bounds that: it covers the daemon's own retry of the same buffered digest, not
+# an arbitrarily long unreadable stretch, so once the marker outlives the bound
+# a later empty composer retypes the escalation instead of destroying it.
+test_inject_msg_dedup_window_is_bounded() {
+  local dir state marker
+  dir=$(make_supercase inject-dedup-window)
+  state="$dir/state"
+  marker="$state/.subsuper-last-unconfirmed-inject"
+  afk_enter "$state"
+  (
+    fm_backend_target_exists() { return 0; }
+    pane_is_busy() { return 1; }
+    arm_marker() {  # <digest>
+      fm_backend_composer_state() { printf 'empty'; }
+      fm_backend_send_text_submit() { printf 'unknown'; }
+      if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "$1" "$state"; then
+        fail "an unknown submit verdict must report undelivered"
+      fi
+      [ -f "$marker" ] || fail "an unknown submit verdict must arm the duplicate-digest marker"
+    }
+    age_marker() {  # <seconds>
+      local hash ts target
+      read -r hash ts target < "$marker" || fail "could not read the duplicate-digest marker"
+      printf '%s %s %s\n' "$hash" "$(( $(_now) - $1 ))" "$target" > "$marker"
+    }
+    arm_marker "digest one"
+    # An unreadable composer proves nothing either way, so it defers and leaves
+    # the marker standing.
+    fm_backend_composer_state() { printf 'unknown'; }
+    fm_backend_send_text_submit() { fail "send_text_submit must not run while the composer is unreadable"; }
+    if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "digest one" "$state"; then
+      fail "an unreadable composer must still defer"
+    fi
+    [ -f "$marker" ] || fail "an unreadable composer must not revoke the duplicate-digest marker"
+    # Control: inside the window the guard still suppresses the duplicate.
+    fm_backend_composer_state() { printf 'empty'; }
+    fm_backend_send_text_submit() { fail "an identical digest inside the dedup window must not be retyped"; }
+    FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "digest one" "$state" \
+      || fail "an identical digest inside the dedup window must still dedup"
+    # A marker just inside the bound still vouches for the earlier submit.
+    arm_marker "digest two"
+    age_marker 299
+    fm_backend_composer_state() { printf 'empty'; }
+    fm_backend_send_text_submit() { fail "a marker still inside the dedup window must not be retyped"; }
+    FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "digest two" "$state" \
+      || fail "a marker still inside the dedup window must dedup"
+    # Past the bound it cannot: the escalation is retyped, never truncated.
+    arm_marker "digest three"
+    fm_backend_composer_state() { printf 'unknown'; }
+    fm_backend_send_text_submit() { fail "send_text_submit must not run while the composer is unreadable"; }
+    if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "digest three" "$state"; then
+      fail "an unreadable composer must still defer"
+    fi
+    age_marker 301
+    fm_backend_composer_state() { printf 'empty'; }
+    fm_backend_send_text_submit() { printf 'typed\n' >> "$dir/typed"; printf 'empty'; }
+    FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "digest three" "$state" \
+      || fail "the retyped digest must report delivered once the submit confirms"
+    [ -s "$dir/typed" ] \
+      || fail "a marker that outlived the dedup window still vouched for a delivery nothing ever confirmed"
+  ) || fail "dedup-window inject_msg subshell failed"
+  pass "inject_msg: the duplicate-digest marker stops vouching once it outlives the dedup window"
+}
+
 # The cost of a wrong dedup is total, so drive the whole flush path: the
 # escalation buffer must survive every deferral and be truncated only after the
 # payload was really submitted.
@@ -2124,6 +2191,7 @@ test_inject_msg_dedups_identical_digest_after_unknown_submit
 test_inject_msg_pending_composer_revokes_dedup_marker
 test_inject_msg_unproven_pending_composer_revokes_dedup_marker
 test_inject_msg_dedup_marker_is_bound_to_its_supervisor_target
+test_inject_msg_dedup_window_is_bounded
 test_escalate_flush_redelivers_an_escalation_proven_undelivered
 test_inject_msg_herdr_pane_gone_defers
 test_inject_msg_herdr_submits_through_backend_dispatch

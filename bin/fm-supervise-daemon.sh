@@ -198,6 +198,18 @@ HOUSEKEEPING_TICK_DEFAULT=15
 # the normal flush path and, if that cannot confirm a submit, raises a loud wedge
 # alarm. The escape hatch makes a guard false-positive visible instead of silent.
 MAX_DEFER_SECS_DEFAULT=300
+# How long the duplicate-digest marker at inject_msg (c) may still vouch that an
+# unconfirmed submit landed. The window only ever needs to cover the daemon's own
+# retry of the SAME buffered digest after a submit returned `unknown`: that retry
+# arrives on the order of INJECT_FAIL_SLEEP_DEFAULT and ESCALATE_BATCH_SECS_DEFAULT,
+# with housekeeping polling every HOUSEKEEPING_TICK_DEFAULT. It is deliberately tied
+# to MAX_DEFER_SECS_DEFAULT, the daemon's own declared bound on how long an
+# escalation may sit undelivered before the max-defer path calls the situation
+# abnormal - past that point the dedup must not still be silently vouching for a
+# delivery nothing ever confirmed. That matters because an `unknown` composer read
+# defers without revoking the marker, so an unreadable stretch longer than this
+# bound now leaves the marker stale and the digest is retyped rather than dropped.
+INJECT_DEDUP_SECS_DEFAULT=$MAX_DEFER_SECS_DEFAULT
 WEDGE_ALARM_TIMEOUT_SECS_DEFAULT=10
 WEDGE_ALARM_LAST_EPOCH=0
 WEDGE_ALARM_NOTIFIER_PID=
@@ -1202,7 +1214,7 @@ inject_msg() {  # <message> [state]
     if [ "$last_hash" = "$msg_hash" ] \
        && [ -n "$last_ts" ] \
        && [ -n "$last_target" ] && [ "$last_target" = "$target" ] \
-       && [ $(( $(_now) - last_ts )) -le "${FM_INJECT_DEDUP_SECS:-3600}" ]; then
+       && [ $(( $(_now) - last_ts )) -le "${FM_INJECT_DEDUP_SECS:-$INJECT_DEDUP_SECS_DEFAULT}" ]; then
       rm -f "$dedup_marker"
       log "inject deduped: identical digest already typed into this same supervisor target with an unconfirmed submit and the composer is now empty; treating the earlier submit as delivered"
       return 0
