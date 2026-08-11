@@ -2318,6 +2318,7 @@ test_home_workspace_record_reader_and_writer_are_silent_on_unreadable_state() {
   [ -z "$(find "$dir/ro-state" -name '.herdr-home-workspace.tmp.*' 2>/dev/null)" ] \
     || fail "a refused container record write left a temp file behind"
   pass "home workspace record: an unreadable record and an unwritable state directory both stay silent"
+}
 
 # The pane-foreground classifier decides from two independent signals: herdr's
 # process-info says who owns the pane's foreground, and the operating system's
