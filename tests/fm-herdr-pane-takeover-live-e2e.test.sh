@@ -21,10 +21,10 @@ set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# cleanup_all is defined once the lab session exists, which is before the first
+# fail call below; every earlier exit path reports and exits directly.
 fail() { printf 'not ok - %s\n' "$1" >&2; cleanup_all; exit 1; }
 pass() { printf 'ok - %s\n' "$1"; }
-
-cleanup_all() { :; }
 
 if [ "${FM_HERDR_TAKEOVER_LIVE_E2E:-0}" != 1 ]; then
   echo "skip: set FM_HERDR_TAKEOVER_LIVE_E2E=1 to run the real-Herdr pane-takeover guard"
@@ -159,6 +159,7 @@ pass "$BACKEND_ID: a shell replaced by another program through exec is refused"
 PANE=$(new_pane fm-takeover-late-exec)
 [ -n "$PANE" ] || fail "$BACKEND_ID: no pane id for the late-exec case"
 wait_for_rest "$PANE" || fail "$BACKEND_ID: the late-exec pane never reached its prompt"
+# shellcheck disable=SC2016  # the pane's own shell expands this, not the test's
 fm_backend_herdr_cli "$SESSION" pane run "$PANE" \
   'i=0; while [ $i -lt 800000 ]; do i=$((i+1)); done; exec /usr/bin/tail -f /dev/null' >/dev/null 2>&1 \
   || fail "$BACKEND_ID: could not run the late-exec command in the pane"
