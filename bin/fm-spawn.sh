@@ -2403,6 +2403,35 @@ else
   fi
 fi
 
+# #1912: a herdr pane is created as a bare shell with no command, and the
+# secondmate path skips the crewmate worktree cwd-settle gate entirely, so
+# nothing yet proves the created shell still owns the pane. If a shell rc
+# `exec`d another process (e.g. a tmux auto-attach), everything typed later -
+# including the env-laden launch command - would land in whatever process took
+# over, silently. Crewmates and scouts keep their stronger cwd-settle gate as
+# the equivalent proof.
+#
+# The gate settles the pane before it answers and refuses ONLY on positive
+# evidence of a takeover; the backend function owns that contract. It is
+# deliberately NOT the idle-lone-shell proof used by pane cleanup: that proof
+# requires no child process at all, which docs/herdr-backend.md records as
+# permanently unsatisfiable for a shell running a persistent helper
+# (gitstatusd, zsh-async, direnv), so requiring it here refused legitimate
+# spawns outright. Unreadable, ambiguous, or shell-confirmed all proceed,
+# which is never worse than the historical no-check behavior.
+#
+# It runs BEFORE metadata publication, so a refusal is cleaned up by the
+# pre-metadata abort path below rather than leaving a live pane and a meta file
+# describing a secondmate that was never launched - state a retry of the same
+# task id then collides with. Nothing has been typed into a secondmate's pane
+# at this point, so moving the gate earlier costs the spawn nothing.
+if [ "$BACKEND" = herdr ] && [ "$KIND" = secondmate ]; then
+  if fm_backend_herdr_pane_foreground_takeover "$HERDR_SES" "$HERDR_PANE_ID"; then
+    echo "error: created herdr pane for $W is running '$FM_BACKEND_HERDR_TAKEOVER_PROCESS' under the shell's own process id (a shell rc exec'd it); refusing to type the launch command into a pane its shell no longer owns" >&2
+    exit 1
+  fi
+fi
+
 META_WINDOW=$T
 [ "$BACKEND" = orca ] && META_WINDOW=$W
 {
@@ -2496,28 +2525,6 @@ if [ "$KIND" = secondmate ]; then
   # Reuse the single frozen decision from the carrier resolution above so the
   # injected carrier and this on/off snapshot are guaranteed to agree.
   LAUNCH="FM_ROOT_OVERRIDE= FM_STATE_OVERRIDE= FM_DATA_OVERRIDE= FM_PROJECTS_OVERRIDE= FM_CONFIG_OVERRIDE= FM_PUBLIC_FOLLOWUP_PRIMARY_HOME=$sq_primary_home FM_HOME=$sq_home FM_TRACE_CONTEXT=$SPAWN_TRACE_EFFECTIVE FM_SUPERVISION_MODEL=$supervision_model $LAUNCH"
-fi
-# #1912: a herdr pane is created as a bare shell with no command, and the
-# secondmate path skips the crewmate worktree cwd-settle gate entirely, so
-# nothing yet proves the created shell still owns the pane. If a shell rc
-# `exec`d another process (e.g. a tmux auto-attach), everything typed below -
-# including the env-laden launch command - would land in whatever process took
-# over, silently. Crewmates and scouts keep their stronger cwd-settle gate as
-# the equivalent proof.
-#
-# This refuses ONLY on positive evidence of a takeover - a readable pane whose
-# sole foreground process is confirmably not a shell, twice in a row. It is
-# deliberately NOT the idle-lone-shell proof used by pane cleanup: that proof
-# requires no child process at all, which docs/herdr-backend.md records as
-# permanently unsatisfiable for a shell running a persistent helper
-# (gitstatusd, zsh-async, direnv), so requiring it here refused legitimate
-# spawns outright. Unreadable, ambiguous, or shell-confirmed all proceed,
-# which is never worse than the historical no-check behavior.
-if [ "$BACKEND" = herdr ] && [ "$KIND" = secondmate ]; then
-  if fm_backend_herdr_pane_foreground_takeover "$HERDR_SES" "$HERDR_PANE_ID"; then
-    echo "error: created herdr pane for $W is running '$FM_BACKEND_HERDR_TAKEOVER_PROCESS' instead of its shell (a shell rc likely exec'd it); refusing to type the launch command into a pane its shell no longer owns" >&2
-    exit 1
-  fi
 fi
 # Export GOTMPDIR into the crewmate's pane shell so the agent and every child
 # process (go build, go test, ...) inherit it. Sent before the launch command so

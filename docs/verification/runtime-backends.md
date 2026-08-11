@@ -493,6 +493,43 @@ ok - forced secondmate teardown retains Herdr child identity until exact pane di
 ok - forced teardown retains a nested secondmate home and its grandchild's Herdr identity when the grandchild close is unconfirmed
 ```
 
+### Secondmate pane-takeover gate
+
+A Herdr pane is created as a bare shell, and a secondmate spawn has no worktree cwd-settle gate to prove that shell still owns the pane before the launch command is typed into it.
+The gate that closes that gap classifies a pane from what Herdr emits, and these are the four states it separates, each measured on 2026-08-11 against Herdr 0.8.0 on macOS in a guarded `fm-lab-` session:
+
+| Pane state | `shell_pid` vs foreground process group | Sole foreground process | Process state of the shell pid | Verdict |
+|---|---|---|---|---|
+| Shell waiting at its prompt | equal | the shell, under its own pid | `Ss+` | cleared |
+| Shell running pure-shell rc work | equal | the shell, under its own pid | `Rs+` | not yet settled |
+| Ordinary foreground rc command | different | the child, under its own pid | `Ss` | cleared |
+| Shell replaced through `exec` | equal | another program, under the shell's own pid | `Ss+` | refused |
+
+Only `exec` can put another program under the shell's own pid and process group, so that comparison is what separates a real substitution from an ordinary foreground rc command; without it, an rc running `nvm use`, a keychain lookup, or any other foreground command for longer than the sampling window aborted the spawn.
+Herdr's own data cannot separate the first two rows, so the operating system's process state is read as a second, independent signal; without it, an rc doing pure-shell work reads as a settled pane and the gate clears it before the `exec` it exists to catch has happened.
+
+Refresh this table with the opt-in guard, which drives a real pane through all four states and fails naming the backend and version:
+
+```sh
+FM_HERDR_TAKEOVER_LIVE_E2E=1 tests/fm-herdr-pane-takeover-live-e2e.test.sh
+```
+
+Observed on Herdr 0.8.0:
+
+```text
+ok - herdr backend, herdr 0.8.0: a pane whose shell sits at its prompt is cleared
+ok - herdr backend, herdr 0.8.0: an ordinary foreground rc command is cleared, not refused as a takeover
+ok - herdr backend, herdr 0.8.0: a shell replaced by another program through exec is refused
+ok - herdr backend, herdr 0.8.0: a shell that works first and execs afterwards is still refused
+evidence: backend=herdr version=0.8.0 states_checked=4
+```
+
+The classifier itself is pinned portably with real processes and no Herdr installed, including the divergence between the two signals it reads:
+
+```sh
+tests/fm-backend-herdr.test.sh
+```
+
 ### Composer and operational input
 
 Real captures verified these active distinctions:

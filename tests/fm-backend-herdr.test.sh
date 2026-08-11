@@ -2318,60 +2318,172 @@ test_home_workspace_record_reader_and_writer_are_silent_on_unreadable_state() {
   [ -z "$(find "$dir/ro-state" -name '.herdr-home-workspace.tmp.*' 2>/dev/null)" ] \
     || fail "a refused container record write left a temp file behind"
   pass "home workspace record: an unreadable record and an unwritable state directory both stay silent"
+
+# The pane-foreground classifier decides from two independent signals: herdr's
+# process-info says who owns the pane's foreground, and the operating system's
+# own process table says whether that shell is executing anything. Herdr cannot
+# separate a shell waiting at its prompt from one still running its rc - both
+# report the shell as the sole foreground process under its own pid - so the
+# process state is what keeps a working rc from being read as a settled pane.
+#
+# This preamble pins the classifier with REAL processes and no herdr at all, so
+# CI enforces it anywhere it runs. It drives the two signals apart deliberately
+# (a genuinely sleeping process and a genuinely spinning one) and asserts that
+# divergence before any case runs, so no case can pass vacuously on a fixture
+# that quietly stopped diverging.
+#
+# A case body gets:
+#   RESTING  pid of a real sleeping process, standing in for a settled shell
+#   BUSY     pid of a real process spinning in a shell loop, standing in for an
+#            rc still working
+#   OTHER    pid of a second real process, standing in for a foreground child
+#   BUDGET   the settle poll budget, so a verdict that was never proved and
+#            fell open is told apart from one decided on evidence
+#   pi <name> <argv0> <shell-pid> [pane]      the shell's own pid runs <name>
+#   child_pi <name> <argv0> <shell-pid> <child-pid>   an ordinary foreground child
+#   check <label> <expected-rc> <expected-samples> <response> [cli-rc]
+#   check_seq <label> <expected-rc> <expected-samples> <flip-after> <early> <late>
+TAKEOVER_MATRIX_PREAMBLE=$(cat <<'PREAMBLE'
+. "$0/bin/backends/herdr.sh"
+RESPDIR="$1/takeover-responses"
+rm -rf "$RESPDIR"; mkdir -p "$RESPDIR"
+COUNTER="$RESPDIR/.calls"
+# Detached from this shell's stdout, which a case body's own command
+# substitution would otherwise wait on until every standin process exited.
+sleep 30 >/dev/null 2>&1 & RESTING=$!
+sleep 30 >/dev/null 2>&1 & OTHER=$!
+bash -c 'e=$((SECONDS+120)); while [ $SECONDS -lt $e ]; do :; done' >/dev/null 2>&1 & BUSY=$!
+trap 'kill "$RESTING" "$OTHER" "$BUSY" 2>/dev/null' EXIT
+BUDGET=6
+FM_BACKEND_HERDR_PANE_SETTLE_POLLS=$BUDGET
+proc_state() { ps -p "$1" -o stat= 2>/dev/null | tr -d "[:space:]"; }
+wait_for_running() {
+  local i=0
+  while [ "$i" -lt 50 ]; do
+    case "$(proc_state "$1")" in R*) return 0 ;; esac
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+wait_for_running "$BUSY" || true
+case "$(proc_state "$RESTING")" in
+  S*|I*) ;;
+  *) printf "MISMATCH fixture: the resting process reads state '%s', not sleeping\n" "$(proc_state "$RESTING")" ;;
+esac
+case "$(proc_state "$BUSY")" in
+  R*) ;;
+  *) printf "MISMATCH fixture: the spinning process reads state '%s', not running\n" "$(proc_state "$BUSY")" ;;
+esac
+[ "$RESTING" != "$BUSY" ] && [ "$RESTING" != "$OTHER" ] \
+  || printf "MISMATCH fixture: the standin processes share a pid\n"
+fm_backend_herdr_cli() {
+  local n
+  n=$(( $(cat "$COUNTER" 2>/dev/null || echo 0) + 1 ))
+  printf "%s" "$n" > "$COUNTER"
+  if [ -f "$RESPDIR/$n.out" ]; then cat "$RESPDIR/$n.out"; else cat "$RESPDIR/default.out" 2>/dev/null; fi
+  return "$(cat "$RESPDIR/rc" 2>/dev/null || echo 0)"
+}
+pi() {  # <name> <argv0> <shell-pid> [pane]
+  printf "{\"result\":{\"type\":\"pane_process_info\",\"process_info\":{\"pane_id\":\"%s\",\"shell_pid\":%s,\"foreground_process_group_id\":%s,\"foreground_processes\":[{\"pid\":%s,\"name\":\"%s\",\"argv0\":\"%s\"}]}}}" \
+    "${4:-w1:p1}" "$3" "$3" "$3" "$1" "$2"
+}
+child_pi() {  # <name> <argv0> <shell-pid> <child-pid>
+  printf "{\"result\":{\"type\":\"pane_process_info\",\"process_info\":{\"pane_id\":\"w1:p1\",\"shell_pid\":%s,\"foreground_process_group_id\":%s,\"foreground_processes\":[{\"pid\":%s,\"name\":\"%s\",\"argv0\":\"%s\"}]}}}" \
+    "$3" "$4" "$4" "$1" "$2"
+}
+reset_responses() { rm -f "$RESPDIR"/*.out "$RESPDIR"/rc; printf 0 > "$COUNTER"; }
+run_check() {  # <label> <expected-rc> <expected-samples>
+  local rc=0 samples
+  fm_backend_herdr_pane_foreground_takeover fmtest w1:p1 || rc=$?
+  samples=$(cat "$COUNTER")
+  [ "$rc" = "$2" ] || printf "MISMATCH %s: rc=%s expected=%s\n" "$1" "$rc" "$2"
+  [ "$samples" = "$3" ] || printf "MISMATCH %s: took %s samples, expected %s\n" "$1" "$samples" "$3"
+}
+check() {  # <label> <expected-rc> <expected-samples> <response> [cli-rc]
+  reset_responses
+  printf "%s" "$4" > "$RESPDIR/default.out"
+  printf "%s" "${5:-0}" > "$RESPDIR/rc"
+  run_check "$1" "$2" "$3"
+}
+check_seq() {  # <label> <expected-rc> <expected-samples> <flip-after> <early> <late>
+  local i=1
+  reset_responses
+  while [ "$i" -le "$4" ]; do printf "%s" "$5" > "$RESPDIR/$i.out"; i=$((i + 1)); done
+  printf "%s" "$6" > "$RESPDIR/default.out"
+  run_check "$1" "$2" "$3"
+}
+PREAMBLE
+)
+
+takeover_matrix_harness() {  # <case-body>
+  bash -c "$TAKEOVER_MATRIX_PREAMBLE
+$1" "$ROOT" "$TMP_ROOT" 2>&1
 }
 
 test_pane_foreground_takeover_only_on_positive_evidence() {
   local out
-  out=$(bash -c '
-    . "$0/bin/backends/herdr.sh"
-    # One canned process-info response per call; two calls per check because
-    # the takeover verdict requires two agreeing samples. The counter lives in
-    # a FILE, not a variable: each sample runs inside a command substitution,
-    # so a variable increment would never survive back to this shell and every
-    # call would replay the first response.
-    counter="$1/takeover-calls"
-    fm_backend_herdr_cli() {
-      local n
-      n=$(( $(cat "$counter" 2>/dev/null || echo 0) + 1 ))
-      printf "%s" "$n" > "$counter"
-      if [ "$n" = 1 ]; then printf "%s\n" "$FM_FAKE_PI_1"; return "${FM_FAKE_PI_1_RC:-0}"; fi
-      printf "%s\n" "$FM_FAKE_PI_2"; return "${FM_FAKE_PI_2_RC:-0}"
-    }
-    pi() {  # <pane> <name> <argv0>
-      printf "{\"result\":{\"type\":\"pane_process_info\",\"process_info\":{\"pane_id\":\"%s\",\"foreground_processes\":[{\"pid\":9,\"name\":\"%s\",\"argv0\":\"%s\"}]}}}" "$1" "$2" "$3"
-    }
-    check() {  # <label> <resp1> <resp2> <expected-rc> [rc1] [rc2]
-      printf 0 > "$counter"
-      FM_FAKE_PI_1=$2 FM_FAKE_PI_2=$3 FM_FAKE_PI_1_RC=${5:-0} FM_FAKE_PI_2_RC=${6:-0}
-      rc=0
-      fm_backend_herdr_pane_foreground_takeover fmtest w1:p1 || rc=$?
-      [ "$rc" = "$4" ] || printf "MISMATCH %s: rc=%s expected=%s\n" "$1" "$rc" "$4"
-      [ "$(cat "$counter")" -ge 2 ] || [ "$4" = 1 ] \
-        || printf "MISMATCH %s: verdict used only one sample\n" "$1"
-    }
-    # Positive evidence: a non-shell owns the pane in both samples (#1912).
-    check exec-tmux "$(pi w1:p1 tmux tmux)" "$(pi w1:p1 tmux tmux)" 0
+  # shellcheck disable=SC2016  # the case body is shell source the harness expands, not this shell
+  out=$(takeover_matrix_harness '
+    # Positive evidence: another program runs under the shell own pid (#1912).
+    check exec-tmux 0 2 "$(pi tmux tmux "$RESTING")"
     [ "$FM_BACKEND_HERDR_TAKEOVER_PROCESS" = tmux ] \
       || printf "MISMATCH takeover-name: %s\n" "$FM_BACKEND_HERDR_TAKEOVER_PROCESS"
-    # Ordinary shells never read as a takeover, including a login shell whose
-    # argv0 is spelled "-zsh" and an absolute-path name.
-    check plain-zsh "$(pi w1:p1 zsh zsh)" "$(pi w1:p1 zsh zsh)" 1
-    check login-zsh "$(pi w1:p1 zsh -zsh)" "$(pi w1:p1 zsh -zsh)" 1
-    check abs-path-bash "$(pi w1:p1 /bin/bash /bin/bash)" "$(pi w1:p1 /bin/bash /bin/bash)" 1
-    # A transient rc-startup command must not be mistaken for a permanent exec.
-    check transient "$(pi w1:p1 direnv direnv)" "$(pi w1:p1 zsh zsh)" 1
+    # A resting shell clears the pane on its own proof, including a login shell
+    # whose argv0 is spelled "-zsh" and an absolute-path name.
+    check plain-zsh 1 2 "$(pi zsh zsh "$RESTING")"
+    check login-zsh 1 2 "$(pi zsh -zsh "$RESTING")"
+    check abs-path-bash 1 2 "$(pi /bin/bash /bin/bash "$RESTING")"
+    # An ordinary foreground rc command (nvm use, a keychain lookup, a sleep)
+    # is a child in its OWN process group and is never evidence of a takeover.
+    # Reading it as one is what refused legitimate spawns outright, so this
+    # must run the settle window out and still clear the pane.
+    check foreground-child 1 "$BUDGET" "$(child_pi sleep sleep "$RESTING" "$OTHER")"
     # Everything unreadable or ambiguous proceeds: a missing read must never
-    # invent a blocker (the regression that refused legitimate spawns).
-    check unreadable "" "" 1 1 1
-    check garbage "not json" "not json" 1
-    check wrong-pane "$(pi w9:p9 tmux tmux)" "$(pi w9:p9 tmux tmux)" 1
-    check no-process-info "{\"result\":{\"type\":\"other\"}}" "{\"result\":{\"type\":\"other\"}}" 1
-    check two-foreground \
-      "{\"result\":{\"type\":\"pane_process_info\",\"process_info\":{\"pane_id\":\"w1:p1\",\"foreground_processes\":[{\"pid\":9,\"name\":\"tmux\"},{\"pid\":10,\"name\":\"zsh\"}]}}}" \
-      "{\"result\":{\"type\":\"pane_process_info\",\"process_info\":{\"pane_id\":\"w1:p1\",\"foreground_processes\":[{\"pid\":9,\"name\":\"tmux\"},{\"pid\":10,\"name\":\"zsh\"}]}}}" 1
-  ' "$ROOT" "$TMP_ROOT" 2>&1)
+    # invent a blocker.
+    check unreadable 1 "$BUDGET" "" 1
+    check garbage 1 "$BUDGET" "not json"
+    check wrong-pane 1 "$BUDGET" "$(pi tmux tmux "$RESTING" w9:p9)"
+    check no-process-info 1 "$BUDGET" "{\"result\":{\"type\":\"other\"}}"
+    check two-foreground 1 "$BUDGET" \
+      "{\"result\":{\"type\":\"pane_process_info\",\"process_info\":{\"pane_id\":\"w1:p1\",\"shell_pid\":$RESTING,\"foreground_process_group_id\":$RESTING,\"foreground_processes\":[{\"pid\":$RESTING,\"name\":\"tmux\"},{\"pid\":$OTHER,\"name\":\"zsh\"}]}}}"
+    # A takeover verdict reads herdr process data only, so it survives losing
+    # the process-table signal entirely; the resting verdict is the one that
+    # depends on it, and without it the pane is never cleared early.
+    FM_HERDR_PS_BIN="$1/no-such-ps" check exec-tmux-without-ps 0 2 "$(pi tmux tmux "$RESTING")"
+    FM_HERDR_PS_BIN="$1/no-such-ps" check plain-zsh-without-ps 1 "$BUDGET" "$(pi zsh zsh "$RESTING")"
+  ')
   [ -z "$out" ] || fail "pane foreground takeover matrix mismatch: $out"
-  pass "pane foreground takeover: refuses only on two agreeing non-shell samples, never on an unreadable or ambiguous read"
+  pass "pane foreground takeover: refuses only when another program holds the shell's own pid, never on a foreground child or an unreadable read"
+}
+
+test_pane_foreground_takeover_settles_before_it_clears_a_pane() {
+  local out
+  # shellcheck disable=SC2016  # the case body is shell source the harness expands, not this shell
+  out=$(takeover_matrix_harness '
+    # A shell still running its rc is indistinguishable from a settled one in
+    # herdr process data, so the pane is cleared only once the operating system
+    # agrees the shell has stopped executing. A working shell must therefore
+    # never clear the pane, however long it holds it.
+    check busy-rc-never-clears 1 "$BUDGET" "$(pi zsh zsh "$BUSY")"
+    # ... while a settled shell clears it immediately, on the same process-info.
+    # The two differ only in the process-state signal, so the sample counts
+    # below are what prove that signal is load-bearing rather than decorative.
+    check settled-shell-clears 1 2 "$(pi zsh zsh "$RESTING")"
+    # The #1912 case this gate exists for: an rc that does pure-shell work and
+    # only then execs. Both of the first two samples read as an ordinary shell,
+    # which is exactly where a two-quick-samples verdict cleared the pane and
+    # typed the launch command into whatever the rc went on to exec. The
+    # substitution is still caught, several samples after that window closed.
+    check_seq busy-rc-then-exec 0 5 3 "$(pi zsh zsh "$BUSY")" "$(pi tail tail "$BUSY")"
+    [ "$FM_BACKEND_HERDR_TAKEOVER_PROCESS" = tail ] \
+      || printf "MISMATCH late-takeover-name: %s\n" "$FM_BACKEND_HERDR_TAKEOVER_PROCESS"
+    # An rc whose ordinary foreground command outlives the early samples and
+    # then hands the pane back is cleared, not refused.
+    check_seq busy-child-then-settles 1 5 3 "$(child_pi sleep sleep "$RESTING" "$OTHER")" "$(pi zsh zsh "$RESTING")"
+  ')
+  [ -z "$out" ] || fail "pane foreground settle mismatch: $out"
+  pass "pane foreground takeover: settles the pane before clearing it, so an rc that execs after its early samples is still caught"
 }
 
 test_projection_seeded_prune_refuses_active_tab() {
@@ -4483,6 +4595,7 @@ test_kill_emptying_non_focused_uses_pane_death
 test_kill_focused_workspace_stays_plain_close
 test_endpoint_confirmed_gone_gates_on_structured_presence
 test_pane_foreground_takeover_only_on_positive_evidence
+test_pane_foreground_takeover_settles_before_it_clears_a_pane
 test_home_workspace_record_disambiguates_a_label_collision
 test_home_workspace_record_never_captures_a_foreign_workspace
 test_home_workspace_record_two_match_stale_residual_is_pinned
