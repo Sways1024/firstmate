@@ -225,12 +225,14 @@ unit_failed_start_rolls_back_state() {
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-failed-start.XXXXXX")
   mkdir -p "$st/state"
   printf 'pending\n' > "$st/state/.subsuper-escalations"
+  printf 'armed\n' > "$st/state/.subsuper-last-unconfirmed-inject"
   printf 'wedged\n' > "$st/state/.subsuper-inject-wedged"
   if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" FM_SUPERVISOR_TARGET=unused \
     FM_SUPERVISOR_BACKEND=unsupported "$LAUNCH" start >/dev/null 2>&1; then
     fail "failed start: unsupported backend unexpectedly succeeded"
   elif [ ! -e "$st/state/.afk" ] \
     && [ "$(cat "$st/state/.subsuper-escalations")" = pending ] \
+    && [ "$(cat "$st/state/.subsuper-last-unconfirmed-inject" 2>/dev/null)" = armed ] \
     && [ "$(cat "$st/state/.subsuper-inject-wedged")" = wedged ]; then
     pass "failed start: away flag and delivery artifacts roll back"
   else
