@@ -199,17 +199,28 @@ HOUSEKEEPING_TICK_DEFAULT=15
 # alarm. The escape hatch makes a guard false-positive visible instead of silent.
 MAX_DEFER_SECS_DEFAULT=300
 # How long the duplicate-digest marker at inject_msg (c) may still vouch that an
-# unconfirmed submit landed. The window only ever needs to cover the daemon's own
-# retry of the SAME buffered digest after a submit returned `unknown`: that retry
-# arrives on the order of INJECT_FAIL_SLEEP_DEFAULT and ESCALATE_BATCH_SECS_DEFAULT,
-# with housekeeping polling every HOUSEKEEPING_TICK_DEFAULT. It is deliberately tied
-# to MAX_DEFER_SECS_DEFAULT, the daemon's own declared bound on how long an
-# escalation may sit undelivered before the max-defer path calls the situation
-# abnormal - past that point the dedup must not still be silently vouching for a
-# delivery nothing ever confirmed. That matters because an `unknown` composer read
-# defers without revoking the marker, so an unreadable stretch longer than this
-# bound now leaves the marker stale and the digest is retyped rather than dropped.
-INJECT_DEDUP_SECS_DEFAULT=$MAX_DEFER_SECS_DEFAULT
+# unconfirmed submit landed. This window must outlast a supervisor TURN, not just
+# a poll: in the case the guard exists for the earlier Enter did land, so the
+# agent is mid-turn and every following poll returns at the busy guard, which
+# sits ABOVE both the revocation and the dedup. The duplicate therefore only
+# arrives at the next composer-empty poll, once that turn ends. The measured
+# incident that motivated the guard was 59 repeats over 16h, roughly one every
+# 976s, so a window near MAX_DEFER_SECS_DEFAULT would expire before the
+# duplicate it is meant to suppress ever arrived and would cost the guard its
+# purpose. Unreadable-composer survival is bounded by the consecutive-observation
+# count below instead, which is the condition that actually needs bounding.
+INJECT_DEDUP_SECS_DEFAULT=3600
+# How many CONSECUTIVE unreadable composer observations the marker may survive
+# before it is expired. An `unknown` composer defers without revoking, so without
+# this an unreadable pane could let a stale marker vouch for a delivery nothing
+# confirmed until the window above ran out. A busy pane is NOT one of these
+# observations - the busy guard returns before the composer is ever read - so a
+# long legitimate turn never spends this budget and only genuinely unreadable
+# reads do. Three tolerates a transient capture failure or a brief dead-shell
+# moment while keeping a persistent unreadable condition strictly bounded: the
+# third consecutive unreadable read expires the marker, so the digest is retyped
+# rather than treated as delivered.
+INJECT_DEDUP_UNREADABLE_MAX_DEFAULT=3
 WEDGE_ALARM_TIMEOUT_SECS_DEFAULT=10
 WEDGE_ALARM_LAST_EPOCH=0
 WEDGE_ALARM_NOTIFIER_PID=
@@ -1161,24 +1172,44 @@ inject_msg() {  # <message> [state]
   #      stays buffered for the next cycle or the catch-up flush.
   #      A composer holding unsent text ('pending', or 'pending-unproven' when
   #      the classifier could not prove the box geometry) also REVOKES the
-  #      duplicate-digest marker before this guard returns, so the marker is
-  #      resolved here rather than at (c); (c) owns that contract.
-  local dedup_marker last_hash last_ts last_target msg_hash
+  #      duplicate-digest marker before this guard returns, and an UNREADABLE
+  #      composer counts against the marker's consecutive-unreadable budget, so
+  #      the marker is resolved here rather than at (c); (c) owns that contract.
+  local dedup_marker last_hash last_ts last_unreadable last_target msg_hash
+  local unreadable_max
   dedup_marker="$state/.subsuper-last-unconfirmed-inject"
   msg_hash=$(_hash_text "$msg")
+  unreadable_max=${FM_INJECT_DEDUP_UNREADABLE_MAX:-$INJECT_DEDUP_UNREADABLE_MAX_DEFAULT}
   composer=$(fm_backend_composer_state "$backend" "$target" 2>/dev/null)
   if [ "$composer" != empty ]; then
-    case "$composer" in
-      pending|pending-unproven)
-        if [ -f "$dedup_marker" ]; then
-          read -r last_hash last_ts last_target < "$dedup_marker" 2>/dev/null || last_hash=
-          if [ "$last_hash" = "$msg_hash" ]; then
+    if [ -f "$dedup_marker" ]; then
+      read -r last_hash last_ts last_unreadable last_target < "$dedup_marker" 2>/dev/null \
+        || { last_hash=; last_ts=; last_unreadable=; last_target=; }
+      if [ "$last_hash" = "$msg_hash" ]; then
+        case "$composer" in
+          pending|pending-unproven)
             rm -f "$dedup_marker"
             log "inject dedup marker revoked: the supervisor composer holds unsent text while this exact digest is the one still awaiting confirmation, so the earlier submit cannot be treated as delivered"
-          fi
-        fi
-        ;;
-    esac
+            ;;
+          *)
+            # Unreadable (or an unrecognized verdict): this poll proves nothing
+            # either way, so spend one unit of the marker's budget rather than
+            # letting it vouch through an indefinite unreadable stretch.
+            case $last_unreadable in
+              ''|*[!0-9]*) last_unreadable=0 ;;
+            esac
+            last_unreadable=$((last_unreadable + 1))
+            if [ "$last_unreadable" -ge "$unreadable_max" ]; then
+              rm -f "$dedup_marker"
+              log "inject dedup marker expired: $last_unreadable consecutive unreadable composer observations, so this digest is no longer treated as possibly delivered and will be retyped"
+            else
+              printf '%s %s %s %s\n' "$last_hash" "$last_ts" "$last_unreadable" "$last_target" \
+                > "$dedup_marker" 2>/dev/null || true
+            fi
+            ;;
+        esac
+      fi
+    fi
     log "inject deferred: supervisor composer not confirmed-empty (state=${composer:-unknown}: pending input, dead-shell prompt, or unreadable pane)"
     return 1
   fi
@@ -1187,15 +1218,16 @@ inject_msg() {  # <message> [state]
   #      the buffer preserved, and the next flush retyped the identical digest
   #      as a duplicate turn - the measured 16h incident was 59 repeat
   #      deliveries of unchanged payloads. The marker records the digest hash,
-  #      the arming time, and the supervisor target it was typed into; the dedup
-  #      fires only when all three still hold, because a false positive DESTROYS
-  #      the escalation rather than retrying it (escalate_flush truncates the
-  #      buffer on success). So: the exact digest we last typed with an
-  #      unconfirmed submit, reaching an EMPTY composer on the SAME target,
-  #      within the dedup window, had its earlier Enter accepted - treat it as
-  #      delivered. Two observations instead defeat that inference and revoke
-  #      the marker so the digest is retyped (a possible duplicate, never a
-  #      silent loss). First, a composer holding unsent text - 'pending', or
+  #      the arming time, a consecutive-unreadable count, and the supervisor
+  #      target it was typed into; the dedup fires only when hash, target, and
+  #      window all still hold, because a false positive DESTROYS the escalation
+  #      rather than retrying it (escalate_flush truncates the buffer on
+  #      success). So: the exact digest we last typed with an unconfirmed
+  #      submit, reaching an EMPTY composer on the SAME target, within the dedup
+  #      window, had its earlier Enter accepted - treat it as delivered.
+  #      Three observations instead defeat that inference and drop the marker so
+  #      the digest is retyped (a possible duplicate, never a silent loss).
+  #      First, a composer holding unsent text - 'pending', or
   #      'pending-unproven' when the classifier read real text but could not
   #      prove the box geometry, both of which are positive evidence of
   #      unsubmitted input - while this exact digest is the one still awaiting
@@ -1210,7 +1242,8 @@ inject_msg() {  # <message> [state]
   #      older daemon) cannot prove either, so it never dedups.
   #      A different digest always passes; a confirmed submit clears the marker.
   if [ -f "$dedup_marker" ]; then
-    read -r last_hash last_ts last_target < "$dedup_marker" 2>/dev/null || { last_hash=; last_ts=; last_target=; }
+    read -r last_hash last_ts last_unreadable last_target < "$dedup_marker" 2>/dev/null \
+      || { last_hash=; last_ts=; last_unreadable=; last_target=; }
     if [ "$last_hash" = "$msg_hash" ] \
        && [ -n "$last_ts" ] \
        && [ -n "$last_target" ] && [ "$last_target" = "$target" ] \
@@ -1238,8 +1271,9 @@ inject_msg() {  # <message> [state]
     # Typed once, Enter retried, confirmation unreadable: arm the
     # duplicate-digest guard above so a retype of THIS exact digest into a
     # later empty composer ON THIS SAME TARGET is recognized as already
-    # delivered. The target is recorded last so it may contain spaces.
-    printf '%s %s %s\n' "$msg_hash" "$(_now)" "$target" > "$dedup_marker" 2>/dev/null || true
+    # delivered. The consecutive-unreadable count starts at zero; the target is
+    # recorded last so it may contain spaces.
+    printf '%s %s %s %s\n' "$msg_hash" "$(_now)" 0 "$target" > "$dedup_marker" 2>/dev/null || true
   fi
   log "inject failed: submit unconfirmed after $retries retries (verdict=$verdict, text may be in composer)"
   return 1
