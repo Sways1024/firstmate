@@ -81,15 +81,20 @@
 #   creation through metadata publication, so concurrent same-id spawns serialize
 #   even when they select different backends.
 #   With no harness arg, a crewmate/scout spawn resolves the CREW harness only when
-#   config/crew-dispatch.json is absent. When that file exists, crewmate/scout
-#   spawns require an explicit harness so firstmate cannot silently skip dispatch
-#   profile consultation. A --secondmate spawn is exempt and resolves the SECONDMATE
+#   config/crew-dispatch.json is absent. When that file exists, a NEW crewmate/scout
+#   spawn requires an explicit harness so firstmate cannot silently skip dispatch
+#   profile consultation; a RESPAWN keeps the task's own recorded profile instead and
+#   prints a one-line stderr notice naming the rules it did not consult, so that skip
+#   is not silent either. A --secondmate spawn is exempt and resolves the SECONDMATE
 #   harness (config/secondmate-harness -> config/crew-harness -> own), so the
 #   secondmate-vs-crewmate split is DURABLE across every respawn (recovery,
 #   /updatefirstmate, restart). A bare adapter name (claude|codex|opencode|pi|pi-signed|grok|kimi|muse)
 #   overrides it for this spawn (either kind). A non-flag string containing
 #   whitespace is treated as a RAW launch command - the escape hatch for verifying
-#   new adapters. pi-signed launches that exact executable name from PATH and
+#   new adapters. Only its harness basename is recorded, so a bare RESPAWN never
+#   reproduces a raw command: it relaunches from that harness's template, or from
+#   config when the basename has no template. Pass the raw command again to keep it.
+#   pi-signed launches that exact executable name from PATH and
 #   refuses before endpoint creation when it is unavailable; it never falls back to pi.
 #   config/secondmate-harness may also carry an optional model and effort as extra
 #   whitespace-separated tokens ("<harness> [<model>] [<effort>]"). For a
@@ -965,6 +970,17 @@ case "$ARG3" in
       # still govern genuinely new tasks (no meta yet); secondmates above
       # deliberately keep re-resolving from config so a changed pin takes
       # effect across restarts. An explicit --model/--effort still wins.
+      # This branch therefore skips the dispatch rules that the backstop below
+      # refuses a bare NEW spawn over, so it announces that skip on stderr
+      # whenever a profile file is active: the backstop's guarantee is that the
+      # rules are never skipped SILENTLY, not that they are never skipped.
+      # Meta records a harness basename and nothing about how the launch was
+      # spelled, so a task started from a raw command whose first word IS a
+      # verified harness (`claude --mcp-config ...` records harness=claude)
+      # respawns on that harness's template. Skipping this branch would not
+      # recover the command either - the config path below builds the same
+      # template - so preserving a raw launch needs a recorded launch, and meta
+      # has no field for one.
       HARNESS=$RESPAWN_HARNESS
       harness_src="the task's recorded metadata (respawn)"
       if [ "${MODEL_SET:-0}" -eq 0 ]; then
@@ -974,6 +990,9 @@ case "$ARG3" in
       if [ "${EFFORT_SET:-0}" -eq 0 ]; then
         RESPAWN_EFFORT=$(fm_meta_get "$STATE/$ID.meta" effort)
         [ -z "$RESPAWN_EFFORT" ] || [ "$RESPAWN_EFFORT" = default ] || EFFORT=$RESPAWN_EFFORT
+      fi
+      if [ -f "$CONFIG/crew-dispatch.json" ]; then
+        echo "notice: respawning $ID on its recorded profile (harness=$HARNESS model=${MODEL:-default} effort=${EFFORT:-default}); config/crew-dispatch.json rules were not consulted for this respawn." >&2
       fi
     else
       if [ -f "$CONFIG/crew-dispatch.json" ]; then

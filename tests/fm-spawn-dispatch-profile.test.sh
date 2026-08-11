@@ -691,12 +691,79 @@ test_respawn_defaults_from_recorded_meta() {
   status=$?
   expect_code 0 "$status" "bare respawn should succeed"
   assert_meta_profile "$meta" claude claude-opus-5 high
+  assert_not_contains "$out" "crew-dispatch" \
+    "a respawn with no dispatch-profile file active should say nothing about the rules"
   # An explicit per-respawn override still wins over the recorded profile.
   out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --effort low)
   status=$?
   expect_code 0 "$status" "override respawn should succeed"
   assert_meta_profile "$meta" claude claude-opus-5 low
   pass "a respawn keeps the task's recorded harness/model/effort; explicit flags still win"
+}
+
+test_respawn_announces_the_dispatch_rules_it_skipped() {
+  local rec id newid out status meta
+  id=respawn-notice-z17
+  newid=respawn-notice-new-z18
+  rec=$(make_spawn_case respawn-notice claude "$id" "$newid")
+  read_case_record "$rec"
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+    "$id" "$PROJ_DIR" --model claude-opus-5 --effort high)
+  status=$?
+  expect_code 0 "$status" "initial spawn before any dispatch profile should succeed"
+  meta="$HOME_DIR/state/$id.meta"
+  assert_meta_profile "$meta" claude claude-opus-5 high
+
+  # The captain installs dispatch profiles AFTER this task launched. A bare
+  # respawn still adopts the recorded profile, but it must say that it did so
+  # without consulting the rules: the backstop's guarantee is that the rules are
+  # never skipped silently, not that they are never skipped.
+  enable_dispatch_profile "$HOME_DIR"
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR")
+  status=$?
+  expect_code 0 "$status" "bare respawn should still succeed once dispatch profiles are active"
+  assert_contains "$out" "config/crew-dispatch.json rules were not consulted for this respawn" \
+    "respawn silently skipped the crew-dispatch consultation backstop"
+  assert_contains "$out" "harness=claude model=claude-opus-5 effort=high" \
+    "respawn notice did not name the recorded profile it launched on"
+  assert_meta_profile "$meta" claude claude-opus-5 high
+
+  # The notice is respawn-specific: a genuinely new task in the same home is
+  # still refused outright rather than downgraded to a notice.
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$newid" "$PROJ_DIR")
+  status=$?
+  expect_code 1 "$status" "a new bare spawn should still be refused while dispatch profiles are active"
+  assert_contains "$out" "config/crew-dispatch.json is active - pass an explicit harness resolved from the dispatch rules" \
+    "new-task refusal no longer explains the dispatch-profile backstop"
+  assert_absent "$HOME_DIR/state/$newid.meta" "new-task refusal should happen before meta is written"
+  pass "a respawn adopting its recorded profile reports the dispatch rules it did not consult"
+}
+
+test_respawn_of_a_raw_launch_command_uses_the_recorded_harness_template() {
+  local rec id out status launch
+  id=respawn-raw-z19
+  rec=$(make_spawn_case respawn-raw claude "$id")
+  read_case_record "$rec"
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+    "$id" "$PROJ_DIR" "claude --mcp-config /custom/mcp.json")
+  status=$?
+  expect_code 0 "$status" "a raw launch command wrapping a verified harness should spawn"
+  launch=$(cat "$LAUNCH_LOG")
+  assert_contains "$launch" "claude --mcp-config /custom/mcp.json" "the first spawn did not use the raw command"
+  assert_grep "harness=claude" "$HOME_DIR/state/$id.meta" "a raw claude command should record its basename"
+
+  # Known limitation, pinned so a future fix has to change it deliberately: meta
+  # records only the basename, so a bare respawn cannot tell this task from one
+  # launched with --harness claude and relaunches on the canonical template.
+  # Falling through to config instead would lose the raw command the same way.
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR")
+  status=$?
+  expect_code 0 "$status" "a bare respawn of a raw-launch task should succeed"
+  launch=$(cat "$LAUNCH_LOG")
+  assert_not_contains "$launch" "--mcp-config" "the respawn unexpectedly reproduced the raw launch command"
+  assert_contains "$launch" "claude --dangerously-skip-permissions" \
+    "the respawn did not relaunch on the recorded harness's canonical template"
+  pass "a bare respawn of a raw launch command relaunches on the recorded harness's template"
 }
 
 test_no_profile_keeps_claude_profile_defaults
@@ -726,5 +793,7 @@ test_claude_omits_config_dir_prefix_when_unset
 test_non_claude_harness_ignores_config_dir
 test_active_dispatch_profile_does_not_block_secondmate_launch
 test_respawn_defaults_from_recorded_meta
+test_respawn_announces_the_dispatch_rules_it_skipped
+test_respawn_of_a_raw_launch_command_uses_the_recorded_harness_template
 
 echo "# all fm-spawn-dispatch-profile tests passed"
