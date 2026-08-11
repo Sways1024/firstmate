@@ -29,7 +29,17 @@ one case; likely Node 26 vs upstream's runtime — irrelevant unless Pi becomes
 a crew harness. (The presentation e2e's abort-cleanup and journal-retirement
 failures previously listed here are fixed by `fix/herdr-followups`.)
 
-Load-sensitive under a full parallel `--changed` run, all three pass solo on an
+Environment-bound rather than load-sensitive: `tests/fm-afk-inject-e2e.test.sh`
+and `tests/fm-afk-inject-herdr-e2e.test.sh` both fail with
+`nohup: can't detach from console: Inappropriate ioctl for device` whenever the
+suite runs from a shell with no controlling terminal, which is the normal case
+for a crewmate agent pane.
+Rerunning them alone does not clear them, because load is not the cause.
+`nohup true` reproduces it directly in such a shell, and the tmux one never
+loads the herdr adapter at all, so a herdr change is never the explanation.
+Verify these two from an interactive terminal.
+
+Load-sensitive under a full parallel `--changed` run, all four pass solo on an
 idle machine — rerun individually before investigating:
 `tests/fm-vendor-auth-probe.test.sh` (wall-clock bound assertions; measured
 312s against a 20s bound while the suite saturated the machine),
