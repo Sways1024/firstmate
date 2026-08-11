@@ -33,12 +33,21 @@ Load-sensitive under a full parallel `--changed` run, all three pass solo on an
 idle machine — rerun individually before investigating:
 `tests/fm-vendor-auth-probe.test.sh` (wall-clock bound assertions; measured
 312s against a 20s bound while the suite saturated the machine),
-`tests/fm-watcher-lock.test.sh` (exit 124), and
-`tests/fm-backend-herdr-presentation-e2e.test.sh` (real-herdr lab timing).
+`tests/fm-watcher-lock.test.sh` (exit 124 - also fails when run immediately
+after a real-herdr e2e, so let the machine settle),
+`tests/fm-startup-network.test.sh` ("the worker never published" against a 30s
+wait bound), and `tests/fm-backend-herdr-presentation-e2e.test.sh` (real-herdr
+lab timing).
 
-Last full verification: 2026-08-10 on herdr 0.8.0 / protocol 19 —
-111 test files, 1,905 assertions green; the only failures were the
-pre-existing Pi case and the two load artifacts above.
+Last full verification: 2026-08-11 on herdr 0.8.0 / protocol 19 —
+111 test files, 1,900 assertions green. Four failures, all resolved: the
+launcher-workspace e2e encoded the pre-record duplicate-label refusal and was
+updated to the new contract (passes solo, 13 assertions); the startup-network
+and watcher-lock suites are load artifacts that pass solo; the Pi case is
+pre-existing. Plus a live end-to-end shakedown on the real default herdr
+session: spawn, trust dialogs, a real Claude crewmate committing work,
+crew-state, guarded local merge, teardown through the real landed-work gate,
+and complete cleanup with the captain's own workspace and focus untouched.
 
 ## Standing captain rules (add to `data/captain.md` on first setup)
 
