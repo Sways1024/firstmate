@@ -1147,21 +1147,26 @@ inject_msg() {  # <message> [state]
   #      target - typing the escalation into a shell could execute it - so defer
   #      on anything that is not affirmatively 'empty'. A deferred escalation
   #      stays buffered for the next cycle or the catch-up flush.
-  #      A 'pending' composer also REVOKES the duplicate-digest marker before
-  #      this guard returns, so the marker is resolved here rather than at (c);
-  #      (c) owns that contract.
+  #      A composer holding unsent text ('pending', or 'pending-unproven' when
+  #      the classifier could not prove the box geometry) also REVOKES the
+  #      duplicate-digest marker before this guard returns, so the marker is
+  #      resolved here rather than at (c); (c) owns that contract.
   local dedup_marker last_hash last_ts last_target msg_hash
   dedup_marker="$state/.subsuper-last-unconfirmed-inject"
   msg_hash=$(_hash_text "$msg")
   composer=$(fm_backend_composer_state "$backend" "$target" 2>/dev/null)
   if [ "$composer" != empty ]; then
-    if [ "$composer" = pending ] && [ -f "$dedup_marker" ]; then
-      read -r last_hash last_ts last_target < "$dedup_marker" 2>/dev/null || last_hash=
-      if [ "$last_hash" = "$msg_hash" ]; then
-        rm -f "$dedup_marker"
-        log "inject dedup marker revoked: this exact digest is still sitting unsent in the supervisor composer, so the earlier submit was never accepted"
-      fi
-    fi
+    case "$composer" in
+      pending|pending-unproven)
+        if [ -f "$dedup_marker" ]; then
+          read -r last_hash last_ts last_target < "$dedup_marker" 2>/dev/null || last_hash=
+          if [ "$last_hash" = "$msg_hash" ]; then
+            rm -f "$dedup_marker"
+            log "inject dedup marker revoked: the supervisor composer holds unsent text while this exact digest is the one still awaiting confirmation, so the earlier submit cannot be treated as delivered"
+          fi
+        fi
+        ;;
+    esac
     log "inject deferred: supervisor composer not confirmed-empty (state=${composer:-unknown}: pending input, dead-shell prompt, or unreadable pane)"
     return 1
   fi
@@ -1176,14 +1181,21 @@ inject_msg() {  # <message> [state]
   #      buffer on success). So: the exact digest we last typed with an
   #      unconfirmed submit, reaching an EMPTY composer on the SAME target,
   #      within the dedup window, had its earlier Enter accepted - treat it as
-  #      delivered. Two observations instead prove NON-delivery and revoke the
-  #      marker so the digest is retyped (a possible duplicate, never a silent
-  #      loss): a 'pending' composer holding that same digest, which is our own
-  #      text still unsent (revoked at (b) above, which returns before this
-  #      block); and a DIFFERENT supervisor target, since a pane recreated or
-  #      re-discovered between polls was never typed into and reads empty only
-  #      because it is new. A marker with no recorded target (armed by an older
-  #      daemon) cannot prove either, so it never dedups.
+  #      delivered. Two observations instead defeat that inference and revoke
+  #      the marker so the digest is retyped (a possible duplicate, never a
+  #      silent loss). First, a composer holding unsent text - 'pending', or
+  #      'pending-unproven' when the classifier read real text but could not
+  #      prove the box geometry, both of which are positive evidence of
+  #      unsubmitted input - while this exact digest is the one still awaiting
+  #      confirmation. The classifier returns only a verdict and never the
+  #      composer's content, so this says text is sitting unsent and the earlier
+  #      submit cannot be treated as delivered, not that the unsent text IS this
+  #      digest; a human's half-typed line revokes the marker too, which is the
+  #      fail-safe direction. (Revoked at (b) above, which returns before this
+  #      block.) Second, a DIFFERENT supervisor target, since a pane recreated
+  #      or re-discovered between polls was never typed into and reads empty
+  #      only because it is new. A marker with no recorded target (armed by an
+  #      older daemon) cannot prove either, so it never dedups.
   #      A different digest always passes; a confirmed submit clears the marker.
   if [ -f "$dedup_marker" ]; then
     read -r last_hash last_ts last_target < "$dedup_marker" 2>/dev/null || { last_hash=; last_ts=; last_target=; }

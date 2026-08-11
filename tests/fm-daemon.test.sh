@@ -1994,6 +1994,51 @@ test_inject_msg_pending_composer_revokes_dedup_marker() {
   pass "inject_msg: a pending composer revokes the duplicate-digest marker, so a later empty composer retypes instead of dropping"
 }
 
+# The same revocation on the daemon's DEFAULT backend, reading a real composer
+# through the real tmux classifier rather than a stubbed verdict. An away-mode
+# digest always carries non-ASCII (the operational mark, the template's dash),
+# which leaves the composer box geometry unproven, so the classifier reports
+# 'pending-unproven' - still positive evidence of unsubmitted text, and still a
+# reason the earlier submit cannot be treated as delivered.
+test_inject_msg_unproven_pending_composer_revokes_dedup_marker() {
+  local dir state marker fakebin composer verdict digest
+  dir=$(make_bordered_case inject-dedup-unproven-revoke)
+  state="$dir/state"; fakebin="$dir/fakebin"; composer="$dir/composer"
+  marker="$state/.subsuper-last-unconfirmed-inject"
+  afk_enter "$state"
+  digest="away-supervisor: needs-decision - PR 4242 $(printf '⁣—')"
+  (
+    export PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$composer"
+    fm_backend_target_exists() { return 0; }
+    pane_is_busy() { return 1; }
+    fm_backend_send_text_submit() { printf 'unknown'; }
+    if FM_SUPERVISOR_BACKEND=tmux FM_SUPERVISOR_TARGET="fakepane" inject_msg "digest one" "$state"; then
+      fail "an unknown submit verdict must report undelivered"
+    fi
+    [ -f "$marker" ] || fail "an unknown submit verdict must arm the duplicate-digest marker"
+    # The swallowed digest is still sitting in the composer box.
+    printf '╭%s╮\n│ > %s │\n╰%s╯\n' \
+      "$(printf '─%.0s' $(seq 1 $(( ${#digest} + 4 ))))" "$digest" \
+      "$(printf '─%.0s' $(seq 1 $(( ${#digest} + 4 ))))" > "$composer"
+    verdict=$(fm_backend_composer_state tmux fakepane)
+    [ "$verdict" = pending-unproven ] \
+      || fail "expected the tmux classifier to report pending-unproven for a swallowed away-mode digest, got '$verdict'"
+    fm_backend_send_text_submit() { fail "send_text_submit must not run while the composer holds unsent text"; }
+    if FM_SUPERVISOR_BACKEND=tmux FM_SUPERVISOR_TARGET="fakepane" inject_msg "digest one" "$state"; then
+      fail "a composer holding unsent text must still defer"
+    fi
+    [ ! -f "$marker" ] \
+      || fail "a pending-unproven composer holds unsent text and must revoke the duplicate-digest marker"
+    printf '╭─────╮\n│ >   │\n╰─────╯\n' > "$composer"
+    fm_backend_send_text_submit() { printf 'typed\n' >> "$dir/typed"; printf 'empty'; }
+    FM_SUPERVISOR_BACKEND=tmux FM_SUPERVISOR_TARGET="fakepane" inject_msg "digest one" "$state" \
+      || fail "the retyped digest must report delivered once the submit confirms"
+    [ -s "$dir/typed" ] \
+      || fail "a digest observed as unsent under unproven geometry was declared delivered without ever being submitted"
+  ) || fail "unproven-pending-revoke inject_msg subshell failed"
+  pass "inject_msg: a pending-unproven composer on the tmux backend revokes the duplicate-digest marker, so the digest is retyped"
+}
+
 # The marker is bound to the supervisor target it was typed into. A supervisor
 # pane recreated and re-discovered between polls (daemon restart, backend server
 # restart, the captain closing and reopening it) reads empty because it is NEW.
@@ -2077,6 +2122,7 @@ test_inject_msg_herdr_busy_guard_defers
 test_inject_msg_herdr_composer_guard_defers
 test_inject_msg_dedups_identical_digest_after_unknown_submit
 test_inject_msg_pending_composer_revokes_dedup_marker
+test_inject_msg_unproven_pending_composer_revokes_dedup_marker
 test_inject_msg_dedup_marker_is_bound_to_its_supervisor_target
 test_escalate_flush_redelivers_an_escalation_proven_undelivered
 test_inject_msg_herdr_pane_gone_defers
