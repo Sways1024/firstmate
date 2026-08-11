@@ -2305,7 +2305,8 @@ test_workspace_mint_refuses_when_its_lock_is_unusable() {
   ns="$dir/namespace"
   # Mode 755 is one of the shapes the namespace validity check rejects, and it
   # is what any other local uid creating this shared path first would leave.
-  mkdir -m 755 "$ns"
+  # The explicit chmod keeps the case independent of the runner's umask.
+  mkdir "$ns" && chmod 755 "$ns"
   home="$dir/home"; mkdir -p "$home/state"
   : > "$dir/state"
   creates="$dir/creates"; : > "$creates"
