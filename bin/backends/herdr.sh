@@ -1269,6 +1269,7 @@ fm_backend_herdr_pane_foreground_takeover() {  # <session> <pane-id>
     attempt=$((attempt + 1))
     [ "$attempt" -ge 2 ] || sleep 0.3
   done
+  # shellcheck disable=SC2034  # caller consumes the observed takeover process name
   FM_BACKEND_HERDR_TAKEOVER_PROCESS=$observed
   return 0
 }
