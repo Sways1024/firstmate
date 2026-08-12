@@ -138,17 +138,19 @@ EOF
   : > "$TMUX_LOG"
 }
 
-# pool_json <path> <status> [holder]: one pool record in the shape
-# `treehouse status --json` emits, nested `processes` array included, so the
-# parser under test is fed the real record shape rather than a flattened one.
+# pool_json <path> <status> [holder]: a two-slot pool in the shape
+# `treehouse status --json` emits, nested `processes` arrays included, so the
+# spawn reads real record shapes rather than a flattened single record. Slot 2
+# is the free spare the pool would hand out on a fallback lease.
 pool_json() {
-  local path=$1 status=$2 holder=${3:-}
+  local path=$1 status=$2 holder=${3:-} first
   if [ -n "$holder" ]; then
-    printf '[{"name":"1","path":"%s","status":"%s","lease_id":"deadbeef","lease_holder":"%s","holder_gone":true,"processes":[{"pid":4321,"name":"zsh"}]}]\n' \
-      "$path" "$status" "$holder"
+    first=$(printf '{"name":"1","path":"%s","status":"%s","lease_id":"deadbeef","lease_holder":"%s","holder_gone":true,"processes":[{"pid":4321,"name":"zsh"}]}' \
+      "$path" "$status" "$holder")
   else
-    printf '[{"name":"1","path":"%s","status":"%s","processes":[]}]\n' "$path" "$status"
+    first=$(printf '{"name":"1","path":"%s","status":"%s","processes":[]}' "$path" "$status")
   fi
+  printf '[%s,{"name":"2","path":"%s","status":"free","processes":[]}]\n' "$first" "$SPARE_DIR"
 }
 
 # write_task_meta <id> <worktree>: the metadata a previous worker left behind,

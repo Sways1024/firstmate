@@ -532,6 +532,38 @@ test_meta_get_and_backend_of_meta() {
   pass "fm_meta_get / fm_backend_of_meta: read key=value, default backend to tmux"
 }
 
+# The treehouse pool-status parse behind fm_backend_treehouse_lease_holder, which
+# fm-spawn.sh's respawn worktree adoption reads to prove a recorded worktree is
+# still leased to its own task. It walks brace depth rather than shelling out to
+# jq, so the nested `processes` objects and both emitted spacings need pinning:
+# a silent parse failure would read as "never adopt" and quietly reopen the bug.
+test_treehouse_status_records_parse() {
+  local out
+  out=$(printf '%s' '[{"name":"1","path":"/pool/1","status":"leased","lease_id":"ab","lease_holder":"fm-task-a","holder_gone":true,"processes":[{"pid":7,"name":"zsh"},{"pid":8,"name":"node"}]},{"name":"2","path":"/pool/2","status":"free","processes":[]}]' \
+    | fm_backend_treehouse_status_records)
+  [ "$out" = "$(printf '/pool/1\tleased\tfm-task-a\n/pool/2\tfree\t')" ] \
+    || fail "compact pool status did not parse to one record per slot: $out"
+
+  # Nested process objects carry their own name/pid keys; the record fields must
+  # not be read out of them.
+  out=$(printf '%s' '[{"name":"1","path":"/pool/1","status":"free","processes":[{"pid":9,"name":"status"}]}]' \
+    | fm_backend_treehouse_status_records)
+  [ "$out" = "$(printf '/pool/1\tfree\t')" ] \
+    || fail "a nested process object leaked into the record fields: $out"
+
+  out=$(printf '[\n  {\n    "path": "/pool/3",\n    "status": "leased",\n    "lease_holder": "fm-task-b"\n  }\n]\n' \
+    | fm_backend_treehouse_status_records)
+  [ "$out" = "$(printf '/pool/3\tleased\tfm-task-b')" ] \
+    || fail "spaced pool status did not parse: $out"
+
+  [ -z "$(printf '' | fm_backend_treehouse_status_records)" ] \
+    || fail "empty input should print no records"
+  [ -z "$(printf 'treehouse: no pool here\n' | fm_backend_treehouse_status_records)" ] \
+    || fail "non-JSON input should print no records"
+
+  pass "fm_backend_treehouse_status_records: one record per pool slot, nested processes ignored"
+}
+
 test_resolve_selector_three_forms() {
   local state=$TMP_ROOT/resolve-state fakebin out
   mkdir -p "$state"
@@ -1133,6 +1165,7 @@ test_backend_validate_refuses_unknown
 test_backend_source_shell_portable
 test_backend_validate_spawn_accepts_orca
 test_meta_get_and_backend_of_meta
+test_treehouse_status_records_parse
 test_resolve_selector_three_forms
 test_backend_of_selector_matches_explicit_target_meta
 test_send_conformance_old_vs_new
