@@ -124,9 +124,28 @@
 #   supports leases, then cd the pane into the leased path; teardown's
 #   `treehouse return --force` releases the lease. Without lease support the
 #   pane types a bare `treehouse get` as before, with a loud warning.
+#   A RESPAWN re-enters the task's own recorded worktree instead of leasing a
+#   fresh slot, but only when all of these hold, and prints one notice naming
+#   the adopted path when it does:
+#     - state/<id>.meta records a non-empty worktree= path;
+#     - that path exists and is its own git worktree root;
+#     - it is not the primary project checkout;
+#     - treehouse reports it leased with holder fm-<id>;
+#     - the task's own recorded endpoint probes dead or missing (unknown,
+#       unreadable, and unrecorded endpoints all refuse to adopt);
+#     - the sibling-ownership guard finds no other live task recording it.
+#   Any unmet precondition falls back to the lease path above unchanged, so a
+#   task with no metadata is unaffected. Adoption exists because `treehouse get`
+#   never re-issues an already-leased slot, not even to its own holder, so a
+#   respawn would otherwise start in a different slot and abandon the dead
+#   worker's unlanded work in the leased one. The pane only cd's in: an adopted
+#   worktree is never cleaned, reset, checked out, or re-branched.
 #   A spawn aborting after the tmux window exists but before metadata is
 #   written kills that exact window and returns its own just-acquired lease
 #   (kept held only on the sibling-ownership refusal, to shield the incumbent).
+#   An ADOPTED worktree's lease is never returned on abort: only a lease this
+#   invocation itself acquired may be released, because the forced return that
+#   releases it also cleans and resets the worktree.
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
@@ -1565,6 +1584,50 @@ validate_spawn_worktree() {  # <source> <inspect-target>
   done
 }
 
+# spawn_recorded_worktree_adoptable: print the task's OWN recorded worktree when
+# a respawn may simply re-enter it, and print nothing when it may not.
+#
+# `treehouse get` never re-issues a slot that is already leased - not even to
+# the holder that leased it - so a respawn of a task whose worktree is still
+# leased under fm-<id> is handed a DIFFERENT slot. The dead worker's branch and
+# uncommitted work then sit abandoned in the old slot while the replacement
+# starts in an empty one, and the only thing that releases the old lease is
+# teardown's `treehouse return --force`, which cleans and resets the worktree.
+# Adopting the recorded path is the only recovery that keeps that work.
+#
+# Every precondition below is proof-shaped: absent, unreadable, unclassifiable,
+# or merely probable all print nothing, and the caller then leases a fresh slot
+# exactly as before. A task with no metadata is therefore untouched by this.
+# Eligibility is all this decides - validate_spawn_worktree still runs against
+# the adopted path afterwards and remains the authority that refuses an
+# unisolated checkout or one a live sibling owns.
+spawn_recorded_worktree_adoptable() {
+  local meta="$STATE/$ID.meta" recorded recorded_real top top_real target holder
+  [ -f "$meta" ] || return 0
+  recorded=$(fm_meta_get "$meta" worktree)
+  [ -n "$recorded" ] || return 0
+  recorded_real=$(cd "$recorded" 2>/dev/null && pwd -P) || return 0
+  top=$(git -C "$recorded_real" rev-parse --show-toplevel 2>/dev/null) || return 0
+  top_real=$(cd "$top" 2>/dev/null && pwd -P) || return 0
+  [ "$top_real" = "$recorded_real" ] || return 0
+  [ "$recorded_real" != "$PROJ_ABS_REAL" ] || return 0
+  # The task's own endpoint must be confidently gone before its worktree may be
+  # re-entered: adopting under a live worker would put two agents in one
+  # checkout. Same probe and same reading as the sibling-ownership guard above -
+  # only a dead or missing endpoint frees it, while unknown, unreadable, and
+  # unrecorded endpoints all stop here. This is why the whole check runs BEFORE
+  # this spawn creates its own fm-<id> endpoint: afterwards the new endpoint
+  # answers for the recorded one and every dead worker reads as alive.
+  target=$(fm_backend_target_of_meta "$meta")
+  [ -n "$target" ] || return 0
+  [ "$(fm_backend_agent_alive "$(fm_backend_of_meta "$meta")" "$target" 2>/dev/null)" = dead ] || return 0
+  # The pool must still record the slot as THIS task's. A path already returned,
+  # re-issued to another holder, or never leased at all is not ours to re-enter.
+  holder=$( cd "$PROJ_ABS" && fm_backend_treehouse_lease_holder "$recorded_real" ) || return 0
+  [ "$holder" = "fm-$ID" ] || return 0
+  printf '%s\n' "$recorded_real"
+}
+
 herdr_projection_meta_field_exact() {  # <meta> <key>
   local meta=$1 key=$2 count
   [ -f "$meta" ] && [ ! -L "$meta" ] || return 1
@@ -1640,6 +1703,17 @@ herdr_projection_existing_meta_allows_flat() {  # <meta>
       ;;
   esac
 }
+
+# Decide respawn worktree adoption while the recorded endpoint still answers for
+# the PREVIOUS worker. The backend case below creates this spawn's own fm-<id>
+# endpoint, which a legacy tmux record names by the same window name, so the
+# liveness half of the decision is only truthful ahead of it. The result is
+# consumed at worktree acquisition further down; nothing is entered or mutated
+# here.
+SPAWN_ADOPTED_WT=
+if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
+  SPAWN_ADOPTED_WT=$(spawn_recorded_worktree_adoptable)
+fi
 
 W="fm-$ID"
 case "$BACKEND" in
@@ -2001,8 +2075,23 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   # treehouse without --lease support falls back to the historical bare
   # `treehouse get` typed into the pane, loudly, so the captain knows the pool
   # still cannot record ownership until treehouse is upgraded.
+  #
+  # A respawn whose own recorded worktree is still leased under fm-<id> re-enters
+  # that exact path instead (spawn_recorded_worktree_adoptable, decided above),
+  # because the pool would otherwise hand this spawn a different slot and strand
+  # the dead worker's unlanded work in the old one. The pane only cd's there:
+  # nothing is cleaned, reset, checked out, or re-branched, so the adopted
+  # worktree's branch, commits, and uncommitted changes survive the respawn
+  # untouched. TREEHOUSE_LEASE_ABORT_PATH deliberately stays empty on this
+  # branch - it drives `treehouse return --force`, which would hard-reset the
+  # very work this path exists to preserve, and only a lease THIS invocation
+  # acquired may ever be released on abort.
   SPAWN_LEASED_WT=
-  if fm_backend_treehouse_supports_lease; then
+  if [ -n "$SPAWN_ADOPTED_WT" ]; then
+    echo "notice: $ID is re-entering its own recorded worktree $SPAWN_ADOPTED_WT (still leased to fm-$ID, and its recorded endpoint is gone); no new pool slot was leased and nothing in that worktree was cleaned or reset" >&2
+    WT=$SPAWN_ADOPTED_WT
+    spawn_send_text_line "$WT_TARGET" "cd $(shell_quote "$SPAWN_ADOPTED_WT")"
+  elif fm_backend_treehouse_supports_lease; then
     SPAWN_LEASED_WT=$( cd "$PROJ_ABS" && treehouse get --lease --lease-holder "fm-$ID" ) || {
       echo "error: treehouse get --lease failed to lease a task worktree for $ID; inspect window $T" >&2
       exit 1
@@ -2019,8 +2108,8 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
     spawn_send_text_line "$WT_TARGET" 'treehouse get'
   fi
 
-  # Wait for the pane to enter the worktree: on the lease path its cwd must
-  # settle on the exact leased path just sent; on the fallback path the
+  # Wait for the pane to enter the worktree: on the lease and adoption paths its
+  # cwd must settle on the exact path just sent; on the fallback path the
   # treehouse subshell moves it from the project to a pool worktree.
   # Target the stable window id, not the name: if the name is ever lost (e.g. an
   # automatic-rename slips through), display-message -t <bad-name> falls back to the
@@ -2042,7 +2131,11 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   # pane that is already settled by the first real read only costs the one existing
   # inter-poll sleep as confirmation, not a whole extra cycle on top.
   SPAWN_EXPECTED_WT_REAL=
-  [ -z "$SPAWN_LEASED_WT" ] || SPAWN_EXPECTED_WT_REAL=$(real_path_or_raw "$SPAWN_LEASED_WT")
+  if [ -n "$SPAWN_LEASED_WT" ]; then
+    SPAWN_EXPECTED_WT_REAL=$(real_path_or_raw "$SPAWN_LEASED_WT")
+  elif [ -n "$SPAWN_ADOPTED_WT" ]; then
+    SPAWN_EXPECTED_WT_REAL=$(real_path_or_raw "$SPAWN_ADOPTED_WT")
+  fi
   candidate=""
   SPAWN_PANE_ENTERED=0
   for _ in $(seq 1 60); do
@@ -2053,8 +2146,9 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
          || { [ -z "$SPAWN_EXPECTED_WT_REAL" ] && [ "$p_real" != "$PROJ_ABS_REAL" ]; }; then
         if [ -n "$candidate" ] && [ "$p_real" = "$candidate" ]; then
           # The fallback path learns the worktree from the settled pane; the
-          # lease path already knows it and only needed the entry confirmed.
-          [ -n "$SPAWN_LEASED_WT" ] || WT="$p"
+          # lease and adoption paths already know it (both set an expected path
+          # above) and only needed the entry confirmed.
+          [ -n "$SPAWN_EXPECTED_WT_REAL" ] || WT="$p"
           SPAWN_PANE_ENTERED=1
           break
         fi
@@ -2070,13 +2164,19 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   if [ "$SPAWN_PANE_ENTERED" -ne 1 ]; then
     if [ -n "$SPAWN_LEASED_WT" ]; then
       echo "error: the pane did not enter the leased worktree $SPAWN_LEASED_WT within 60s; inspect window $T" >&2
+    elif [ -n "$SPAWN_ADOPTED_WT" ]; then
+      echo "error: the pane did not enter the adopted worktree $SPAWN_ADOPTED_WT within 60s; inspect window $T" >&2
     else
       echo "error: treehouse get did not enter a worktree within 60s; inspect window $T" >&2
     fi
     exit 1
   fi
 
-  validate_spawn_worktree "treehouse get" "$T"
+  if [ -n "$SPAWN_ADOPTED_WT" ]; then
+    validate_spawn_worktree "adopting $ID's recorded worktree" "$T"
+  else
+    validate_spawn_worktree "treehouse get" "$T"
+  fi
 fi
 
 # Per-task temp root: /tmp/fm-<id>/ with Go's build temp nested at gotmp/. Go won't

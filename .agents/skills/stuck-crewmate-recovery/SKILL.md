@@ -33,7 +33,10 @@ Before relaunch, prove that no live agent still owns the recorded task and that 
 Preserve its uncommitted changes and commits, keep the same task identity, and resume or relaunch the recorded harness in that existing worktree with the same brief plus a concise progress note.
 A resume or relaunch must carry the same autonomy flags and env prefix the original launch used - each adapter's Resume row in `harness-adapters` gives the exact command; a bare resume (e.g. `claude --resume <id>`, the shape a herdr server restart reconstructs on its own) returns the worker in interactive-approval mode, where it stalls on its first tool call and presents as a wedge.
 Confirm the resumed pane's working directory is the recorded worktree before steering it, because a backend restore can also drop the worker back in the project clone; never accept a trust dialog naming the clone - escape it and re-enter the worktree first.
-Do not use a fresh generic spawn while the recorded worktree is unaccounted for, because allocating another worktree can split one task across two copies.
+When the recorded worktree is still leased to this task and no live agent owns it, an ordinary `bin/fm-spawn.sh` respawn is a correct recovery: it re-enters that exact worktree rather than leasing a new one, changes nothing inside it, and prints one notice naming the adopted path.
+That notice is the confirmation to look for, because its absence means the spawn leased a fresh worktree instead.
+`bin/fm-spawn.sh`'s header owns the exact adoption preconditions.
+Do not spawn while the recorded worktree is unaccounted for - the pool no longer holding it for this task, another task recording it, or a live endpoint still owning it - because that spawn allocates a second worktree and splits one task across two copies.
 If the worktree or ownership cannot be reconciled safely, leave all state intact and report the task failed or blocked with the conflicting evidence.
 
 ## Live-endpoint escalation

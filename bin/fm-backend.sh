@@ -327,6 +327,98 @@ fm_backend_treehouse_supports_lease() {
   treehouse get --help 2>&1 | grep -Eq '(^|[^[:alnum:]_-])--lease([^[:alnum:]_-]|$)'
 }
 
+# fm_backend_treehouse_lease_holder: print the lease holder the pool currently
+# records for <worktree-path> and return 0, or print nothing and return 1 when
+# the pool does not report that exact path as leased. The second half of the
+# treehouse lease surface owned here: fm-spawn.sh's respawn worktree adoption
+# uses it to prove a task's recorded worktree is still held under that task's
+# own fm-<id> holder before re-entering it, because `treehouse get` never
+# re-issues an already-leased slot, not even to its own holder.
+# Runs `treehouse status --json` in the CALLER's cwd, so callers cd into the
+# project whose pool owns the slot. Paths are compared physically, so a
+# symlinked pool prefix cannot make a match look like a miss.
+# Every failure - no treehouse, no --json, unparsable output, an unresolvable
+# path - is silent and returns 1, because the only caller reads "cannot prove
+# it" as "do not adopt".
+# The JSON is walked by brace depth in awk rather than parsed with jq: the tmux
+# backend does not require jq (fm_backend_required_tools), and a missing
+# optional tool must never decide worktree ownership. Depth-1 objects are the
+# pool records; the nested `processes` objects carry only pid/name keys, so the
+# three fields read here cannot collide with them.
+fm_backend_treehouse_lease_holder() {  # <worktree-path>
+  local want=$1 want_real json rec_path rec_status rec_holder rec_real
+  want_real=$(cd "$want" 2>/dev/null && pwd -P) || want_real=$want
+  json=$(treehouse status --json 2>/dev/null) || return 1
+  [ -n "$json" ] || return 1
+  while IFS=$'\t' read -r rec_path rec_status rec_holder; do
+    [ -n "$rec_path" ] || continue
+    [ "$rec_status" = leased ] || continue
+    [ -n "$rec_holder" ] || continue
+    rec_real=$(cd "$rec_path" 2>/dev/null && pwd -P) || rec_real=$rec_path
+    [ "$rec_real" = "$want_real" ] || continue
+    printf '%s\n' "$rec_holder"
+    return 0
+  done < <(printf '%s\n' "$json" | fm_backend_treehouse_status_records)
+  return 1
+}
+
+# fm_backend_treehouse_status_records: read `treehouse status --json` on stdin
+# and print one tab-separated `path<TAB>status<TAB>lease_holder` line per pool
+# record. A record missing a field prints it empty; unparsable input prints
+# nothing. Split from fm_backend_treehouse_lease_holder so the parse is
+# exercisable on its own.
+fm_backend_treehouse_status_records() {
+  awk '
+    function jval(rec, key,   pat, i, s, j, c, esc, out) {
+      pat = "\"" key "\""
+      i = index(rec, pat)
+      if (i == 0) return ""
+      s = substr(rec, i + length(pat))
+      j = 1
+      while (j <= length(s) && substr(s, j, 1) != "\"") {
+        c = substr(s, j, 1)
+        if (c != ":" && c != " " && c != "\t") return ""
+        j++
+      }
+      j++
+      out = ""
+      esc = 0
+      for (; j <= length(s); j++) {
+        c = substr(s, j, 1)
+        if (esc) { out = out c; esc = 0; continue }
+        if (c == "\\") { esc = 1; continue }
+        if (c == "\"") break
+        out = out c
+      }
+      return out
+    }
+    { buf = buf $0 }
+    END {
+      depth = 0; instr = 0; esc = 0; rec = ""
+      n = length(buf)
+      for (i = 1; i <= n; i++) {
+        c = substr(buf, i, 1)
+        if (depth > 0) rec = rec c
+        if (esc) { esc = 0; continue }
+        if (instr) {
+          if (c == "\\") esc = 1
+          else if (c == "\"") instr = 0
+          continue
+        }
+        if (c == "\"") { instr = 1; continue }
+        if (c == "{") { if (depth == 0) rec = c; depth++ }
+        else if (c == "}") {
+          depth--
+          if (depth == 0) {
+            printf "%s\t%s\t%s\n", jval(rec, "path"), jval(rec, "status"), jval(rec, "lease_holder")
+            rec = ""
+          }
+        }
+      }
+    }
+  '
+}
+
 fm_backend_required_tool_available() {  # <backend> <tool>
   local backend=$1 tool=$2 required
   required=$(fm_backend_required_tools "$backend") || return 1
