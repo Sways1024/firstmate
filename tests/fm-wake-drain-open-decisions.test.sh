@@ -215,7 +215,35 @@ test_over_long_decision_note_is_capped_with_a_marker() {
   pass "an over-long open decision is cut to its per-item budget with the shared truncation marker"
 }
 
+# Every entry states the key that answers it, "default" included, because
+# firstmate copies that token straight into fm-send's --resolve-key, which
+# accepts only the key this same fold recorded (contract: bin/fm-send.sh
+# header). Two shapes must not lose it: a decision opened with no key token at
+# all, and one whose NOTE begins with its own "[key=...]" token - what a worker
+# writes when it puts the token after the colon instead of before it, where
+# fm-classify-lib.sh's "Decision key grammar" defines it. The second shape is
+# the one that misled: with the entry's own key suppressed, the note's token sat
+# in exactly the position a real key occupies and read as the decision's key.
+test_every_entry_states_its_answerable_key() {
+  local dir state out
+  dir=$(make_case answerable-key)
+  state="$dir/state"
+  out="$dir/drain.out"
+  printf 'needs-decision: pick the rollout plan\n' > "$state/task-bare.status"
+  printf 'needs-decision: [key=after-colon] two ask-user findings park the run\n' > "$state/task-noteish.status"
+  printf 'working: continuing on the other finding\n' >> "$state/task-noteish.status"
+
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out" || fail "drain failed on decisions carrying no key token"
+
+  grep -F 'task-bare [key=default] needs-decision: pick the rollout plan' "$out" >/dev/null \
+    || fail "an unkeyed open decision did not state the key that answers it: $(cat "$out")"
+  grep -F 'task-noteish [key=default] needs-decision: [key=after-colon] two ask-user findings park the run' "$out" >/dev/null \
+    || fail "a note-embedded key token displaced the entry's own answerable key: $(cat "$out")"
+  pass "every open-decision entry states the key that answers it, including default"
+}
+
 test_buried_decision_still_surfaces
+test_every_entry_states_its_answerable_key
 test_over_long_decision_note_is_capped_with_a_marker
 test_explicit_resolution_closes_it
 test_later_unrelated_terminal_line_does_not_close_it

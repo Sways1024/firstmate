@@ -52,9 +52,16 @@ print_open_decisions_section() {
 
   while IFS=$(printf '\t') read -r task key verb note; do
     [ -n "$task" ] || continue
-    line="$task"
-    [ "$key" = default ] || line="$line [key=$key]"
-    line="$line $verb: $note"
+    # Print the folded key on every entry, "default" included: the hint below
+    # tells the reader to copy <key> into fm-send's --resolve-key, which accepts
+    # only the key this same fold recorded. Suppressing "default" left an
+    # unkeyed decision with no key to copy at all, and let a note that itself
+    # begins with a "[key=...]" token - what a worker writes when it puts the
+    # token after the colon instead of before it, where fm-classify-lib.sh's
+    # "Decision key grammar" defines it - render in exactly the position a real
+    # key token occupies, so the note's token read as the decision's key and
+    # --resolve-key refused it.
+    line="$task [key=$key] $verb: $note"
     # The shared cut counts the item's own characters; the trailing newline this
     # section's global budget also pays for is this caller's, so the per-item
     # allowance passed down is one short of the cap.
