@@ -1892,6 +1892,112 @@ test_herdr_projection_teardown_retains_journal_when_close_unconfirmed() {
   pass "herdr projection teardown retains every record when post-close presence is unknown"
 }
 
+# The same projected task, but with the pane's own shell modelled as a REAL
+# process rooted in the task worktree - which is what it is in the field, and
+# therefore one of the leaked worktree processes teardown's own reap ends.
+# While that process lives the disposable workspace w1 exists and the captain's
+# anchor w2 is active; once the reap kills it Herdr has removed the emptied
+# workspace and, on a release below the presentation floor, carried the active
+# workspace off to w3 with it. That removal happens before the locked close, so
+# the close has no pane left to close and its own restore never runs.
+configure_herdr_projection_reaped_pane_case() {  # <case-dir>
+  local case_dir=$1 token=AbCdEfGhIjKlMnOpQrStUv
+  sed -i.bak 's/^window=.*/window=fmtest:w1:p2/' "$case_dir/state/task-x1.meta"
+  rm -f "$case_dir/state/task-x1.meta.bak"
+  printf '%s\n' \
+    'backend=herdr' \
+    'herdr_session=fmtest' \
+    'herdr_workspace_id=w1' \
+    'herdr_tab_id=w1:t2' \
+    'herdr_pane_id=w1:p2' >> "$case_dir/state/task-x1.meta"
+  printf '%s\n' \
+    'version=1' \
+    'task_id=task-x1' \
+    "projection_id=$token" > "$case_dir/state/task-x1.herdr-presentation"
+  cat > "$case_dir/fakebin/herdr" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "$*" >> "${FM_FAKE_HERDR_LOG:?}"
+pane_alive() { kill -0 "${FM_FAKE_HERDR_PANE_PID:?}" 2>/dev/null; }
+case "${1:-} ${2:-}" in
+  "workspace list")
+    if [ -e "${FM_FAKE_HERDR_RESTORED:?}" ]; then
+      printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"w2","active_tab_id":"w2:t2","label":"2ndmate-bravo","focused":true},{"workspace_id":"w3","active_tab_id":"w3:t1","label":"2ndmate-alpha","focused":false}]}}'
+    elif pane_alive; then
+      printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"w1","active_tab_id":"w1:t2","label":"firstmate/task-x1 · p:AbCdEfGhIjKlMnOpQrStUv","focused":false},{"workspace_id":"w2","active_tab_id":"w2:t2","label":"2ndmate-bravo","focused":true},{"workspace_id":"w3","active_tab_id":"w3:t1","label":"2ndmate-alpha","focused":false}]}}'
+    else
+      printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"w2","active_tab_id":"w2:t2","label":"2ndmate-bravo","focused":false},{"workspace_id":"w3","active_tab_id":"w3:t1","label":"2ndmate-alpha","focused":true}]}}'
+    fi
+    ;;
+  "tab list")
+    case "$*" in
+      *"--workspace w1"*) printf '%s\n' '{"result":{"tabs":[{"tab_id":"w1:t2","focused":true}]}}' ;;
+      *"--workspace w2"*) printf '%s\n' '{"result":{"tabs":[{"tab_id":"w2:t2","focused":true}]}}' ;;
+      *"--workspace w3"*) printf '%s\n' '{"result":{"tabs":[{"tab_id":"w3:t1","focused":true}]}}' ;;
+      *) printf '%s\n' '{"result":{"tabs":[]}}' ;;
+    esac
+    ;;
+  "status --json") printf '%s\n' '{"server":{"running":true}}' ;;
+  "session list")
+    printf '%s\n' '{"sessions":[{"name":"fmtest","running":true,"socket_path":"/tmp/fmtest.sock"}]}'
+    ;;
+  "pane get")
+    if pane_alive; then
+      printf '%s\n' '{"result":{"pane":{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1"}}}'
+    else
+      printf '%s\n' '{"error":{"code":"pane_not_found"}}' >&2
+      exit 1
+    fi
+    ;;
+  "tab get")
+    printf '%s\n' '{"result":{"tab":{"tab_id":"w2:t2","workspace_id":"w2"}}}'
+    ;;
+  "tab focus")
+    : > "${FM_FAKE_HERDR_RESTORED:?}"
+    printf '%s\n' '{"result":{"tab":{"tab_id":"w2:t2","workspace_id":"w2","focused":true}}}'
+    ;;
+  "agent get")
+    printf '%s\n' '{"error":{"code":"agent_not_found"}}' >&2
+    exit 1
+    ;;
+esac
+SH
+  chmod +x "$case_dir/fakebin/herdr"
+}
+
+test_herdr_projection_teardown_restores_focus_after_its_own_reap_removed_the_workspace() {
+  local case_dir log restored pid rc
+  case_dir=$(make_case herdr-projection-reaped-pane)
+  write_meta "$case_dir" local-only ship
+  configure_herdr_projection_reaped_pane_case "$case_dir"
+  log="$case_dir/herdr.log"; restored="$case_dir/restored"; : > "$log"
+
+  # The projected pane's shell: rooted by cwd in the task worktree, exactly
+  # like the real one, so teardown's leaked-process reap is what ends it.
+  ( cd "$case_dir/wt" && exec sleep 300 ) &
+  pid=$!
+  disown
+  sleep 0.3
+  kill -0 "$pid" 2>/dev/null || fail "herdr-projection-reaped-pane: setup pane shell did not start"
+
+  rc=0
+  FM_FAKE_HERDR_LOG="$log" FM_FAKE_HERDR_RESTORED="$restored" FM_FAKE_HERDR_PANE_PID="$pid" \
+    run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 0 "$rc" "herdr-projection-reaped-pane: forced teardown failed"
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL "$pid" 2>/dev/null || true
+    fail "herdr-projection-reaped-pane: the reap never ended the pane's shell, so the regression was not exercised"
+  fi
+  assert_present "$restored" \
+    "herdr-projection-reaped-pane: teardown left the captain on the workspace the pane death drifted to"
+  assert_contains "$(cat "$log")" "tab focus w2:t2" \
+    "herdr-projection-reaped-pane: teardown did not restore the exact pre-reap active tab"
+  [ ! -e "$case_dir/state/task-x1.meta" ] \
+    || fail "herdr-projection-reaped-pane: a confirmed-gone pane left the durable endpoint record behind"
+  pass "herdr projection teardown restores the captain's exact workspace and tab when its own reap removed the disposable workspace"
+}
+
 test_herdr_projection_teardown_surfaces_restore_failure_without_blocking_cleanup() {
   local case_dir log closed restored
   case_dir=$(make_case herdr-projection-restore-failure)
@@ -2520,6 +2626,7 @@ test_forced_teardown_retains_nested_secondmate_home_when_grandchild_close_unconf
 test_herdr_projection_teardown_retires_journal_only_after_confirmed_close
 test_herdr_projection_teardown_retains_journal_when_close_unconfirmed
 test_herdr_projection_teardown_surfaces_restore_failure_without_blocking_cleanup
+test_herdr_projection_teardown_restores_focus_after_its_own_reap_removed_the_workspace
 test_squash_merged_branch_deleted_allows
 test_squash_merged_pr_allows_when_head_ancestor_of_pr_head
 test_no_pr_recorded_discovers_merged_pr_by_branch_allows

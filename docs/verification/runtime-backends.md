@@ -444,7 +444,7 @@ tests/fm-backend-herdr.test.sh
 
 Observed guarantees: every measured release classifies as the table records; either the protocol or the version signal alone carries an at-or-above verdict, and each divergent pair flips once the carrying signal is removed; client and running selected-session server verdicts compose conservatively, an unreadable server-running state and losing both release signals report indeterminate and fall back flat, the default is rechecked after server ensure before projection publication, an unconfigured home is projected only at or above the floor, an explicit `on`, including the historical empty opt-in file, is honored below it, and the below-floor warning is emitted once per home per detected release rather than once per spawn.
 
-The whole real-Herdr lane was run on 2026-08-05 against both the CI-pinned Herdr 0.7.4 protocol 16, which is below the floor, and Herdr 0.8.0 protocol 19, which is at it:
+The whole real-Herdr lane was run on 2026-08-05 against both Herdr 0.7.4 protocol 16, which is below the floor, and Herdr 0.8.0 protocol 19, which is at it and is what the CI lane pins:
 
 ```sh
 HERDR_LAB_HELPER=bin/fm-herdr-lab.sh bin/fm-test-run.sh --lane real-herdr-gated
@@ -491,6 +491,16 @@ Observed output:
 ok - forced secondmate teardown preflights every Herdr child before cleanup mutation
 ok - forced secondmate teardown retains Herdr child identity until exact pane disappearance
 ok - forced teardown retains a nested secondmate home and its grandchild's Herdr identity when the grandchild close is unconfirmed
+```
+
+A projected task's pane is itself one of the leaked worktree processes teardown reaps: the pane shell's cwd is the task worktree.
+Instrumenting the whole projection suite on 2026-08-12 against Herdr 0.8.0 measured the pane as already gone at every single projected teardown's close decision, killed by teardown's own reap one step earlier, which is before the session presentation lock is taken and outside the locked close that owns the exact-tab restore.
+At or above the presentation floor that pane-death removal preserves the active workspace, so nothing was visible there; below it the same removal carries the captain's active workspace off to another one whenever the disposable workspace sat before it, with no close left to restore it.
+Teardown therefore captures the exact active workspace and tab before the reap and restores them under the session lock after the close, which is a verified no-op at or above the floor and the only restore below it.
+That restore is pinned portably, with the pane shell modelled as a real reaped worktree process and no Herdr installed:
+
+```sh
+tests/fm-teardown.test.sh
 ```
 
 ### Secondmate pane-takeover gate

@@ -1,6 +1,6 @@
 # Local patches (Sways1024 fork)
 
-`patched` = upstream HEAD `833a9a2` (2026-08-07) plus twenty-six fixes on nine branches:
+`patched` = upstream HEAD `833a9a2` (2026-08-07) plus twenty-seven fixes on nine branches:
 
 | Branch | Upstream issues | Fix |
 | --- | --- | --- |
@@ -19,6 +19,15 @@ registered in `bin/fm-test-run.sh`'s changed-test map and in
 `docs/documentation-audiences.json`, because `--changed` verification dies on
 any unmapped/unclassified file — it previously aborted before selecting a
 single test, so earlier "verified with --changed" runs never actually ran.
+Both workflows in `.github/workflows/` now trigger on `patched` as well as `main`.
+They triggered on `main` alone before, so pushes to `patched` and pull requests targeting `patched` were never covered, and adding `patched` closes exactly that gap and nothing more.
+`patched` is added alongside `main` rather than replacing it, because these files are shared with upstream, where `main` really is the default branch: adding a branch that upstream does not have changes nothing for upstream and keeps the diff to one token per trigger list, whereas replacing `main` would disable upstream CI and conflict on every rebase.
+This fork's default branch is now `patched`, changed deliberately on 2026-08-12.
+`main` here tracks pristine upstream `833a9a2` and carries upstream's own default branch name.
+Pull requests 1 and 2 were opened before that change and therefore target base `main`, which the old filter already matched, so the trigger lists are not what explains this fork having produced no workflow run to date.
+The absence of runs is explained instead by the fork's workflows having gone unregistered until 2026-08-12: GitHub registers the workflows it finds on a repository's default branch, and while that branch was `main` sitting at pristine upstream, nothing was ever pushed there for it to notice.
+Both workflows registered themselves once the default branch became `patched` and work was pushed to it, with no enablement step needed, and both are active from 2026-08-12.
+Runs therefore reach `patched` pushes and `patched`-based pull requests only once this trigger change lands.
 
 Verification lesson worth keeping: the first cut of the #1912 secondmate guard
 reused the pane-CLOSE idle-shell proof, which demands a shell with no child
@@ -87,9 +96,11 @@ focus untouched.
   TREEHOUSE_NO_UPDATE_CHECK=1 and NO_MISTAKES_NO_UPDATE_CHECK=1 in ~/.zshrc.
 - `/updatefirstmate` is safe only because `origin` is our own fork. Never add or
   pull from a kunchenguid upstream remote, and never repoint origin at it.
-  `origin/HEAD` is set locally to `origin/patched` so the worktree-tangle guard
-  treats `patched` as this checkout's default branch; that is a per-machine
-  local ref, not something a clone carries.
+  `origin/HEAD` must resolve to `origin/patched` so the worktree-tangle guard
+  treats `patched` as this checkout's default branch. `patched` is the fork's
+  GitHub default branch, so a clone made after 2026-08-12 already resolves it;
+  an older clone still points at `main` and needs
+  `git remote set-head origin patched`.
 - Relay stays disabled. Remote secondmates stay disabled unless the captain
   sets them up in person.
 ```
@@ -125,8 +136,10 @@ cd ~/dev/firstmate
 #     installed as the verified fallback — write `tmux` here to revert):
 mkdir -p config && printf 'herdr\n' > config/backend
 
-# 3c. Point origin/HEAD at our canonical branch. This is a LOCAL git ref, so it
-#     does not travel with the clone and must be set on every machine.
+# 3c. Point origin/HEAD at our canonical branch. Since 2026-08-12 `patched` is
+#     the fork's GitHub default branch, so a fresh clone already resolves
+#     origin/HEAD to it and this command is a harmless no-op; a clone made
+#     before that date still points at `main` and needs it.
 #     Without it the worktree-tangle guard resolves the default branch as
 #     `main` and warns on every command that this checkout is "stranded" on
 #     `patched` — which is where our work correctly lives. It feeds nothing but

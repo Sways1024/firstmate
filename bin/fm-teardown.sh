@@ -2209,6 +2209,28 @@ fi
 # kind=secondmate: a secondmate home's own runtime lifecycle is owned by the
 # dedicated process-event and firstmate-home removal machinery further below,
 # not by task-worktree cleanup.
+#
+# A projected task's pane is one of those leaked worktree processes: its shell's
+# cwd IS the worktree, so the reap below ends it and Herdr removes the emptied
+# disposable workspace through its pane-death path - measured on every projected
+# teardown, whose exact pane already reads gone by the time the locked close
+# below decides anything. That removal happens before the session presentation
+# lock is taken and outside the close that owns the exact-tab restore, so below
+# the presentation floor it moves the captain's active workspace whenever the
+# disposable one sat before it (Herdr keeps the focused index stale on pane
+# death, upstream #1621/#1912) and nothing restores it. Capture the exact active
+# workspace and tab here, while the pane is still alive, so the herdr section
+# below can restore them once the destructive sequence is finished.
+HERDR_PRESENTATION_JOURNAL="$STATE/$ID.herdr-presentation"
+HERDR_PRESENTATION_PRE_REAP_FOCUS=
+if [ "$BACKEND" = herdr ] \
+   && { [ -e "$HERDR_PRESENTATION_JOURNAL" ] || [ -L "$HERDR_PRESENTATION_JOURNAL" ]; }; then
+  fm_backend_source herdr || true
+  if declare -F fm_backend_herdr_projection_focus_snapshot >/dev/null 2>&1; then
+    HERDR_PRESENTATION_PRE_REAP_FOCUS=$(fm_backend_herdr_projection_focus_snapshot \
+      "$(meta_value "$META" herdr_session)") || HERDR_PRESENTATION_PRE_REAP_FOCUS=
+  fi
+fi
 if [ "$KIND" != secondmate ]; then
   conclude_task_no_mistakes_run "$WT"
   reap_task_worktree_processes worktree "$WT" "$TASK_TMP"
@@ -2277,7 +2299,6 @@ elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   }
 fi
 
-HERDR_PRESENTATION_JOURNAL="$STATE/$ID.herdr-presentation"
 HERDR_PRESENTATION_RETIRE_CANDIDATE=0
 HERDR_PRESENTATION_RETIRE_IF_GONE=0
 HERDR_PRESENTATION_SESSION=
@@ -2342,6 +2363,17 @@ elif [ "$BACKEND" = herdr ]; then
   fi
 elif [ "$BACKEND" != orca ]; then
   fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
+fi
+# The close above restores focus only around a close it performed itself, and it
+# has nothing left to close once the reap already ended this projection's pane.
+# This is the same exact-tab restore, taken under the same session lock, against
+# the workspace and tab captured before the reap: a verified no-op whenever the
+# removal preserved focus, which is every release at or above the presentation
+# floor.
+if [ -n "$HERDR_PRESENTATION_PRE_REAP_FOCUS" ] \
+   && teardown_herdr_session_lock_held "$TEARDOWN_HERDR_SESSION"; then
+  fm_backend_herdr_projection_focus_restore "$TEARDOWN_HERDR_SESSION" \
+    "$HERDR_PRESENTATION_PRE_REAP_FOCUS" "teardown workspace removal" || true
 fi
 if [ "$HERDR_PRESENTATION_RETIRE_CANDIDATE" = 1 ]; then
   # Retirement is decided by the same structured confirmed-gone gate that

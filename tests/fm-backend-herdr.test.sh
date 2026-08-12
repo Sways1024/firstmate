@@ -2543,6 +2543,11 @@ test_home_workspace_record_reader_and_writer_are_silent_on_unreadable_state() {
 #   child_pi <name> <argv0> <shell-pid> <child-pid>   an ordinary foreground child
 #   check <label> <expected-rc> <expected-samples> <response> [cli-rc]
 #   check_seq <label> <expected-rc> <expected-samples> <flip-after> <early> <late>
+#
+# Stock macOS Bash 3.2 scans this here-document as if it were code while it
+# looks for the closing paren of the command substitution, so every paren in the
+# body below must be balanced or the substitution ends early: that is why the
+# case patterns here are written in the (pattern) form.
 TAKEOVER_MATRIX_PREAMBLE=$(cat <<'PREAMBLE'
 . "$0/bin/backends/herdr.sh"
 RESPDIR="$1/takeover-responses"
@@ -2562,7 +2567,7 @@ proc_state() { ps -p "$1" -o stat= 2>/dev/null | tr -d "[:space:]"; }
 wait_for_running() {
   local i=0
   while [ "$i" -lt 50 ]; do
-    case "$(proc_state "$1")" in R*) return 0 ;; esac
+    case "$(proc_state "$1")" in (R*) return 0 ;; esac
     sleep 0.1
     i=$((i + 1))
   done
@@ -2570,12 +2575,12 @@ wait_for_running() {
 }
 wait_for_running "$BUSY" || true
 case "$(proc_state "$RESTING")" in
-  S*|I*) ;;
-  *) printf "MISMATCH fixture: the resting process reads state '%s', not sleeping\n" "$(proc_state "$RESTING")" ;;
+  (S*|I*) ;;
+  (*) printf "MISMATCH fixture: the resting process reads state '%s', not sleeping\n" "$(proc_state "$RESTING")" ;;
 esac
 case "$(proc_state "$BUSY")" in
-  R*) ;;
-  *) printf "MISMATCH fixture: the spinning process reads state '%s', not running\n" "$(proc_state "$BUSY")" ;;
+  (R*) ;;
+  (*) printf "MISMATCH fixture: the spinning process reads state '%s', not running\n" "$(proc_state "$BUSY")" ;;
 esac
 [ "$RESTING" != "$BUSY" ] && [ "$RESTING" != "$OTHER" ] \
   || printf "MISMATCH fixture: the standin processes share a pid\n"
