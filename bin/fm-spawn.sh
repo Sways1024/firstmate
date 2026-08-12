@@ -739,7 +739,12 @@ spawn_abort_cleanup() {
   # no metadata was ever written. fm_backend_herdr_kill serializes under the
   # session presentation lock and tolerates an already-gone pane.
   if [ -n "${HERDR_FLAT_ABORT_PANE:-}" ]; then
-    fm_backend_herdr_kill "$HERDR_FLAT_ABORT_SESSION:$HERDR_FLAT_ABORT_PANE" 2>/dev/null || true
+    # stderr is deliberately NOT suppressed: a refusal here names the holding pid
+    # and the lock's age, and this is the waiter most likely to be waiting, so
+    # silencing it would leave a bounded wait on a named holder looking like a
+    # hang. The trailing || true still keeps this best-effort cleanup from
+    # changing an already-failing spawn's exit status.
+    fm_backend_herdr_kill "$HERDR_FLAT_ABORT_SESSION:$HERDR_FLAT_ABORT_PANE" || true
     HERDR_FLAT_ABORT_PANE=
     HERDR_FLAT_ABORT_SESSION=
   fi

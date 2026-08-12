@@ -700,7 +700,17 @@ secondmate_liveness_one() {  # <meta> <id>
     dead|missing)
       if [ "$agent_state" = dead ]; then
         cause="confirmed agent absence on existing endpoint"
-        fm_backend_kill "$backend" "$target" 2>/dev/null || true
+        # Bounded short on purpose, like bin/fm-herdr-session-cleanup.sh: this
+        # runs on session start's blocking path, once per dead secondmate, and a
+        # herdr close here waits on the shared presentation lock. Waiting a live
+        # projected spawn out would stall startup; a refused close costs nothing,
+        # because the respawn immediately below re-establishes the endpoint.
+        # The subshell scopes the override to this one call. Measured: a bare
+        # assignment prefixing a FUNCTION call survives the call on stock macOS
+        # bash 3.2 under `set -o posix` (not on 5.3, and not in either shell's
+        # default mode), and this bound must never reach the rest of bootstrap.
+        ( FM_HERDR_PRESENTATION_LOCK_ATTEMPTS=50 \
+          fm_backend_kill "$backend" "$target" ) 2>/dev/null || true
       else
         cause="recorded endpoint confidently missing"
       fi
