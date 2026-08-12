@@ -25,8 +25,9 @@ They triggered on `main` alone before, so pushes to `patched` and pull requests 
 This fork's default branch is now `patched`, changed deliberately on 2026-08-12.
 `main` here tracks pristine upstream `833a9a2` and carries upstream's own default branch name.
 Pull requests 1 and 2 were opened before that change and therefore target base `main`, which the old filter already matched, so the trigger lists are not what explains this fork having produced no workflow run to date.
-The absence of runs is explained instead by the fork's workflows never having been registered or enabled: the GitHub API reports Actions permissions enabled while both the workflow list and the run list are empty.
-Enabling them is a repository-settings action for the owner and is handled separately, so this fork's CI does not run yet.
+The absence of runs is explained instead by the fork's workflows having gone unregistered until 2026-08-12: GitHub registers the workflows it finds on a repository's default branch, and while that branch was `main` sitting at pristine upstream, nothing was ever pushed there for it to notice.
+Both workflows registered themselves once the default branch became `patched` and work was pushed to it, with no enablement step needed, and both are active from 2026-08-12.
+Runs therefore reach `patched` pushes and `patched`-based pull requests only once this trigger change lands.
 
 Verification lesson worth keeping: the first cut of the #1912 secondmate guard
 reused the pane-CLOSE idle-shell proof, which demands a shell with no child
