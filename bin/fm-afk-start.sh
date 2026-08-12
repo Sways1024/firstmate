@@ -55,13 +55,15 @@ fm_afk_start_usage() {
 # escalation - the delivery buffer is a transient cache, and any condition still
 # true (a crew still blocked, a check still firing) is re-derived and re-escalated
 # fresh by the daemon's heartbeat catch-all scan and the durable
-# state/.wake-queue replay (see docs/herdr-backend.md "Away-mode stale-artifact
+# state/.wake-queue replay (see .agents/skills/afk/SKILL.md "Stale-artifact
 # lifecycle" and bin/fm-supervise-daemon.sh's escalate_add/inject_wedge_alarm).
 # NOT called on a refresh (daemon already alive), so the current session's own
 # buffered escalations are preserved.
 #
-# MARKER LIFECYCLE (this comment owns the rule; every site that clears the
-# delivery buffer clears the marker in the same step, and cross-references here).
+# MARKER LIFECYCLE (this comment owns the rule; every site that discards the
+# delivery buffer at a session boundary - a fresh entry here, the return
+# catch-up in bin/fm-afk-return.sh, and bin/fm-afk-launch.sh's launch backup and
+# rollback set - carries the marker with it).
 # state/.subsuper-last-unconfirmed-inject is inject_msg's duplicate-digest
 # marker: it records that one specific digest was typed with an unconfirmed
 # submit, so a later identical digest can be recognized as already delivered.
@@ -73,6 +75,11 @@ fm_afk_start_usage() {
 # that false success, so nothing retries the escalation and the captain never
 # hears it. Clearing the marker is always the safe direction, because its
 # absence can only cost a duplicate delivery, never a lost one.
+# escalate_flush is the one place that empties the buffer without naming the
+# marker, and needs no clear: it truncates only after inject_msg returned
+# success, and both of inject_msg's success paths (the dedup hit and the
+# confirmed submit) already remove the marker, so it cannot survive that
+# truncation. Every remaining site that touches the buffer only reads it.
 fm_afk_clear_stale_artifacts() {  # <state-dir>
   local state=$1
   rm -f "$state/.subsuper-escalations" \
