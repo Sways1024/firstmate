@@ -87,13 +87,14 @@ SH
 
 # run_send <fakebin> <home> <send-log> <fm-send args...>: run the real fm-send
 # with the stubs on PATH against the given home. Guard noise goes to stderr,
-# captured per test when the diagnostic matters.
+# captured per test when the diagnostic matters. Stdin is closed so a send-path
+# subprocess can never eat input a caller is reading in a loop.
 run_send() {
   local fb=$1 home=$2 log=$3; shift 3
   : > "$log"
   env PATH="$fb:$PATH" \
     FM_ROOT_OVERRIDE="$home" FM_HOME="$home" FM_SEND_LOG="$log" FM_SEND_SETTLE=0 \
-    "$SEND" "$@" 2>/dev/null
+    "$SEND" "$@" </dev/null 2>/dev/null
 }
 
 setup_home() {  # <name> -> echoes a fresh home dir with an empty state/
@@ -395,7 +396,90 @@ test_flag_misuse_refuses() {
   pass "fm-send --resolve-key: --key, empty message, explicit targets, and malformed keys refuse loudly"
 }
 
+# The OPEN DECISIONS listing and --resolve-key are two readers of one fold, and
+# firstmate drives the second from the first: it copies a key out of the listing
+# and answers with it. A listing that states a key the answer path then refuses
+# breaks that round trip, and because the refusal is correctly loud and sends
+# nothing, the answer never reaches the worker at all. This drives the whole trip
+# over the noise a real task accumulates - an earlier keyed decision already
+# resolved, paused/working lines around it, and a decision whose NOTE begins with
+# its own "[key=...]" token, which is what a worker writes when it puts the token
+# after the colon instead of before it. Every key the listing states must be one
+# --resolve-key accepts.
+test_every_listed_key_round_trips_from_the_listing() {
+  local dir fb log home rc out task keytok key entries=0
+  dir="$TMP_ROOT/round-trip"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); log="$dir/send.log"
+  home=$(setup_home round-trip)
+  fm_write_meta "$home/state/t10.meta" "window=sess:fm-t10" "kind=ship"
+  {
+    printf 'working: setup done, branch created\n'
+    printf 'needs-decision [key=window-2]: earlier keyed decision\n'
+    printf 'resolved [key=window-2]: answered: use the wider window\n'
+    printf 'paused: waiting on an upstream release\n'
+    printf 'needs-decision: [key=askuser] two ask-user findings park the run\n'
+    printf 'working: continuing on the other finding\n'
+  } > "$home/state/t10.status"
+
+  out=$(drain_out "$home")
+  printf '%s' "$out" | grep -F 'OPEN DECISIONS' >/dev/null \
+    || fail "precondition: the still-open decision should list as open: $out"
+
+  # Read each entry's key from the entry's OWN key position, which is where the
+  # listing states the answerable key, never from whatever a note happens to hold.
+  while read -r task keytok; do
+    case "$keytok" in
+      \[key=*\]) key=${keytok#\[key=}; key=${key%\]} ;;
+      *) fail "listing entry for $task states no answerable key: $out" ;;
+    esac
+    entries=$((entries + 1))
+    run_send "$fb" "$home" "$log" "$task" --resolve-key "$key" "answered from the listing"; rc=$?
+    expect_code 0 "$rc" "the listing stated key '$key' but --resolve-key refused it"
+  done < <(printf '%s\n' "$out" | grep '^t10 ' | awk '{print $1, $2}')
+
+  [ "$entries" -gt 0 ] || fail "no listing entry was exercised: $out"
+  out=$(drain_out "$home")
+  if printf '%s' "$out" | grep -F 'OPEN DECISIONS' >/dev/null; then
+    fail "answering every key the listing stated still left a decision open: $out"
+  fi
+  pass "fm-send --resolve-key accepts exactly the keys the OPEN DECISIONS listing states as open"
+}
+
+# The refusal is a safety property, not an inconvenience: it keeps a stale key
+# from delivering an answer that silently leaves its decision open. Making the
+# listing state every key must not widen it, so a key that WAS open and has since
+# been resolved is refused exactly like a mistyped one, before anything is typed.
+test_already_resolved_key_is_still_refused() {
+  local dir fb log home err rc out
+  dir="$TMP_ROOT/already-resolved"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); log="$dir/send.log"; err="$dir/send.err"
+  home=$(setup_home already-resolved)
+  fm_write_meta "$home/state/t11.meta" "window=sess:fm-t11" "kind=ship"
+  printf 'needs-decision [key=api-shape]: pick REST or RPC\n' > "$home/state/t11.status"
+  printf 'resolved [key=api-shape]: answered: went with REST\n' >> "$home/state/t11.status"
+  printf 'needs-decision: an unkeyed decision that IS still open\n' >> "$home/state/t11.status"
+
+  : > "$log"
+  env PATH="$fb:$PATH" \
+    FM_ROOT_OVERRIDE="$home" FM_HOME="$home" FM_SEND_LOG="$log" FM_SEND_SETTLE=0 \
+    "$SEND" t11 --resolve-key api-shape "too late" >/dev/null 2>"$err"; rc=$?
+  [ "$rc" -ne 0 ] || fail "an already-resolved key should refuse"
+  assert_contains "$(cat "$err")" "--resolve-key 'api-shape'" "the refusal should name the closed key"
+  assert_contains "$(cat "$err")" "nothing was sent" "the refusal should state nothing was sent"
+  [ ! -s "$log" ] || fail "a refused answer still typed text: $(cat "$log")"
+  [ "$(grep -c '^resolved ' "$home/state/t11.status")" = 1 ] \
+    || fail "a refused answer wrote a second closing line: $(cat "$home/state/t11.status")"
+
+  # The decision that is genuinely still open is untouched, and still answerable.
+  out=$(drain_out "$home")
+  printf '%s' "$out" | grep -F 't11 [key=default] needs-decision:' >/dev/null \
+    || fail "the refusal disturbed the decision that is still open: $out"
+  pass "fm-send --resolve-key: a key that was open and is now resolved still refuses before anything is sent"
+}
+
 test_answer_send_closes_open_decision
+test_every_listed_key_round_trips_from_the_listing
+test_already_resolved_key_is_still_refused
 test_answer_starts_work_never_orphans
 test_routine_steer_never_closes
 test_not_open_key_refuses_before_send
