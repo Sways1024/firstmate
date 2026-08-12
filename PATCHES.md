@@ -1,6 +1,6 @@
 # Local patches (Sways1024 fork)
 
-`patched` = upstream HEAD `833a9a2` (2026-08-07) plus twenty-six fixes on nine branches:
+`patched` = upstream HEAD `833a9a2` (2026-08-07) plus twenty-seven fixes on nine branches:
 
 | Branch | Upstream issues | Fix |
 | --- | --- | --- |
@@ -19,6 +19,9 @@ registered in `bin/fm-test-run.sh`'s changed-test map and in
 `docs/documentation-audiences.json`, because `--changed` verification dies on
 any unmapped/unclassified file — it previously aborted before selecting a
 single test, so earlier "verified with --changed" runs never actually ran.
+Both workflows in `.github/workflows/` now trigger on `patched` as well as `main`, so this fork's CI actually runs.
+They were filtered to `main` alone, which nothing on this fork has ever matched, so no workflow run had ever executed here and every pull request reported zero configured checks.
+`patched` is added alongside `main` rather than replacing it, because these files are shared with upstream, where `main` really is the default branch: adding a branch that upstream does not have changes nothing for upstream and keeps the diff to one token per trigger list, whereas replacing `main` would disable upstream CI and conflict on every rebase.
 
 Verification lesson worth keeping: the first cut of the #1912 secondmate guard
 reused the pane-CLOSE idle-shell proof, which demands a shell with no child
