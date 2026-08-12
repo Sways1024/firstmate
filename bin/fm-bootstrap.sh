@@ -705,12 +705,11 @@ secondmate_liveness_one() {  # <meta> <id>
         # herdr close here waits on the shared presentation lock. Waiting a live
         # projected spawn out would stall startup; a refused close costs nothing,
         # because the respawn immediately below re-establishes the endpoint.
-        # The subshell scopes the override to this one call. Measured: a bare
-        # assignment prefixing a FUNCTION call survives the call on stock macOS
-        # bash 3.2 under `set -o posix` (not on 5.3, and not in either shell's
-        # default mode), and this bound must never reach the rest of bootstrap.
-        ( FM_HERDR_PRESENTATION_LOCK_ATTEMPTS=50 \
-          fm_backend_kill "$backend" "$target" ) 2>/dev/null || true
+        # The override is scoped by the prefix alone, deliberately NOT by a
+        # subshell: a subshell here also isolates shell state the surrounding
+        # sweep and its callers still expect to observe.
+        FM_HERDR_PRESENTATION_LOCK_ATTEMPTS=50 \
+          fm_backend_kill "$backend" "$target" 2>/dev/null || true
       else
         cause="recorded endpoint confidently missing"
       fi
