@@ -95,9 +95,11 @@ focus untouched.
   TREEHOUSE_NO_UPDATE_CHECK=1 and NO_MISTAKES_NO_UPDATE_CHECK=1 in ~/.zshrc.
 - `/updatefirstmate` is safe only because `origin` is our own fork. Never add or
   pull from a kunchenguid upstream remote, and never repoint origin at it.
-  `origin/HEAD` is set locally to `origin/patched` so the worktree-tangle guard
-  treats `patched` as this checkout's default branch; that is a per-machine
-  local ref, not something a clone carries.
+  `origin/HEAD` must resolve to `origin/patched` so the worktree-tangle guard
+  treats `patched` as this checkout's default branch. `patched` is the fork's
+  GitHub default branch, so a clone made after 2026-08-12 already resolves it;
+  an older clone still points at `main` and needs
+  `git remote set-head origin patched`.
 - Relay stays disabled. Remote secondmates stay disabled unless the captain
   sets them up in person.
 ```
@@ -133,8 +135,10 @@ cd ~/dev/firstmate
 #     installed as the verified fallback — write `tmux` here to revert):
 mkdir -p config && printf 'herdr\n' > config/backend
 
-# 3c. Point origin/HEAD at our canonical branch. This is a LOCAL git ref, so it
-#     does not travel with the clone and must be set on every machine.
+# 3c. Point origin/HEAD at our canonical branch. Since 2026-08-12 `patched` is
+#     the fork's GitHub default branch, so a fresh clone already resolves
+#     origin/HEAD to it and this command is a harmless no-op; a clone made
+#     before that date still points at `main` and needs it.
 #     Without it the worktree-tangle guard resolves the default branch as
 #     `main` and warns on every command that this checkout is "stranded" on
 #     `patched` — which is where our work correctly lives. It feeds nothing but
