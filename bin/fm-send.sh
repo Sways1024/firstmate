@@ -49,15 +49,22 @@
 # folds lives in this home's own state dir (a remote mate's escalations reach
 # it through the parent-replies ingest); only the answer message crosses the
 # backend or remote transport. Each named key must currently be open in that
-# ledger per status_open_decisions (bin/fm-classify-lib.sh) or fm-send refuses
-# before sending, so a mistyped key cannot deliver an answer while silently
-# orphaning the decision. A failed or unconfirmed send never closes a key; a
-# delivered answer whose closing append fails exits nonzero with the exact
-# manual close command, leaving the decision open to re-surface (the safe
-# direction). A send without the flag never closes anything: a routine steer,
-# working:, or done: event still cannot clear a captain decision. The flag is
-# refused with --key, with an explicit backend target (no task ledger in this
-# home), and with an empty message.
+# ledger per status_open_decisions (bin/fm-classify-lib.sh), AND the closing
+# line below must be one that fold would actually honor for it, or fm-send
+# refuses before sending, so no key can deliver an answer while silently
+# orphaning the decision. The second half is what excludes a reserved-namespace
+# key (bin/fm-classify-lib.sh's reserved-key rule): such a key is open in the
+# fold, but only its owning library speaks the vocabulary that closes it, so
+# fm-send's "answered:" close would be discarded and the decision would stay
+# open forever. Answering one is still fine - resend without --resolve-key for
+# that key and let the owner close it when the expectation it tracks resolves.
+# A failed or unconfirmed send never closes a key; a delivered answer whose
+# closing append fails exits nonzero with the exact manual close command,
+# leaving the decision open to re-surface (the safe direction). A send without
+# the flag never closes anything: a routine steer, working:, or done: event
+# still cannot clear a captain decision. The flag is refused with --key, with
+# an explicit backend target (no task ledger in this home), and with an empty
+# message.
 #
 # After a successful text submit fm-send pauses FM_SEND_SETTLE seconds (default 1,
 # 0 disables) before returning: submit confirmation only proves the text was
@@ -334,12 +341,16 @@ if [ -n "$TARGET_SELECTOR" ] && [ -n "$TARGET_META" ] && [ "$(fm_meta_get "$TARG
   TARGET_TASK_ID=$(fm_send_id_from_meta "$TARGET_META")
 fi
 
+# The vocabulary fm-send's own closing line speaks, shared by the precheck and
+# the writer below so the two can never disagree about what will be appended.
+FM_SEND_RESOLVE_NOTE_VERB='answered'
+
 # Validate the answerer-closes request before any durable mutation or send: the
 # target must have a task ledger in THIS home, the send must carry an answer
 # message, and every named key must be open right now in that ledger per the
-# ONE authoritative fold (status_open_decisions). Refusing here, before the
-# send, is what keeps a mistyped key loud instead of delivering an answer that
-# silently leaves its decision open.
+# ONE authoritative fold (status_open_decisions) AND closable by the line this
+# send would write. Refusing here, before the send, is what keeps a bad key loud
+# instead of delivering an answer that silently leaves its decision open.
 RESOLVE_STATUS_FILE=
 if [ -n "$RESOLVE_KEYS" ]; then
   if [ -z "$TARGET_SELECTOR" ] || [ -z "$TARGET_META" ]; then
@@ -365,6 +376,15 @@ if [ -n "$RESOLVE_KEYS" ]; then
         exit 1
         ;;
     esac
+    # Open is not enough: ask the same fold whether the closing line this send
+    # would append is a transition it honors for this key. A reserved-namespace
+    # key is open yet closable only by its owning library, so accepting one here
+    # would deliver the answer and discard the close - the exact silent orphan
+    # the refusal above exists to prevent.
+    if ! _fm_decision_key_transition_allowed "$k" "$FM_SEND_RESOLVE_NOTE_VERB: "; then
+      echo "error: --resolve-key '$k': that key is in a reserved namespace, so only the library that raised it can close it and this answer's closing line would be discarded, leaving the decision open. Resend the answer without --resolve-key for that key; its owner closes it when the expectation it tracks actually resolves. Nothing was sent." >&2
+      exit 1
+    fi
   done
 fi
 
@@ -375,7 +395,7 @@ fm_send_close_resolved_keys() {  # <answer-text>
   local note=$1 k line
   note=$(printf '%s' "$note" | tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\037\177')
   for k in $RESOLVE_KEYS; do
-    line="resolved [key=$k]: answered: $note"
+    line="resolved [key=$k]: $FM_SEND_RESOLVE_NOTE_VERB: $note"
     fm_cap_line_var "$line"
     if ! printf '%s\n' "$FM_LINE_CAP_LINE" >> "$RESOLVE_STATUS_FILE"; then
       echo "error: the answer was delivered to $T, but decision key '$k' could not be closed in $RESOLVE_STATUS_FILE. Close it manually with: echo 'resolved [key=$k]: <how it was answered>' >> $RESOLVE_STATUS_FILE - do not resend the answer." >&2

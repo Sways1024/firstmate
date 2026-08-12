@@ -21,6 +21,9 @@
 #      message crosses the stubbed ssh transport while the close is the same
 #      local ledger append; a failed transport closes nothing.
 #   7. Flag misuse (--key, empty message, explicit backend target) refuses.
+#   8. A reserved-namespace key is open in the fold yet closable only by the
+#      library that owns it, so the answer path refuses it before typing
+#      anything, and it stays closable by that owner's own vocabulary.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -477,6 +480,56 @@ test_already_resolved_key_is_still_refused() {
   pass "fm-send --resolve-key: a key that was open and is now resolved still refuses before anything is sent"
 }
 
+# A reserved-namespace key (bin/fm-classify-lib.sh reserves pending-reply-* to
+# the library that raises it) is genuinely open in the fold, so the open-set
+# check alone accepts it - but the "answered:" line fm-send would append does
+# not speak that namespace's vocabulary, so the fold discards it. Accepting the
+# key would therefore deliver the answer and leave the decision open forever,
+# the exact silent orphan --resolve-key exists to prevent. It must refuse
+# instead, and the owner must still be able to close its own decision.
+test_reserved_namespace_key_refuses_before_send() {
+  local dir fb log home err rc out corr key
+  dir="$TMP_ROOT/reserved"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); log="$dir/send.log"; err="$dir/send.err"
+  home=$(setup_home reserved)
+  corr=abcdef0123456789
+  key="pending-reply-$corr"
+  fm_write_secondmate_meta "$home/state/domain.meta" "$home" "sess:fm-domain"
+  printf 'blocked [key=%s]: pending-reply-missed: task=domain pending-reply-id=%s request=review the ios build\n' \
+    "$key" "$corr" > "$home/state/domain.status"
+
+  out=$(drain_out "$home")
+  printf '%s' "$out" | grep -F "[key=$key]" >/dev/null \
+    || fail "precondition: the reserved-key escalation should list as open: $out"
+
+  : > "$log"
+  env PATH="$fb:$PATH" \
+    FM_ROOT_OVERRIDE="$home" FM_HOME="$home" FM_SEND_LOG="$log" FM_SEND_SETTLE=0 \
+    "$SEND" fm-domain --resolve-key "$key" "repost through the parent channel" \
+    >/dev/null 2>"$err"; rc=$?
+  [ "$rc" -ne 0 ] || fail "a reserved-namespace key should refuse instead of orphaning its decision"
+  assert_contains "$(cat "$err")" "--resolve-key '$key'" "the refusal should name the reserved key"
+  assert_contains "$(cat "$err")" "reserved namespace" "the refusal should say why the key is not closable here"
+  assert_contains "$(cat "$err")" "Nothing was sent." "the refusal should state nothing was sent"
+  [ ! -s "$log" ] || fail "a refused reserved-key answer still typed text: $(cat "$log")"
+  if grep -F 'resolved' "$home/state/domain.status" >/dev/null; then
+    fail "a refused reserved-key answer still appended a closing line: $(cat "$home/state/domain.status")"
+  fi
+  out=$(drain_out "$home")
+  printf '%s' "$out" | grep -F "[key=$key]" >/dev/null \
+    || fail "the reserved decision must still be open after the refusal: $out"
+
+  # The refusal must not strand the decision: its owner speaks the namespace
+  # vocabulary the fold honors, so the owner's own close still lands.
+  printf 'resolved [key=%s]: pending-reply-resolved: task=domain pending-reply-id=%s via=status\n' \
+    "$key" "$corr" >> "$home/state/domain.status"
+  out=$(drain_out "$home")
+  if printf '%s' "$out" | grep -F "[key=$key]" >/dev/null; then
+    fail "the owning library's own close was not honored by the fold: $out"
+  fi
+  pass "fm-send --resolve-key: a reserved-namespace key refuses before sending and stays closable by its owner"
+}
+
 test_answer_send_closes_open_decision
 test_every_listed_key_round_trips_from_the_listing
 test_already_resolved_key_is_still_refused
@@ -489,3 +542,4 @@ test_local_secondmate_answer_marked_and_closed
 test_remote_secondmate_answer_closes_locally
 test_remote_transport_failure_does_not_close
 test_flag_misuse_refuses
+test_reserved_namespace_key_refuses_before_send

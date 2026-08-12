@@ -157,7 +157,11 @@ status_is_paused_or_captain_held() {  # <status-line>
 # Who WRITES the closing line is owned elsewhere: the answering firstmate closes
 # at answer time through fm-send's --resolve-key (bin/fm-send.sh header), and a
 # worker self-closes only a blocker that cleared without an answer (bin/fm-brief.sh
-# rule 6), so closure never depends on a busy worker's discipline.
+# rule 6), so closure never depends on a busy worker's discipline. The one
+# exception is a key in a reserved namespace (see the reserved-key rule below):
+# only its owning library speaks the vocabulary this fold honors for it, so
+# fm-send refuses --resolve-key for such a key rather than writing a close this
+# fold would discard.
 #
 # Decision key grammar (backward-compatible with the existing "<verb>: <note>"
 # format): an OPTIONAL "[key=<slug>]" token sits between the verb and the colon,
