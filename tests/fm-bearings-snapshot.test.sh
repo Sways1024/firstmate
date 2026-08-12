@@ -26,10 +26,31 @@ make_fakebin() {  # <dir>
 [ "${FAKE_NM_SLEEP:-0}" = 1 ] && sleep 30
 exit 0
 SH
+  # `dead-` in a target is this suite's marker for a closed endpoint. Endpoint
+  # presence is served from the session inventory, not from display-message,
+  # because that is where the real backend decides it: real tmux answers an
+  # absent target from the client's active window and still exits 0, so
+  # bin/backends/tmux.sh requires the exact window to appear in a successful
+  # `list-windows` before it trusts a target. The inventory is derived from the
+  # windows this home actually recorded, so it tracks the fixtures rather than
+  # duplicating their names here.
   cat > "$fb/tmux" <<'SH'
 #!/usr/bin/env bash
 case "${1:-}" in
   display-message) case "$*" in *dead-*) exit 1 ;; *) printf '%%1\n' ;; esac ;;
+  list-windows)
+    session=${3:-}
+    for meta in "${FM_HOME:-}"/state/*.meta; do
+      [ -e "$meta" ] || continue
+      window=$(sed -n 's/^window=//p' "$meta" | tail -1)
+      case "$window" in
+        "$session":*) name=${window#*:} ;;
+        *) continue ;;
+      esac
+      case "$name" in *dead-*) continue ;; esac
+      printf '%s\n' "$name"
+    done
+    ;;
   capture-pane)
     case "$*" in
       *fm-domain-alpha*) printf 'stale terminal summary: Phase 7 started\n> \n' ;;
