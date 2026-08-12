@@ -493,6 +493,16 @@ ok - forced secondmate teardown retains Herdr child identity until exact pane di
 ok - forced teardown retains a nested secondmate home and its grandchild's Herdr identity when the grandchild close is unconfirmed
 ```
 
+A projected task's pane is itself one of the leaked worktree processes teardown reaps: the pane shell's cwd is the task worktree.
+Instrumenting the whole projection suite on 2026-08-12 against Herdr 0.8.0 measured the pane as already gone at every single projected teardown's close decision, killed by teardown's own reap one step earlier, which is before the session presentation lock is taken and outside the locked close that owns the exact-tab restore.
+At or above the presentation floor that pane-death removal preserves the active workspace, so nothing was visible there; below it the same removal carries the captain's active workspace off to another one whenever the disposable workspace sat before it, with no close left to restore it.
+Teardown therefore captures the exact active workspace and tab before the reap and restores them under the session lock after the close, which is a verified no-op at or above the floor and the only restore below it.
+That restore is pinned portably, with the pane shell modelled as a real reaped worktree process and no Herdr installed:
+
+```sh
+tests/fm-teardown.test.sh
+```
+
 ### Secondmate pane-takeover gate
 
 A Herdr pane is created as a bare shell, and a secondmate spawn has no worktree cwd-settle gate to prove that shell still owns the pane before the launch command is typed into it.
