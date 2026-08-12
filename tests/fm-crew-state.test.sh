@@ -79,13 +79,31 @@ case "${1:-}" in
 esac
 exit 0
 SH
+  # `display-message` deliberately succeeds even for an absent target, because
+  # that is what REAL tmux does - it answers from the client's active window and
+  # still exits 0 (proven end to end against a real server in the
+  # tests/fm-crew-state-tmux-endpoint block at the end of this file). An earlier
+  # version of this fake exited 1 for a missing endpoint, so the whole suite
+  # asserted a nonzero exit real tmux never produces, and a gone tmux endpoint
+  # reading as `working` survived undetected. Endpoint presence is therefore
+  # served the way the real backend decides it: from the session inventory.
   cat > "$fb/tmux" <<'SH'
 #!/usr/bin/env bash
 set -u
 case "${1:-}" in
   display-message)
-    [ "${FM_FAKE_TMUX_MISSING:-0}" = 1 ] && exit 1
-    printf '%%1\n' ;;
+    # Format-aware only for pane_tty, so the liveness probe's `ps -t` lands on a
+    # tty that cannot exist and the fake pane's verdict stays deterministic.
+    case "$*" in
+      *'#{pane_tty}'*) printf '/dev/fmfaketty\n' ;;
+      *) printf '%%1\n' ;;
+    esac ;;
+  list-windows)
+    if [ "${FM_FAKE_TMUX_MISSING:-0}" = 1 ]; then
+      printf "can't find session: %s\n" "${3:-}" >&2
+      exit 1
+    fi
+    printf '%s\n' "${FM_FAKE_TMUX_WINDOW:-}" ;;
   capture-pane)
     [ "${FM_FAKE_TMUX_MISSING:-0}" = 1 ] && exit 1
     if [ "${FM_FAKE_BUSY:-0}" = 1 ]; then printf 'work in progress\n%s\n' "${FM_FAKE_BUSY_TEXT:-esc to interrupt}"
@@ -138,9 +156,12 @@ make_no_timeout_toolbin() {  # <dir> -> echoes toolbin path
 }
 
 # Run the helper for one case dir. FM_FAKE_* env (run output, busy flag) are read
-# from the caller's environment by the fakes above.
+# from the caller's environment by the fakes above. The fake session inventory is
+# seeded with this task's own recorded window, which is the `fm:fm-<id>` every
+# case below writes, so a present endpoint needs no per-test wiring.
 run_crew_state() {  # <case-dir> <id>
-  PATH="$1/fakebin:$PATH" FM_STATE_OVERRIDE="$1/state" "$CREW_STATE" "$2"
+  PATH="$1/fakebin:$PATH" FM_STATE_OVERRIDE="$1/state" \
+    FM_FAKE_TMUX_WINDOW="${FM_FAKE_TMUX_WINDOW:-fm-$2}" "$CREW_STATE" "$2"
 }
 
 new_case() {  # <name> -> echoes case dir with an empty state/
@@ -166,11 +187,12 @@ reset_fakes() {
   FM_FAKE_BUSY=0
   FM_FAKE_BUSY_TEXT=
   FM_FAKE_TMUX_MISSING=0
+  FM_FAKE_TMUX_WINDOW=
   FM_FAKE_HERDR_BUSY=0
   FM_FAKE_HERDR_MISSING=0
   FM_FAKE_HERDR_AGENT_STATUS=""
   FM_FAKE_CI_LOGS=""
-  export FM_FAKE_AXI_STATUS FM_FAKE_AXI_STATUS_RUN FM_FAKE_RUNS_LIST FM_FAKE_BUSY FM_FAKE_BUSY_TEXT FM_FAKE_TMUX_MISSING
+  export FM_FAKE_AXI_STATUS FM_FAKE_AXI_STATUS_RUN FM_FAKE_RUNS_LIST FM_FAKE_BUSY FM_FAKE_BUSY_TEXT FM_FAKE_TMUX_MISSING FM_FAKE_TMUX_WINDOW
   export FM_FAKE_HERDR_BUSY FM_FAKE_HERDR_MISSING FM_FAKE_HERDR_AGENT_STATUS FM_FAKE_CI_LOGS
 }
 
@@ -1047,6 +1069,70 @@ test_dead_window_ignores_stale_status_log() {
   pass "dead window ignores stale status log"
 }
 
+# --- gone tmux endpoint must never read `working` ----------------------------
+#
+# The regression these exist for: the guard above was a bare
+# `tmux display-message`, which real tmux answers from the client's active
+# window with exit 0, so no gone tmux endpoint ever failed it. Execution reached
+# the busy verdict instead - a FILE, not a pane - and a worker killed without a
+# lifecycle close event (a hard machine crash) left that record pinned at busy.
+# The helper then reported `working` for a dead worker, so the watcher absorbed
+# its signals and first-sight stale wakes as provably working and supervision
+# reported the opposite of the truth until the busy-turn age bound expired.
+#
+# Every case here arms a busy record first, so a regression cannot pass by the
+# endpoint simply having no state to report: the ONLY thing standing between
+# the busy record and a `working` verdict is the endpoint guard.
+gone_endpoint_case() {  # <case-name> <id> <window> -> echoes the helper's line
+  local d id=$2
+  d=$(new_case "$1")
+  make_repo_on_branch "$d/wt" "fm/$id"
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/$id.meta" "window=$3" "worktree=$d/wt" "kind=ship" "harness=claude"
+  local gen; gen=$("$ROOT/bin/fm-busy-event.sh" arm "$d/state" "$id")
+  "$ROOT/bin/fm-busy-event.sh" apply "$d/state" "$id" busy --gen "$gen" \
+    --source claude-hook --event user-prompt-submit
+  FM_FAKE_AXI_STATUS=""
+  FM_FAKE_RUNS_LIST=""
+  run_crew_state "$d" "$id"
+}
+
+# Shape 1: the whole tmux session is gone. Real tmux fails the session inventory
+# with a definitive "can't find session", while display-message still exits 0.
+test_gone_tmux_session_is_not_working() {
+  reset_fakes
+  FM_FAKE_TMUX_MISSING=1
+  local out; out=$(gone_endpoint_case gone-session gone-sess 'nosuch:fm-gone-sess')
+  assert_contains "$out" "state: unknown" "gone tmux session -> unknown"
+  assert_contains "$out" "backend target gone" "gone tmux session names the gone endpoint"
+  assert_not_contains "$out" "state: working" "a gone tmux session must never read working"
+  pass "a gone tmux session reads unknown, never working"
+}
+
+# Shape 2: the session is alive but this crew's window is gone. This is the
+# dangerous one - real tmux resolves the absent window to a DIFFERENT live pane
+# and exits 0, so only exact window membership in the inventory can catch it.
+test_gone_tmux_window_in_live_session_is_not_working() {
+  reset_fakes
+  FM_FAKE_TMUX_WINDOW=fm-some-other-crew
+  local out; out=$(gone_endpoint_case gone-window gone-win 'fm:fm-gone-win')
+  assert_contains "$out" "state: unknown" "gone window in a live session -> unknown"
+  assert_contains "$out" "backend target gone" "gone window names the gone endpoint"
+  assert_not_contains "$out" "state: working" "a gone window must never read working"
+  pass "a gone window in a live session reads unknown, never working"
+}
+
+# Shape 3: a wholly bogus recorded target. Real tmux resolves it to the active
+# window and exits 0 just the same, so an unreadable target must stay unknown.
+test_bogus_tmux_target_is_not_working() {
+  reset_fakes
+  local out; out=$(gone_endpoint_case bogus-target bogus-t 'bogus')
+  assert_contains "$out" "state: unknown" "bogus tmux target -> unknown"
+  assert_contains "$out" "backend target gone" "bogus tmux target names the gone endpoint"
+  assert_not_contains "$out" "state: working" "a bogus tmux target must never read working"
+  pass "a bogus tmux target reads unknown, never working"
+}
+
 # A closed/unreadable pane must NOT mask an authoritative run-step: judge by the
 # run-step, not the shell. The common case is a finished crew whose agent has
 # exited and closed its window (the normal gap between completion and teardown) -
@@ -1106,7 +1192,8 @@ SH
   "$ROOT/bin/fm-busy-event.sh" apply "$d/state" feat-timeout busy --gen "$gen" \
     --source claude-hook --event user-prompt-submit
   start=$SECONDS
-  out=$(FM_FAKE_NM_CALLS="$calls_file" PATH="$d/fakebin:$toolbin" FM_STATE_OVERRIDE="$d/state" FM_CREW_STATE_NM_TIMEOUT=1 "$CREW_STATE" feat-timeout)
+  out=$(FM_FAKE_NM_CALLS="$calls_file" PATH="$d/fakebin:$toolbin" FM_STATE_OVERRIDE="$d/state" \
+    FM_FAKE_TMUX_WINDOW=fm-feat-timeout FM_CREW_STATE_NM_TIMEOUT=1 "$CREW_STATE" feat-timeout)
   elapsed=$((SECONDS - start))
   assert_contains "$out" "state: working" "timed-out no-mistakes falls back to pane"
   assert_contains "$out" "source: pane" "timed-out no-mistakes -> pane source"
@@ -1290,6 +1377,107 @@ test_local_advanced_past_run_head_invalidates() {
   pass "local work advanced past run head invalidates attribution"
 }
 
+# --- the same three shapes against a REAL tmux server ------------------------
+#
+# tests/fm-crew-state-tmux-endpoint: the fake above can only confirm the
+# assumption written into it, and an earlier fake asserting a nonzero exit real
+# tmux never produces is exactly why a gone tmux endpoint reading as `working`
+# survived. These cases therefore drive bin/fm-crew-state.sh against a REAL tmux
+# server on a private socket (`-L`), so the host's own sessions are never
+# touched and no harness or credentials are needed. The `no-mistakes` fake is
+# still used, because the endpoint guard is only reached when no run is
+# attributed. Same private-socket pattern as
+# tests/fm-tmux-agent-liveness.test.sh.
+TMUX_BIN=$(command -v tmux 2>/dev/null || true)
+TMUX_SOCKET="fm-crewstate-$$"
+
+# This replaces tests/lib.sh's own EXIT trap, so it must call fm_test_cleanup
+# itself (tests/lib.sh's "define your own EXIT trap and call fm_test_cleanup
+# from inside it" contract) or the case dirs stop being reaped.
+real_tmux_cleanup() {
+  [ -n "$TMUX_BIN" ] && "$TMUX_BIN" -L "$TMUX_SOCKET" kill-server >/dev/null 2>&1
+  fm_test_cleanup
+}
+trap real_tmux_cleanup EXIT
+trap 'real_tmux_cleanup; exit 130' INT
+trap 'real_tmux_cleanup; exit 143' TERM
+
+# A case dir whose fake `tmux` is a shim onto the private socket, so every tmux
+# call bin/fm-crew-state.sh makes reaches a real server and nothing else.
+make_real_tmux_case() {  # <name> <id> -> echoes case dir
+  local d id=$2 fb
+  d=$(new_case "$1")
+  make_repo_on_branch "$d/wt" "fm/$id"
+  fb=$(make_fakebin "$d")
+  printf '#!/usr/bin/env bash\nexec %s -L %s "$@"\n' "$TMUX_BIN" "$TMUX_SOCKET" > "$fb/tmux"
+  chmod +x "$fb/tmux"
+  printf '%s\n' "$d"
+}
+
+# Arm a busy record, so the only thing between it and a `working` verdict is the
+# endpoint guard - the same non-vacuity property the fake cases above rely on.
+arm_busy_record() {  # <state-dir> <id>
+  local gen; gen=$("$ROOT/bin/fm-busy-event.sh" arm "$1" "$2")
+  "$ROOT/bin/fm-busy-event.sh" apply "$1" "$2" busy --gen "$gen" \
+    --source claude-hook --event user-prompt-submit
+}
+
+test_real_tmux_endpoint_shapes() {
+  reset_fakes
+  if [ -z "$TMUX_BIN" ]; then
+    echo "skip - real tmux endpoint cases (tmux not found)"
+    return 0
+  fi
+  local d out id=live-crew session=fmlive
+  d=$(make_real_tmux_case real-tmux "$id") || fail "could not build the real-tmux case"
+  "$d/fakebin/tmux" new-session -d -s "$session" -n "fm-$id" -c "$d/wt" 'sleep 120' \
+    || fail "could not start the private tmux server"
+
+  # First, prove the premise the whole fix rests on, against the real server:
+  # display-message succeeds for all three gone shapes, so the old guard could
+  # never have fired. Asserting this keeps the cases below from going vacuous if
+  # tmux ever changes that behavior.
+  local shape
+  for shape in "$session:fm-no-such-window" "nosuch:fm-t" "bogus"; do
+    "$d/fakebin/tmux" display-message -p -t "$shape" '#{pane_id}' >/dev/null 2>&1 \
+      || fail "premise broken: real tmux failed display-message for '$shape'"
+  done
+
+  # A live, readable endpoint keeps its existing verdict unchanged.
+  fm_write_meta "$d/state/$id.meta" "window=$session:fm-$id" "worktree=$d/wt" \
+    "kind=ship" "harness=claude"
+  arm_busy_record "$d/state" "$id"
+  out=$(PATH="$d/fakebin:$PATH" FM_STATE_OVERRIDE="$d/state" "$CREW_STATE" "$id")
+  assert_contains "$out" "state: working" "a live real-tmux endpoint still reads working"
+  assert_contains "$out" "source: pane" "a live real-tmux endpoint still reports the pane source"
+  assert_contains "$out" "claude-hook" "a live real-tmux endpoint still names its semantic source"
+
+  # Shape 2: the session is alive, this crew's window is gone. Real tmux
+  # resolves it to the live pane above and exits 0.
+  fm_write_meta "$d/state/$id.meta" "window=$session:fm-no-such-window" "worktree=$d/wt" \
+    "kind=ship" "harness=claude"
+  out=$(PATH="$d/fakebin:$PATH" FM_STATE_OVERRIDE="$d/state" "$CREW_STATE" "$id")
+  assert_contains "$out" "state: unknown" "real tmux: gone window in a live session -> unknown"
+  assert_not_contains "$out" "state: working" "real tmux: a gone window must never read working"
+
+  # Shape 3: a wholly bogus recorded target.
+  fm_write_meta "$d/state/$id.meta" "window=bogus" "worktree=$d/wt" "kind=ship" "harness=claude"
+  out=$(PATH="$d/fakebin:$PATH" FM_STATE_OVERRIDE="$d/state" "$CREW_STATE" "$id")
+  assert_contains "$out" "state: unknown" "real tmux: bogus target -> unknown"
+  assert_not_contains "$out" "state: working" "real tmux: a bogus target must never read working"
+
+  # Shape 1: the whole session is gone. Kill the server last, so the live-endpoint
+  # assertion above ran against a genuinely live one.
+  fm_write_meta "$d/state/$id.meta" "window=$session:fm-$id" "worktree=$d/wt" \
+    "kind=ship" "harness=claude"
+  "$d/fakebin/tmux" kill-server >/dev/null 2>&1 || true
+  out=$(PATH="$d/fakebin:$PATH" FM_STATE_OVERRIDE="$d/state" "$CREW_STATE" "$id")
+  assert_contains "$out" "state: unknown" "real tmux: gone session -> unknown"
+  assert_not_contains "$out" "state: working" "real tmux: a gone session must never read working"
+
+  pass "real tmux: gone session, gone window, and bogus target never read working"
+}
+
 test_missing_run_head_falls_back_to_current_state() {
   reset_fakes
   local d out
@@ -1345,6 +1533,10 @@ test_no_run_idle_pane_paused
 test_no_run_idle_pane_custom_paused_verb
 test_no_run_idle_secondmate_resolved_event_not_state
 test_dead_window_ignores_stale_status_log
+test_gone_tmux_session_is_not_working
+test_gone_tmux_window_in_live_session_is_not_working
+test_bogus_tmux_target_is_not_working
+test_real_tmux_endpoint_shapes
 test_dead_window_still_reports_terminal_run_step
 test_dead_window_still_reports_active_run_step
 test_no_timeout_uses_perl_bound

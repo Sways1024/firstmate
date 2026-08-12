@@ -144,12 +144,31 @@ LOG_VERB=$(status_line_verb "$LOG_LINE")
 # state (e.g. done) instead of being masked as unknown. Backend-aware
 # (fm_backend_of_meta defaults absent backend= to tmux, the P1 contract): a
 # herdr task is read through fm_backend_capture instead of a bare tmux probe.
+#
+# The tmux arm must NOT be a bare `tmux display-message`: tmux answers an absent
+# target from the client's active window and still exits 0, so such a probe
+# reports every gone endpoint as readable and the guard below never fires. That
+# hazard and the exact-window-membership rule that defeats it are owned by
+# bin/backends/tmux.sh's fm_backend_tmux_agent_state, reached here through
+# fm_backend_agent_state, so this stays a cross-reference rather than a second
+# copy of the rule. Only its two negative verdicts mean "cannot read this
+# endpoint": `missing` (the inventory succeeded and omits the exact window, or
+# the session/server is authoritatively absent) and `unreadable` (a malformed
+# target, or an inventory read that failed for a non-definitive reason - the
+# case the old probe also failed, so unknown stays the answer). `alive`, `dead`,
+# and `ambiguous` all mean the recorded endpoint IS present, and each keeps its
+# existing verdict from the busy and status-log paths below.
 TASK_BACKEND=$(fm_backend_of_meta "$META")
 BACKEND_TARGET=$(fm_backend_target_of_meta "$META")
 EXPECTED_LABEL="fm-$ID"
 pane_readable() {  # <target>
   case "$TASK_BACKEND" in
-    tmux) tmux display-message -p -t "$1" '#{pane_id}' >/dev/null 2>&1 ;;
+    tmux)
+      case "$(fm_backend_agent_state tmux "$1")" in
+        missing|unreadable) return 1 ;;
+        *) return 0 ;;
+      esac
+      ;;
     *) fm_backend_capture "$TASK_BACKEND" "$1" 1 "$EXPECTED_LABEL" >/dev/null 2>&1 ;;
   esac
 }
@@ -558,9 +577,14 @@ fi
 # FM_CLASSIFY_RESOLVE_VERB), and any future decision-only sibling - is NOT a state:
 # it exists solely to CLOSE a keyed decision in the durable fold, so a trailing
 # resolved: must never become the current state or leak its resolution prose as the
-# detail. Skipping it lets a just-resolved idle crew (typically a secondmate, which
-# has no busy check above) fall through to the idle default instead of rendering
-# `unknown` with the resolution note as `doing`. map_log_state is the single owner of
+# detail. There is no idle state in the emitted vocabulary
+# (working|parked|done|blocked|paused|failed|unknown), so a just-resolved idle crew
+# (typically a secondmate, which has no busy check above) reaches the final
+# `unknown ... no current-state source available` below. That is the intended
+# outcome: skipping the verb buys an honest "cannot tell" instead of `unknown`
+# carrying the resolution note as `doing`, not a fall-through to any idle default.
+# Telling "quiet and fine" apart from "cannot tell" would need a real idle state
+# added to that vocabulary. map_log_state is the single owner of
 # the verb->state mapping (including the configurable paused verb), so reusing its
 # `unknown` verdict as the "not a state" test needs no second verb list here.
 if [ -n "$LOG_VERB" ]; then

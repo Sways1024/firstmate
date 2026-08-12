@@ -924,12 +924,21 @@ fm_backend_composer_state() {  # <backend> <target> -> empty|pending|pending-unp
 # going through fm_backend_herdr_target_ready (which auto-starts the herdr
 # server as a side effect via fm_backend_herdr_server_ensure - fine for an
 # operation that is about to use the pane, wrong for a passive liveness
-# probe). A gone tmux window or an unqueryable herdr pane (server down, pane
-# closed), missing zellij pane, or unreadable Orca terminal simply fails, which
-# IS "does not exist" for this purpose.
-# Mirrors fm-crew-state.sh's pane_readable check; exists here as one shared
-# primitive so callers that only need a fast alive/dead read (recovery
-# digests, the session-start fleet digest) do not re-derive it inline.
+# probe). An unqueryable herdr pane (server down, pane closed), missing zellij
+# pane, or unreadable Orca terminal simply fails, which IS "does not exist" for
+# this purpose. Exists as one shared primitive so callers that only need a fast
+# alive/dead read (recovery digests, the session-start fleet digest) do not
+# re-derive it inline.
+#
+# KNOWN GAP, tmux arm only: a gone tmux window does NOT fail here. Real tmux
+# answers an absent target from the client's active window and still exits 0
+# (bin/backends/tmux.sh's fm_backend_tmux_agent_state owns that hazard and the
+# exact-window-membership rule that defeats it), so this arm reports a gone
+# window, a gone session, and a malformed target alike as present.
+# fm-crew-state.sh's pane_readable no longer shares this arm for exactly that
+# reason - it reads the tmux endpoint through fm_backend_agent_state instead -
+# so the two are deliberately no longer mirrors. Closing the gap here is a
+# separate change: every caller above would change behavior with it.
 fm_backend_target_exists() {  # <backend> <target> [expected-label]
   local backend=$1 target=$2 expected_label=${3:-} session pane
   case "$backend" in
