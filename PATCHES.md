@@ -19,9 +19,12 @@ registered in `bin/fm-test-run.sh`'s changed-test map and in
 `docs/documentation-audiences.json`, because `--changed` verification dies on
 any unmapped/unclassified file — it previously aborted before selecting a
 single test, so earlier "verified with --changed" runs never actually ran.
-Both workflows in `.github/workflows/` now trigger on `patched` as well as `main`, so this fork's CI actually runs.
-They were filtered to `main` alone, which nothing on this fork has ever matched, so no workflow run had ever executed here and every pull request reported zero configured checks.
+Both workflows in `.github/workflows/` now trigger on `patched` as well as `main`.
+They triggered on `main` alone before, so pushes to `patched` and pull requests targeting `patched` were never covered, and adding `patched` closes exactly that gap and nothing more.
 `patched` is added alongside `main` rather than replacing it, because these files are shared with upstream, where `main` really is the default branch: adding a branch that upstream does not have changes nothing for upstream and keeps the diff to one token per trigger list, whereas replacing `main` would disable upstream CI and conflict on every rebase.
+The trigger lists are not what explains this fork having produced no workflow run to date: `main` is also GitHub's default branch for `Sways1024/firstmate` and sits at pristine upstream `833a9a2` while `patched` is the fork's working branch, and the open pull requests target base `main`, so they did match the old filter.
+The absence of runs is explained instead by the fork's workflows never having been registered or enabled: the GitHub API reports Actions permissions enabled while both the workflow list and the run list are empty.
+Enabling them is a repository-settings action for the owner and is handled separately, so this fork's CI does not run yet.
 
 Verification lesson worth keeping: the first cut of the #1912 secondmate guard
 reused the pane-CLOSE idle-shell proof, which demands a shell with no child
