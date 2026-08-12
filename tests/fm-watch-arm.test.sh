@@ -88,7 +88,13 @@ test_attached_arm_reports_the_delivered_wake() {
   expect_code 0 "$status" "an attached arm whose cycle delivered a wake must close successfully"
   grep -q 'reason=attached-delivered-wake' "$state/.watch-cycle-exits.log" \
     || fail "the delivered-wake close was not classified in the lifecycle ledger"
-  pass "watch-arm: an attached arm reports the wake its cycle delivered instead of a false failure"
+  # The ledger must also name the wake's SUBJECT, not just its class: without it
+  # a burst of stale wakes cannot be attributed to a task from this log alone,
+  # and state/.watch-deliveries.log is a rolling window that may already have
+  # aged the burst out. `signal:` wakes key on the task id.
+  grep -q "$(printf 'wake_key=demo\t')" "$state/.watch-cycle-exits.log" \
+    || fail "the delivered wake's subject was not recorded in the lifecycle ledger: $(cat "$state/.watch-cycle-exits.log")"
+  pass "watch-arm: an attached arm reports the wake its cycle delivered instead of a false failure, and records its subject"
 }
 
 test_attached_arm_reports_the_delivered_wake_after_drain() {

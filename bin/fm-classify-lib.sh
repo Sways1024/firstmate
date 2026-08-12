@@ -649,6 +649,27 @@ crew_is_provably_working() {  # <id>
   [ "$(crew_absorb_class "$1")" = working ]
 }
 
+# 0 iff crew <id>'s AUTHORITATIVE current state is working because an attributed
+# no-mistakes run step is active - the crew handed its branch to a background
+# validation, so its quiet pane is the expected shape of that wait rather than a
+# wedge. Deliberately narrower than crew_is_provably_working: `source: pane` (a
+# busy harness turn) does NOT satisfy it, so the busy-turn duration bound
+# (BUSY_TURN_MAX_SECS) is unaffected - that bound exists precisely to put a
+# ceiling on a busy pane, and widening this predicate would disable it.
+# Like crew_absorb_class it is NOT a pure read (fm-crew-state.sh may make a
+# bounded no-mistakes call), so its one caller consults it only at escalation
+# time - at most once per FM_STALE_ESCALATE_SECS per task, never per poll.
+# Prints the run detail on stdout for the caller's triage line.
+crew_run_step_working() {  # <id>
+  local id=$1 line
+  [ -n "$id" ] || return 1
+  line=$("$FM_CREW_STATE_BIN" "$id" 2>/dev/null) || return 1
+  case "$line" in
+    'state: working'*'source: run-step'*) printf '%s' "${line#*source: }"; return 0 ;;
+  esac
+  return 1
+}
+
 # 0 if crew <id>'s authoritative current state is a declared external-wait pause.
 # The stale path absorbs such a crew (on a long re-surface cadence) instead of
 # escalating a possible wedge.

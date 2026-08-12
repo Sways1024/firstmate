@@ -31,13 +31,21 @@
 #                          wake payload itself, not just repetition, forces a
 #                          closer look instead of another routine supervision
 #                          resume. Before any wedge escalation fires, the timer
-#                          re-consults the semantic busy contract and a cheap
-#                          per-task progress fingerprint (see wedge_timer_check),
-#                          so a worker the harness lifecycle proves mid-turn, or
-#                          one showing busy-record/status-log progress since the
-#                          last escalation, extends the timer and resets the
-#                          streak instead of escalating on elapsed time alone.
-#                          Unless afk is active. A genuinely busy pane
+#                          re-consults the semantic busy contract, a cheap
+#                          per-task progress fingerprint, and the authoritative
+#                          run-step read (see wedge_timer_check), so a worker
+#                          the harness lifecycle proves mid-turn, or one showing
+#                          busy-record/status-log progress since the last
+#                          escalation, extends the timer and resets the streak
+#                          instead of escalating on elapsed time alone.
+#                          A crew whose attributed no-mistakes run is actively
+#                          working is waiting on a background pipeline, which no
+#                          pane, busy record, or status append can reveal: it
+#                          takes the same treatment as a declared external wait,
+#                          absorbed with the streak reset and re-surfaced once
+#                          per FM_VALIDATION_RESURFACE_SECS as a recheck rather
+#                          than a wedge, so a frozen run is delayed but never
+#                          silenced. Unless afk is active. A genuinely busy pane
 #                          (window_is_busy true) is exempt from the above, but
 #                          only up to BUSY_TURN_MAX_SECS with no completed turn
 #                          (state/<id>.turn-ended, or the spawn record before any
@@ -171,6 +179,14 @@ BUSY_TURN_MAX_SECS=${FM_BUSY_TURN_MAX_SECS:-3600}
 # These cases re-surface once for a recheck every PAUSE_RESURFACE_SECS - far
 # longer than the wedge threshold, but finite so a forgotten hold cannot rot invisibly.
 PAUSE_RESURFACE_SECS=${FM_PAUSE_RESURFACE_SECS:-$FM_PAUSE_RESURFACE_SECS_DEFAULT}
+# How long a crew whose attributed no-mistakes run is actively working may sit
+# on a quiet pane before one recheck surfaces. Same shape and default as the
+# declared-pause cadence above, because an actively-running background
+# validation IS a known external wait: the crew is not going to render anything
+# or append a status line until the run reaches a gate. Finite, so a genuinely
+# frozen run still reaches the supervisor - just once per window instead of
+# every FM_STALE_ESCALATE_SECS (see wedge_timer_check's run-step gate).
+VALIDATION_RESURFACE_SECS=${FM_VALIDATION_RESURFACE_SECS:-$FM_PAUSE_RESURFACE_SECS_DEFAULT}
 # Consecutive event-path failures (fm_backend_wait_transition returning 2 -
 # connect/subscribe failure) before the push fast-path is disabled for the rest
 # of this watcher process and the loop reverts to pure polling (report section
@@ -301,9 +317,11 @@ wedge_progress_signature() {  # <task>
 # hash can be absorbed this way (the plain non-terminal path and the
 # stale_is_terminal-overridden path - a captain-relevant status-log line that
 # an active run/busy pane outranked) plus the busy_turn_over_age bound.
-# Before an escalation fires, two cheap gates run (the costly fm-crew-state
-# read still runs only once, at classification time - it is never repeated
-# here):
+# Before an escalation fires, three gates run. The first two are cheap and run
+# on every escalation attempt; the third is the bounded fm-crew-state read,
+# which runs ONLY here and therefore at most once per STALE_ESCALATE_SECS per
+# task - never per poll, which is the cost that keeps it out of the rest of
+# this function:
 #   1. The semantic busy contract (window_is_busy over bin/fm-busy-lib.sh) is
 #      re-consulted for the stale-classified call sites: a worker whose
 #      harness lifecycle proves a turn is open NOW is not a wedge, so the
@@ -318,9 +336,22 @@ wedge_progress_signature() {  # <task>
 #      healthy long-running worker cannot ratchet to demand-deep-inspection
 #      by accumulating quiet periods. Only an unchanged fingerprint keeps the
 #      consecutive count growing.
+#   3. The authoritative run-step read (crew_run_step_working over
+#      bin/fm-crew-state.sh): a crew whose attributed no-mistakes run is
+#      actively running/fixing/ci is waiting on a background pipeline, not
+#      wedged, and neither gate 1 nor gate 2 can see that - the harness turn has
+#      ended, so the busy record reads idle, and the sparse status-reporting
+#      contract means nothing appends to the log while the run works. Such a
+#      crew is treated exactly like a declared external wait: absorbed with the
+#      streak reset, and re-surfaced once per VALIDATION_RESURFACE_SECS as a
+#      recheck rather than a wedge, so the outcome is delayed but never
+#      silenced. The busy-turn callers skip this gate for the same reason they
+#      skip gate 1. Only `source: run-step` qualifies; `source: pane` must not,
+#      or BUSY_TURN_MAX_SECS would be disabled.
 wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-file> [busy-turn]
   local win=$1 since_file=$2 label=$3 escalation_file=$4 guard=${5:-stale}
   local since age n reason task progress_file sig prev_sig
+  local validating_file validating_since validating_age run_detail
   since=$(cat "$since_file" 2>/dev/null || true)
   case "$since" in
     ''|*[!0-9]*)
@@ -338,6 +369,41 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
           triage_log "absorbed $label (busy contract says working - wedge timer extended, streak reset): $win"
           return 0
         fi
+        # Gate 3, the authoritative run-step read. A crew that handed its branch
+        # to a no-mistakes run has a quiet pane BY DESIGN: nothing renders, the
+        # harness turn has ended so the busy record reads idle (gate 1 passes),
+        # and the sparse status-reporting contract produces no new append, so
+        # the progress fingerprint below never moves either (gate 2 passes).
+        # Escalating on that is exactly wrong, and it repeats every
+        # STALE_ESCALATE_SECS for as long as the run takes. So consult the ONE
+        # signal that actually distinguishes "waiting on a background pipeline"
+        # from "wedged", and treat a working run the way a declared external
+        # wait is already treated: extend the timer, reset the streak, and
+        # re-surface once per VALIDATION_RESURFACE_SECS with a recheck reason
+        # rather than a wedge reason. Finite, not silent - a genuinely frozen
+        # run still reaches the supervisor, on the long cadence.
+        # This read is consulted ONLY here, so it costs at most one bounded
+        # fm-crew-state call per STALE_ESCALATE_SECS per task; the per-poll cost
+        # that keeps it out of the rest of this function does not apply.
+        # The busy-turn callers skip it for the same reason they skip gate 1:
+        # BUSY_TURN_MAX_SECS exists to bound a signal this gate would re-trust.
+        validating_file="$escalation_file.validating"
+        if [ "$guard" != busy-turn ] && run_detail=$(crew_run_step_working "$task"); then
+          validating_since=$(cat "$validating_file" 2>/dev/null || true)
+          case "$validating_since" in ''|*[!0-9]*) date +%s > "$validating_file"; validating_since=$(cat "$validating_file") ;; esac
+          validating_age=$(( $(date +%s) - validating_since ))
+          date +%s > "$since_file"
+          rm -f "$escalation_file" "$progress_file"
+          if [ "$validating_age" -ge "$VALIDATION_RESURFACE_SECS" ]; then
+            date +%s > "$validating_file"
+            reason="stale: $win (validating ${validating_age}s, $run_detail - background validation rechecked on a long cadence, not a wedge; confirm the run is still advancing)"
+            fm_wake_append stale "$win" "$reason" || exit 1
+            wake "$reason"
+          fi
+          triage_log "absorbed $label (authoritative run-step working: $run_detail - validation cadence ${validating_age}s): $win"
+          return 0
+        fi
+        rm -f "$validating_file"
         sig=$(wedge_progress_signature "$task")
         prev_sig=$(cat "$progress_file" 2>/dev/null || true)
         if [ -n "$prev_sig" ] && [ "$sig" != "$prev_sig" ]; then
@@ -391,7 +457,7 @@ handle_paused_stale() {  # <window> <task> <hash>
   key=$(printf '%s' "$win" | tr ':/.' '___')
   printf '%s' "$h" > "$STATE/.stale-$key"
   : > "$STATE/.paused-$key"
-  rm -f "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key" "$STATE/.wedge-escalations-$key.progress"
+  rm -f "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key" "$STATE/.wedge-escalations-$key.progress" "$STATE/.wedge-escalations-$key.validating"
   statusf="$STATE/$task.status"
   mtime=$(stat_mtime "$statusf")
   case "$mtime" in ''|*[!0-9]*) mtime=$(date +%s) ;; esac
@@ -421,7 +487,7 @@ clear_pause_tracking() {  # <window>
   key=${key//\//_}
   key=${key//./_}
   clear_pause_state "$win"
-  rm -f "$STATE/.stale-$key" "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key" "$STATE/.wedge-escalations-$key.progress"
+  rm -f "$STATE/.stale-$key" "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key" "$STATE/.wedge-escalations-$key.progress" "$STATE/.wedge-escalations-$key.validating"
 }
 
 # Reconcile a declared pause or captain-held status with authoritative crew state.
@@ -1133,7 +1199,7 @@ EOF
         if [ "$busy_now" -eq 0 ] && busy_turn_over_age "$task"; then
           wedge_timer_check "$w" "$ssf" "busy (no completed turn)" "$ewf" busy-turn
         else
-          rm -f "$ssf" "$ewf" "$ewf.progress"
+          rm -f "$ssf" "$ewf" "$ewf.progress" "$ewf.validating"
         fi
         if [ -e "$pf" ] && { [ "$n" -ge 2 ] || ! status_is_paused_or_captain_held "$(last_status_line "$STATE/$(window_to_task "$w" "$STATE").status")"; }; then
           clear_pause_tracking "$w"
@@ -1145,7 +1211,7 @@ EOF
       if [ "$busy_now" -eq 0 ] && busy_turn_over_age "$task"; then
         wedge_timer_check "$w" "$ssf" "busy (no completed turn)" "$ewf" busy-turn
       else
-        rm -f "$ssf" "$ewf" "$ewf.progress"
+        rm -f "$ssf" "$ewf" "$ewf.progress" "$ewf.validating"
       fi
       task=$(window_to_task "$w" "$STATE")
       if ! afk_present && status_is_paused_or_captain_held "$(last_status_line "$STATE/$task.status")" && [ "$busy_now" -ne 0 ]; then

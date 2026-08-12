@@ -46,10 +46,13 @@
 #
 # Every observed watcher cycle appends one tab-separated lifecycle record to
 # state/.watch-cycle-exits.log. The arm layer owns that bounded ledger; it records
-# arm/watcher identities, timestamps, exit/signal classification, beacon age,
-# lock identity before and after close, and successor disposition. The separate
-# state/.watch-triage.log remains exclusively the watcher's absorbed-wake debug
-# log and is never written here.
+# arm/watcher identities, timestamps, exit/signal classification, the delivered
+# wake's reason class and subject (wake_key=, see wake_key_from_reason), beacon
+# age, lock identity before and after close, and successor disposition. Together
+# with state/.watch-deliveries.log - which the watcher owns and which carries the
+# full reason text - this is the durable record of every wake that reached the
+# supervisor. The separate state/.watch-triage.log records ABSORBED wakes only and
+# is never written here, so an escalation's absence from it proves nothing.
 #
 # --restart: stop ONLY this FM_HOME's watcher (the pid recorded in THIS home's
 # state/.watch.lock) and own a fresh cycle, or attach if a verified live peer
@@ -110,6 +113,9 @@ cycle_watcher_identity=none
 cycle_origin=unknown
 cycle_started_at=0
 cycle_lock_before='pid:none|identity:none'
+# Subject of the wake this cycle delivered; see wake_key_from_reason. Reset per
+# cycle so one cycle's key can never be attributed to the next.
+cycle_wake_key=none
 
 cycle_begin() {
   cycle_watcher_pid=$1
@@ -117,6 +123,7 @@ cycle_begin() {
   cycle_watcher_identity=$3
   cycle_started_at=$(date +%s)
   cycle_lock_before=$(lock_snapshot)
+  cycle_wake_key=none
   cycle_active=1
 }
 
@@ -151,7 +158,7 @@ cycle_log_append() {
     sleep 0.02
     i=$((i + 1))
   done
-  printf 'arm_pid=%s\twatcher_pid=%s\torigin=%s\tstarted_at=%s\tended_at=%s\texit_code=%s\tsignal=%s\treason=%s\tbeacon_age=%s\tlock_before=%s\tlock_after=%s\tsuccessor=%s\n' \
+  printf 'arm_pid=%s\twatcher_pid=%s\torigin=%s\tstarted_at=%s\tended_at=%s\texit_code=%s\tsignal=%s\treason=%s\twake_key=%s\tbeacon_age=%s\tlock_before=%s\tlock_after=%s\tsuccessor=%s\n' \
     "$ARM_PID" \
     "$(cycle_clean_field "$cycle_watcher_pid")" \
     "$(cycle_clean_field "$cycle_origin")" \
@@ -160,6 +167,7 @@ cycle_log_append() {
     "$(cycle_clean_field "$exit_code")" \
     "$(cycle_clean_field "$signal")" \
     "$(cycle_clean_field "$reason")" \
+    "$(cycle_clean_field "$cycle_wake_key")" \
     "$beacon_age" \
     "$(cycle_clean_field "$cycle_lock_before")" \
     "$(cycle_clean_field "$lock_after")" \
@@ -298,6 +306,7 @@ close_unobserved_cycle() {
   fi
   fm_lock_release "$WATCH_DELIVERY_LOCK"
   if [ -n "$reason" ]; then
+    cycle_wake_key=$(wake_key_from_reason "$reason")
     printf '%s\n' "$reason"
     return 0
   fi
@@ -365,6 +374,38 @@ watch_output_reason_type() {
     heartbeat*) printf 'actionable-heartbeat' ;;
     *) printf 'none' ;;
   esac
+}
+
+# The delivered wake's SUBJECT, recorded alongside reason= in the cycle ledger so
+# per-task wake rates are answerable from that log alone. Without it the ledger
+# says only how many stale wakes fired, not for which worker, and attributing a
+# burst needs state/.watch-deliveries.log - which is a short rolling window and
+# so is empty exactly when churn has been worst. Bounded and privacy-safe: a
+# window handle, a task id, or a check name, never a full path or reason prose.
+wake_key_from_reason() {  # <reason-line>
+  local reason=$1 first base
+  first=${reason#* }
+  first=${first%% *}
+  case "$reason" in
+    stale:*)     printf '%s' "$(cycle_clean_field "$first")" ;;
+    check:*)     printf '%s' "$(cycle_clean_field "${first%:}")" ;;
+    heartbeat*)  printf 'heartbeat' ;;
+    signal:*)
+      # The listed files are absolute state paths; the task id is the subject.
+      base=${first##*/}
+      base=${base%.status}
+      base=${base%.turn-ended}
+      printf '%s' "$(cycle_clean_field "$base")"
+      ;;
+    *) printf 'none' ;;
+  esac
+}
+
+watch_output_wake_key() {
+  local out=$1 line
+  line=$(grep -E '^(signal:|stale:|check:|heartbeat($|:))' "$out" 2>/dev/null | head -1 || true)
+  [ -n "$line" ] || { printf 'none'; return 0; }
+  wake_key_from_reason "$line"
 }
 
 print_watch_output() {
@@ -457,6 +498,7 @@ owned_child_finished() {
   signal=$(cycle_signal_name "$rc")
   if [ "$rc" -eq 0 ] && watch_output_has_wake "$child_out"; then
     reason_type=$(watch_output_reason_type "$child_out")
+    cycle_wake_key=$(watch_output_wake_key "$child_out")
     cycle_log_append "$rc" "$signal" "$reason_type" none
     print_watch_output "$child_out"
     rm -f "$child_out" 2>/dev/null || true

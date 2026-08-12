@@ -23,10 +23,17 @@ FM_WATCH_DELIVERY_PID=
 FM_WATCH_DELIVERY_IDENTITY=
 WATCH_DELIVERY_LOG="$STATE/.watch-deliveries.log"
 WATCH_DELIVERY_LOCK="$STATE/.watch-deliveries.lock"
-WATCH_DELIVERY_MAX_BYTES=${FM_WATCH_DELIVERY_MAX_BYTES:-65536}
-WATCH_DELIVERY_KEEP_LINES=${FM_WATCH_DELIVERY_KEEP_LINES:-64}
-case "$WATCH_DELIVERY_MAX_BYTES" in ''|*[!0-9]*|0) WATCH_DELIVERY_MAX_BYTES=65536 ;; esac
-case "$WATCH_DELIVERY_KEEP_LINES" in ''|*[!0-9]*|0) WATCH_DELIVERY_KEEP_LINES=64 ;; esac
+# Retention for the delivered-wake record. This log carries the full wake reason
+# text, so it is the only place a wake's escalation count and demand-deep-inspection
+# marker survive - the arm ledger keeps the reason CLASS and subject, not the prose.
+# The original 64-line window held roughly half a day on a quiet fleet and far less
+# during a churn burst, i.e. it emptied exactly when the history mattered most, so a
+# supervision-churn regression could not be measured after the fact. Sized to the
+# other bounded watcher ledgers (the arm cycle log and the triage log) instead.
+WATCH_DELIVERY_MAX_BYTES=${FM_WATCH_DELIVERY_MAX_BYTES:-262144}
+WATCH_DELIVERY_KEEP_LINES=${FM_WATCH_DELIVERY_KEEP_LINES:-1000}
+case "$WATCH_DELIVERY_MAX_BYTES" in ''|*[!0-9]*|0) WATCH_DELIVERY_MAX_BYTES=262144 ;; esac
+case "$WATCH_DELIVERY_KEEP_LINES" in ''|*[!0-9]*|0) WATCH_DELIVERY_KEEP_LINES=1000 ;; esac
 
 watch_delivery_clean_identity() {
   printf '%s' "$1" | tr '\t\r\n' '   '
