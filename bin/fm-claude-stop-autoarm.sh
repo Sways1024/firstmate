@@ -9,7 +9,8 @@
 #
 #   - Scope: only a genuine primary checkout (plain checkout or validly marked
 #     secondmate home) with AGENTS.md, bin/, and the effective state dir - the
-#     exact fm-turnend-guard.sh scope. Child crew/scout worktrees stay inert.
+#     exact fm-turnend-guard.sh scope. Child crew/scout worktrees stay inert,
+#     and a non-primary root is left byte-for-byte untouched.
 #   - Identity: only when THIS session's harness ancestor holds state/.lock.
 #     When an existing numeric owner fails the shared harness-liveness predicate,
 #     the hook delegates guarded recovery to bin/fm-lock.sh and then re-verifies
@@ -70,14 +71,19 @@ case "$AUTOARM_ATTEMPTS" in
   *) AUTOARM_ATTEMPTS=2 ;;
 esac
 
+# Only the side-effect-free scope predicate may be sourced before the scope gate
+# below, because nothing may write outside a genuine primary home. This file is
+# tracked, so it is checked out into every crewmate/scout task worktree of this
+# repo and Claude fires it there on every worker turn end; a lower-precedence
+# settings.local.json adds hooks but never replaces a tracked one, so this gate
+# is the only thing that keeps a task worktree inert. fm-wake-lib.sh creates its
+# resolved state dir at SOURCE time, so sourcing it above the gate would write a
+# state dir into every task worktree AND pre-satisfy the gate's own "state dir
+# exists" condition, leaving it resting on its linked-worktree test alone. Every
+# sibling tracked hook (fm-turnend-guard, fm-subagent-pretool-check,
+# fm-sessionstart-run) already scopes before sourcing anything that writes.
 # shellcheck source=bin/fm-primary-scope-lib.sh
 . "$SCRIPT_DIR/fm-primary-scope-lib.sh"
-# shellcheck source=bin/fm-supervision-lib.sh
-. "$SCRIPT_DIR/fm-supervision-lib.sh"
-# shellcheck source=bin/fm-wake-lib.sh
-. "$SCRIPT_DIR/fm-wake-lib.sh"
-# shellcheck source=bin/fm-session-lock-lib.sh
-. "$SCRIPT_DIR/fm-session-lock-lib.sh"
 
 # Consume the Stop payload once. The decisions below are state-based; the
 # payload is read so a slow writer can never wedge on a full pipe.
@@ -85,6 +91,13 @@ cat >/dev/null 2>&1 || true
 
 # --- scope: genuine primary checkout only -----------------------------------
 fm_primary_scope_matches "$FM_ROOT" "$STATE" || exit 0
+
+# shellcheck source=bin/fm-supervision-lib.sh
+. "$SCRIPT_DIR/fm-supervision-lib.sh"
+# shellcheck source=bin/fm-wake-lib.sh
+. "$SCRIPT_DIR/fm-wake-lib.sh"
+# shellcheck source=bin/fm-session-lock-lib.sh
+. "$SCRIPT_DIR/fm-session-lock-lib.sh"
 
 # --- identity: only the lock-owning session's hooks may arm ------------------
 # A prior session may have died after leaving its numeric harness pid in .lock.

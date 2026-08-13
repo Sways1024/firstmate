@@ -63,6 +63,17 @@ make_crewmate_worktree_dir() {
   printf '%s\n' "$dir"
 }
 
+# Same shape with NO state dir: this file is tracked, so a real crewmate/scout
+# worktree of this repo carries the hook with no state dir of its own until
+# something creates one. $3 = branch name, so several fixtures can coexist.
+make_bare_worktree_dir() {
+  local base=$1 dir=$2 branch=$3
+  fm_git_worktree "$base" "$dir" "$branch"
+  : > "$dir/AGENTS.md"
+  install_autoarm_scripts "$dir"
+  printf '%s\n' "$dir"
+}
+
 # Run the hook as a child of the fake harness holding the fixture home's
 # session lock. $1 = fixture dir. Any extra env assignments must be exported
 # before invocation. Captures stdout+stderr; exit code on stdout of the caller.
@@ -85,6 +96,17 @@ write_arm_fixture() {
       cat > "$dir/bin/fm-watch-arm.sh" <<'SH'
 #!/usr/bin/env bash
 echo "$$" >> "$FM_HOME/state/arm-ran"
+printf 'watcher: started pid=%s (beacon fresh)\n' "$$"
+printf 'stale: fixture-win actionable\n'
+exit 0
+SH
+      ;;
+    # Records OUTSIDE the state dir, so a fixture with no state dir can still
+    # prove the hook never armed rather than only that it could not record it.
+    actionable-root-marker)
+      cat > "$dir/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+echo "$$" >> "$FM_HOME/arm-ran"
 printf 'watcher: started pid=%s (beacon fresh)\n' "$$"
 printf 'stale: fixture-win actionable\n'
 exit 0
@@ -188,6 +210,46 @@ test_inert_in_child_worktree() {
   [ ! -e "$dir/state/arm-ran" ] || fail "hook armed inside a child worktree"
   [ ! -e "$dir/state/.claude-autoarm-epoch" ] || fail "hook wrote an epoch inside a child worktree"
   pass "auto-arm: inert in a linked child worktree even when in-flight"
+}
+
+test_leaves_child_worktree_untouched() {
+  local base dir status
+  base="$TMP_ROOT/footprint-base"
+  dir="$TMP_ROOT/footprint-wt"
+  make_bare_worktree_dir "$base" "$dir" fm/autoarm-footprint-branch >/dev/null
+  write_arm_fixture "$dir" actionable-root-marker
+  # No fake harness and no lock: the scope gate must reject this root before the
+  # hook can source anything that writes, so the worktree keeps no state dir at
+  # all. Sourcing a writing library above that gate would create one on every
+  # worker turn end AND pre-satisfy the gate's own "state dir exists" condition.
+  status=0
+  printf '%s\n' '{"session_id":"s"}' \
+    | FM_HOME="$dir" bash "$dir/bin/fm-claude-stop-autoarm.sh" >/dev/null 2>&1 || status=$?
+  expect_code 0 "$status" "hook must stay inert in a child task worktree with no state dir"
+  [ ! -e "$dir/state" ] || fail "hook created a state dir inside a child worktree"
+  [ ! -e "$dir/arm-ran" ] || fail "hook armed inside a child worktree"
+  pass "auto-arm: a child task worktree is left byte-for-byte untouched"
+}
+
+test_leaves_non_home_checkout_untouched() {
+  local dir status
+  # A plain checkout that is NOT a firstmate home: no state dir, so the scope
+  # gate's state-dir condition must still mean "this home already has one"
+  # rather than "this hook just made one".
+  dir="$TMP_ROOT/non-home"
+  mkdir -p "$dir"
+  git init -q "$dir"
+  git -C "$dir" commit -q --allow-empty -m init
+  : > "$dir/AGENTS.md"
+  install_autoarm_scripts "$dir"
+  write_arm_fixture "$dir" actionable-root-marker
+  status=0
+  printf '%s\n' '{"session_id":"s"}' \
+    | FM_HOME="$dir" bash "$dir/bin/fm-claude-stop-autoarm.sh" >/dev/null 2>&1 || status=$?
+  expect_code 0 "$status" "hook must stay inert in a plain checkout that is not a firstmate home"
+  [ ! -e "$dir/state" ] || fail "hook created a state dir in a checkout that is not a firstmate home"
+  [ ! -e "$dir/arm-ran" ] || fail "hook armed in a checkout that is not a firstmate home"
+  pass "auto-arm: a plain non-home checkout is left byte-for-byte untouched"
 }
 
 test_inert_without_session_lock() {
@@ -576,6 +638,8 @@ test_fm_lock_status_still_works_with_shared_lib() {
 }
 
 test_inert_in_child_worktree
+test_leaves_child_worktree_untouched
+test_leaves_non_home_checkout_untouched
 test_inert_without_session_lock
 test_reclaims_stale_session_lock_before_arming
 test_inert_when_lock_held_by_other_harness

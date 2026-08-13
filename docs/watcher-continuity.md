@@ -11,6 +11,9 @@ A failed follow-up never cancels continuity restoration.
 Pi same-process session replacement follows the generation-owner contract in `.pi/extensions/fm-primary-pi-watch.ts`.
 Claude's `.claude/settings.json` Stop `asyncRewake` hook (`bin/fm-claude-stop-autoarm.sh`) owns routine tokenless re-arm.
 The hook fires on every Stop, and an eligible primary with supervision need admits one home-scoped owner that foregrounds `bin/fm-watch-arm.sh` inside the hook-owned process tree.
+Because `.claude/settings.json` is tracked, that hook is also checked out into every crewmate and scout task worktree of this repo and Claude fires it there on each worker turn end, so the script's own `fm_primary_scope_matches` gate is what keeps a non-primary root inert and untouched.
+Per-worktree neutralization is not an available alternative: Claude merges a tracked project `settings.json` hook with the lower-precedence `settings.local.json` that `bin/fm-spawn.sh` writes, so a local file can add hooks but never remove one (verified 2026-08-13 on Claude Code 2.1.229, where the tracked `PreToolUse` seatbelt denied a crewmate's Bash call from inside a linked worktree).
+Nothing before that gate may write, which is why only the side-effect-free scope predicate is sourced above it.
 A numeric session-lock owner that fails the shared `fm_harness_pid_alive` predicate is reclaimed through `bin/fm-lock.sh` before auto-arm state changes, while a live owner, absent lock, or malformed lock keeps the competing hook inert.
 The stale-owner claim occurs only after the existing AFK and supervision-need gates pass.
 After each non-actionable arm close, the hook rechecks the identity-matched watcher lock and fresh beacon before retrying a bounded number of times.
@@ -65,6 +68,7 @@ The same suite covers ordinary same-process session replacement for `/new`, `/re
 `tests/fm-watcher-lock.test.sh` covers verified-successor attach, the typed self-eviction failure, bounded and successor-linked lifecycle rows, and a SIGSTOP counterfactual that distinguishes a live PID from a stale beacon before classifying termination.
 `tests/fm-subagent-pretool-check.test.sh` proves Claude retains only the non-status Bash seatbelts.
 `tests/fm-claude-stop-autoarm.test.sh` covers the auto-arm's scope, stale and live session owners, unchanged AFK and need boundaries, single-flight, bounded failure retries, benign live-watcher cycle ends, one-notice failure episodes, and exit-2 translation.
+Two cases in it pin the no-write guarantee above, proving a linked task worktree and a plain non-home checkout each keep no state directory at all after the hook runs.
 `FM_CLAUDE_LIVE_E2E=1 tests/fm-claude-stop-autoarm-live-e2e.test.sh` starts with the reproduced stale-lock state, runs session start first, completes two tokenless cycles, and checks the competing-live-owner negative control.
 `tests/fm-turnend-guard.test.sh` covers the cooperative `--claude` guard, including monotonic failed-epoch progression, the integrated bounded fail-open, post-alarm continuation suppression, and positive recovery reset.
 
