@@ -664,6 +664,98 @@ test_spawn_preserves_orca_metadata_when_abort_cleanup_fails() {
   pass "fm-spawn.sh --backend orca: preserves metadata when abort cleanup fails"
 }
 
+# The record an aborted Orca spawn leaves when it cannot remove its own worktree
+# is deliberately reduced - a cleanup handle, not a task record. Reduced is not
+# the same as free to drop what another tool bound to the task: a respawn arrives
+# with the task's PR and its Relay binding already recorded, both still true
+# after the abort, and both unrecoverable from anywhere else. This pins the line
+# between the two halves in one run: the allowlist survives the rewrite, and the
+# stale worker-describing fields the reduction exists to shed do not.
+test_spawn_carries_pr_and_relay_into_reduced_orca_cleanup_record() {
+  local proj wt data state config id out status
+  id="orcacleanupcarryz1"
+  proj="$TMP_ROOT/cleanup-carry-project"
+  wt="$TMP_ROOT/cleanup-carry-wt"
+  data="$TMP_ROOT/cleanup-carry-data"
+  state="$TMP_ROOT/cleanup-carry-state"
+  config="$TMP_ROOT/cleanup-carry-config"
+  fm_git_worktree "$proj" "$wt" "fm/$id"
+  mkdir -p "$data/$id" "$state" "$config"
+  printf 'brief\n' > "$data/$id/brief.md"
+  touch "$state/.last-watcher-beat"
+  # The previous worker's record: the PR and Relay fields other tools bound after
+  # its spawn, plus the endpoint identity, busy generation, and trace context
+  # that described that worker and nothing that exists now.
+  cat > "$state/$id.meta" <<META
+window=fm-$id
+endpoint_task_id=$id
+worktree=$TMP_ROOT/cleanup-carry-old-wt
+project=$proj
+harness=claude
+kind=ship
+backend=orca
+orca_worktree_id=wt-cleanup-carry-old
+terminal=term-cleanup-carry-old
+busy_gen=gen-cleanup-carry-old
+traceparent=00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01
+pr=https://github.com/example/repo/pull/4242
+pr_head=cafebabecafebabecafebabecafebabecafebabe
+x_request=req-cleanup-carry
+x_request_ts=1760000000
+x_followups=2
+x_platform=x
+x_reply_max_chars=280
+META
+  orca_case cleanup-carry
+  printf '1\n' > "$RESP/1.exit"
+  printf '{"ok":true,"result":{"repo":{"id":"repo-cleanup-carry"}}}\n' > "$RESP/2.out"
+  printf '{"ok":true,"result":{"worktree":{"id":"wt-cleanup-carry","path":"%s"}}}\n' "$wt" > "$RESP/3.out"
+  printf '1\n' > "$RESP/4.exit"
+  printf '1\n' > "$RESP/5.exit"
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+    FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 \
+    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --mode no-mistakes --yolo off --backend orca 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "Orca spawn should fail when terminal creation and abort cleanup fail"
+  assert_present "$state/$id.meta" "failed Orca abort cleanup should preserve metadata"
+  # The rewrite happened: this is the new spawn's cleanup handle, not the old
+  # record left untouched. Without this the survival assertions below would pass
+  # vacuously on a file nothing rewrote.
+  assert_grep "orca_worktree_id=wt-cleanup-carry" "$state/$id.meta" \
+    "preserved metadata should name the worktree THIS spawn failed to remove"
+  assert_grep "mode=no-mistakes" "$state/$id.meta" \
+    "preserved metadata should be this spawn's record, not the previous one left untouched"
+  # Survives: bound after a spawn, names something outside this machine, and
+  # outlives the worker that aborted.
+  assert_grep "pr=https://github.com/example/repo/pull/4242" "$state/$id.meta" \
+    "reduced cleanup record dropped the task's PR"
+  assert_grep "pr_head=cafebabecafebabecafebabecafebabecafebabe" "$state/$id.meta" \
+    "reduced cleanup record dropped the task's PR head"
+  assert_grep "x_request=req-cleanup-carry" "$state/$id.meta" \
+    "reduced cleanup record dropped the promised public reply's request"
+  assert_grep "x_request_ts=1760000000" "$state/$id.meta" \
+    "reduced cleanup record dropped the public reply window"
+  assert_grep "x_followups=2" "$state/$id.meta" \
+    "reduced cleanup record dropped the spent follow-up count"
+  assert_grep "x_platform=x" "$state/$id.meta" \
+    "reduced cleanup record dropped the public reply platform"
+  assert_grep "x_reply_max_chars=280" "$state/$id.meta" \
+    "reduced cleanup record dropped the public reply split budget"
+  # Does NOT survive: each described the aborted worker, and a stale copy would
+  # be read as describing one that exists. This half is the reduction itself, and
+  # is asserted so a later blanket copy-through cannot quietly replace it.
+  assert_no_grep "orca_worktree_id=wt-cleanup-carry-old" "$state/$id.meta" \
+    "reduced cleanup record carried a stale Orca worktree id"
+  assert_no_grep "terminal=" "$state/$id.meta" \
+    "reduced cleanup record carried a stale terminal handle"
+  assert_no_grep "busy_gen=" "$state/$id.meta" \
+    "reduced cleanup record carried a stale busy generation"
+  assert_no_grep "traceparent=" "$state/$id.meta" \
+    "reduced cleanup record carried the previous spawn's trace context"
+  pass "fm-spawn.sh --backend orca: reduced cleanup record keeps the PR and Relay binding, sheds the stale worker"
+}
+
 test_spawn_releases_orca_resources_when_metadata_write_fails() {
   local proj wt data state config id out status
   id="orcametafailz9"
@@ -1308,6 +1400,7 @@ test_spawn_refuses_orca_when_runtime_not_ready
 test_spawn_refuses_orca_nonisolated_worktree
 test_spawn_removes_orca_worktree_when_terminal_create_fails
 test_spawn_preserves_orca_metadata_when_abort_cleanup_fails
+test_spawn_carries_pr_and_relay_into_reduced_orca_cleanup_record
 test_spawn_releases_orca_resources_when_metadata_write_fails
 test_peek_send_and_crew_state_route_through_orca_meta
 test_peek_and_crew_state_fail_closed_on_orca_error_json

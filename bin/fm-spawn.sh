@@ -154,12 +154,15 @@
 #   An ADOPTED worktree's lease is never returned on abort: only a lease this
 #   invocation itself acquired may be released, because the forced return that
 #   releases it also cleans and resets the worktree.
-#   state/<id>.meta is rewritten in full on every spawn, so a respawn carries
-#   forward the fields other tools bind AFTER a spawn and this script cannot
-#   regenerate: pr= and pr_head= (fm-pr-check.sh, fm-pr-merge.sh) and the Relay
-#   binding x_request=, x_request_ts=, x_followups=, x_platform=,
-#   x_reply_max_chars= (fm-x-link). Every other field is regenerated, and a
-#   first spawn's metadata is unchanged.
+#   Every rewrite of state/<id>.meta by this script carries forward the fields
+#   other tools bind AFTER a spawn and this script cannot regenerate: pr= and
+#   pr_head= (fm-pr-check.sh, fm-pr-merge.sh) and the Relay binding x_request=,
+#   x_request_ts=, x_followups=, x_platform=, x_reply_max_chars= (fm-x-link).
+#   That applies to the full record a successful spawn publishes AND to the
+#   reduced cleanup handle an aborted Orca spawn leaves behind when it cannot
+#   remove its own worktree. Every other field is regenerated, the reduced
+#   record stays reduced in every other respect, and a first spawn's metadata is
+#   unchanged.
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
@@ -705,8 +708,34 @@ parse_orca_worktree_result() {
   fi
 }
 
+# spawn_preserved_meta: the lines of <meta> this script must never regenerate,
+# printed in allowlist order and nothing else, for a caller to re-emit after it
+# rewrites that file. Reading is the caller's job to sequence: every rewrite here
+# truncates the file, so this must run BEFORE the redirect, never inside it.
+#
+# What earns a place: a field naming something OUTSIDE this machine, bound to the
+# task by another tool AFTER a spawn, and outliving any single worker. That is
+# fm-pr-check.sh's pr=/pr_head= (fm-pr-merge.sh records through it) and
+# fm-x-link's Relay binding. Nothing else qualifies - every other field describes
+# the worker this invocation is launching or abandoning, is regenerated from it,
+# and carrying a stale one over (a previous backend's endpoint identity, say)
+# would be worse than losing it.
+#
+# One list rather than one per rewrite site, because it is one contract: an
+# eighth Relay field added to a second hand-maintained copy of these names is
+# exactly the drift that loses a promised public reply.
+spawn_preserved_meta() {  # <meta>
+  local meta=$1 key value
+  for key in pr pr_head x_request x_request_ts x_followups x_platform x_reply_max_chars; do
+    value=$(fm_meta_get "$meta" "$key")
+    [ -n "$value" ] || continue
+    printf '%s=%s\n' "$key" "$value"
+  done
+}
+
 spawn_abort_cleanup() {
   local status=$?
+  local preserved=
   if [ "$HERDR_PROJECTION_ABORT_CLEANUP" = 1 ] \
      && [ "$HERDR_PRESENTATION_ORDER_LOCK_HELD" != 1 ]; then
     if ! spawn_herdr_presentation_order_lock_acquire "${HERDR_PROJECTION_ABORT_SESSION:-}"; then
@@ -734,6 +763,24 @@ spawn_abort_cleanup() {
       if ! fm_backend_remove_worktree orca "$ORCA_WORKTREE_ID" 2>/dev/null; then
         mkdir -p "$STATE" 2>/dev/null || true
         if [ -d "$STATE" ]; then
+          # This record is DELIBERATELY reduced, and stays that way: it is a
+          # cleanup handle rather than a task record. The spawn aborted, so no
+          # worker exists, and the fields left out (a busy generation, this
+          # invocation's trace context) would describe one that does not. What
+          # survives is only what fm-teardown.sh needs to find and remove the
+          # Orca worktree fm_backend_remove_worktree just failed to remove.
+          #
+          # The allowlist below is not part of that reduction, and is read here
+          # before the truncating redirect for the same reason it is carried at
+          # the successful write further down. A respawn arrives with the task's
+          # PR and Relay binding already in this file; nothing about them stopped
+          # being true when this spawn aborted, and the loss is worse here than
+          # there, because no new worker replaces what the rewrite drops -
+          # firstmate reads this record, the aborted task keeps its PR, and a
+          # promised final public reply keeps a request AGENTS.md section 14
+          # forbids recovering from a done: sentence. A first spawn has no such
+          # fields and its preserved record is unchanged.
+          preserved=$(spawn_preserved_meta "$STATE/$ID.meta") || preserved=
           {
             echo "window=$W"
             echo "worktree=${WT:-}"
@@ -748,6 +795,7 @@ spawn_abort_cleanup() {
             echo "backend=orca"
             echo "orca_worktree_id=$ORCA_WORKTREE_ID"
             [ -z "${ORCA_TERMINAL:-}" ] || echo "terminal=$ORCA_TERMINAL"
+            [ -z "$preserved" ] || printf '%s\n' "$preserved"
           } > "$STATE/$ID.meta" 2>/dev/null || true
         fi
       fi
@@ -2612,19 +2660,10 @@ META_WINDOW=$T
 # fm-review-diff.sh both lost the PR, and a promised final public reply lost the
 # request AGENTS.md section 14 forbids recovering from a done: sentence. Carry
 # them across, the way bin/fm-x-lib.sh already rewrites one meta field while
-# preserving every other line.
-#
-# An allowlist, not a blanket copy-through: everything else in this file is
-# regenerated below, and carrying a stale line over (a previous backend's
-# endpoint identity, say) would be worse than losing it. Read before the
-# overwrite, emitted last, so a first spawn's metadata stays byte-identical.
-SPAWN_PRESERVED_META=
-for preserve_key in pr pr_head x_request x_request_ts x_followups x_platform x_reply_max_chars; do
-  preserve_value=$(fm_meta_get "$STATE/$ID.meta" "$preserve_key")
-  [ -n "$preserve_value" ] || continue
-  SPAWN_PRESERVED_META="$SPAWN_PRESERVED_META$preserve_key=$preserve_value
-"
-done
+# preserving every other line. spawn_preserved_meta owns which fields those are
+# and why; read before the overwrite, emitted last, so a first spawn's metadata
+# stays byte-identical.
+SPAWN_PRESERVED_META=$(spawn_preserved_meta "$STATE/$ID.meta")
 {
   echo "window=$META_WINDOW"
   echo "endpoint_task_id=$ID"
@@ -2666,7 +2705,7 @@ done
     echo "home=$PROJ_ABS"
     echo "projects=$SECONDMATE_PROJECTS"
   fi
-  [ -z "$SPAWN_PRESERVED_META" ] || printf '%s' "$SPAWN_PRESERVED_META"
+  [ -z "$SPAWN_PRESERVED_META" ] || printf '%s\n' "$SPAWN_PRESERVED_META"
 } > "$STATE/$ID.meta"
 [ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
 # Metadata is published: fm-teardown.sh now owns the endpoint and the lease,
