@@ -124,6 +124,15 @@
 #   supports leases, then cd the pane into the leased path; teardown's
 #   `treehouse return --force` releases the lease. Without lease support the
 #   pane types a bare `treehouse get` as before, with a loud warning.
+#   Non-secondmate, non-orca spawns read the task's OWN recorded endpoint once,
+#   before creating this spawn's endpoint, and refuse to launch a second agent
+#   for that task id when it reads alive or unreadable. tmux's window-name
+#   collision check covers only the session just resolved, so a worker alive in
+#   an OLD tmux session collided with nothing after firstmate restarted into a
+#   new one; the sibling-ownership guard above never covered it either, because
+#   it refuses on a DIFFERENT task's recorded worktree. An `unverified` backend
+#   (no liveness surface at all, e.g. zellij, cmux), a task with no metadata,
+#   and metadata recording no endpoint all launch exactly as before.
 #   A RESPAWN re-enters the task's own recorded worktree instead of leasing a
 #   fresh slot, but only when all of these hold, and prints one notice naming
 #   the adopted path when it does:
@@ -131,8 +140,7 @@
 #     - that path exists and is its own git worktree root;
 #     - it is not the primary project checkout;
 #     - treehouse reports it leased with holder fm-<id>;
-#     - the task's own recorded endpoint probes dead or missing (unknown,
-#       unreadable, and unrecorded endpoints all refuse to adopt);
+#     - the same single endpoint reading above found it dead or missing;
 #     - the sibling-ownership guard finds no other live task recording it.
 #   Any unmet precondition falls back to the lease path above unchanged, so a
 #   task with no metadata is unaffected. Adoption exists because `treehouse get`
@@ -146,6 +154,12 @@
 #   An ADOPTED worktree's lease is never returned on abort: only a lease this
 #   invocation itself acquired may be released, because the forced return that
 #   releases it also cleans and resets the worktree.
+#   state/<id>.meta is rewritten in full on every spawn, so a respawn carries
+#   forward the fields other tools bind AFTER a spawn and this script cannot
+#   regenerate: pr= and pr_head= (fm-pr-check.sh, fm-pr-merge.sh) and the Relay
+#   binding x_request=, x_request_ts=, x_followups=, x_platform=,
+#   x_reply_max_chars= (fm-x-link). Every other field is regenerated, and a
+#   first spawn's metadata is unchanged.
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
@@ -1584,6 +1598,26 @@ validate_spawn_worktree() {  # <source> <inspect-target>
   done
 }
 
+# spawn_recorded_endpoint_state: fm_backend_agent_state's recovery-grade verdict
+# on the task's OWN recorded endpoint, or `none` when nothing is recorded to
+# probe (no metadata, or metadata naming no endpoint). One reading, taken once,
+# so the two questions a respawn must ask about the previous worker - may a
+# second agent launch for this task id, and may its worktree be re-entered - can
+# never disagree about the same worker.
+#
+# The detailed vocabulary, not fm_backend_agent_alive's three-state view, is
+# what both callers need: that view folds `unverified` (a backend with no
+# liveness surface at all) into the same `unknown` as `unreadable` (a readable
+# surface that failed), and the two must not decide a launch the same way.
+spawn_recorded_endpoint_state() {
+  local meta="$STATE/$ID.meta" target state
+  [ -f "$meta" ] || { printf 'none\n'; return 0; }
+  target=$(fm_backend_target_of_meta "$meta")
+  [ -n "$target" ] || { printf 'none\n'; return 0; }
+  state=$(fm_backend_agent_state "$(fm_backend_of_meta "$meta")" "$target" 2>/dev/null) || state=unreadable
+  printf '%s\n' "${state:-unreadable}"
+}
+
 # spawn_recorded_worktree_adoptable: print the task's OWN recorded worktree when
 # a respawn may simply re-enter it, and print nothing when it may not.
 #
@@ -1601,8 +1635,15 @@ validate_spawn_worktree() {  # <source> <inspect-target>
 # Eligibility is all this decides - validate_spawn_worktree still runs against
 # the adopted path afterwards and remains the authority that refuses an
 # unisolated checkout or one a live sibling owns.
-spawn_recorded_worktree_adoptable() {
-  local meta="$STATE/$ID.meta" recorded recorded_real top top_real target holder
+#
+# <endpoint-state> is the single reading of the task's own recorded endpoint
+# taken by the caller (spawn_recorded_endpoint_state), not a second probe, so
+# the duplicate-launch refusal and this decision can never read one worker two
+# ways. The reading itself is unchanged: only `dead` or `missing` frees the
+# recorded worktree, and this still refuses to adopt everything the duplicate
+# refusal deliberately lets through (an `unverified` backend above all).
+spawn_recorded_worktree_adoptable() {  # <endpoint-state>
+  local endpoint_state=$1 meta="$STATE/$ID.meta" recorded recorded_real top top_real target holder
   [ -f "$meta" ] || return 0
   recorded=$(fm_meta_get "$meta" worktree)
   [ -n "$recorded" ] || return 0
@@ -1613,14 +1654,12 @@ spawn_recorded_worktree_adoptable() {
   [ "$recorded_real" != "$PROJ_ABS_REAL" ] || return 0
   # The task's own endpoint must be confidently gone before its worktree may be
   # re-entered: adopting under a live worker would put two agents in one
-  # checkout. Same probe and same reading as the sibling-ownership guard above -
-  # only a dead or missing endpoint frees it, while unknown, unreadable, and
-  # unrecorded endpoints all stop here. This is why the whole check runs BEFORE
-  # this spawn creates its own fm-<id> endpoint: afterwards the new endpoint
-  # answers for the recorded one and every dead worker reads as alive.
+  # checkout. Same reading as the sibling-ownership guard above - only a dead or
+  # missing endpoint frees it, while unknown, unreadable, and unrecorded
+  # endpoints all stop here.
   target=$(fm_backend_target_of_meta "$meta")
   [ -n "$target" ] || return 0
-  [ "$(fm_backend_agent_alive "$(fm_backend_of_meta "$meta")" "$target" 2>/dev/null)" = dead ] || return 0
+  case "$endpoint_state" in dead|missing) ;; *) return 0 ;; esac
   # The pool must still record the slot as THIS task's. A path already returned,
   # re-issued to another holder, or never leased at all is not ours to re-enter.
   holder=$( cd "$PROJ_ABS" && fm_backend_treehouse_lease_holder "$recorded_real" ) || return 0
@@ -1704,15 +1743,43 @@ herdr_projection_existing_meta_allows_flat() {  # <meta>
   esac
 }
 
-# Decide respawn worktree adoption while the recorded endpoint still answers for
-# the PREVIOUS worker. The backend case below creates this spawn's own fm-<id>
-# endpoint, which a legacy tmux record names by the same window name, so the
-# liveness half of the decision is only truthful ahead of it. The result is
-# consumed at worktree acquisition further down; nothing is entered or mutated
-# here.
+# Read the task's OWN recorded endpoint once, while it still answers for the
+# PREVIOUS worker, and decide both things that reading governs: whether a second
+# agent may launch for this task id at all, and whether this respawn may
+# re-enter the recorded worktree. The backend case below creates this spawn's
+# own fm-<id> endpoint, which a legacy tmux record names by the same window
+# name, so the reading is only truthful ahead of it.
+#
+# The duplicate refusal is why one reading rather than two: tmux's own
+# protection is the window-name collision check, and it only inspects the
+# session container_ensure just resolved. A worker still alive in `0:fm-<id>`
+# after firstmate restarted into session `4` collided with nothing, and a second
+# agent launched against the live one. The sibling-ownership guard never covered
+# it either - that one refuses when a DIFFERENT task records the worktree.
+#
+# What refuses, matching herdr's own duplicate refusal: a live endpoint, and a
+# readable surface that failed to read (`unreadable`), because a transient
+# backend failure is not evidence the previous worker is gone and a false `dead`
+# is the one verdict that puts two agents on one task. What does NOT refuse:
+# `unverified`, a backend with no liveness surface at all. That is not a failed
+# reading but the absence of one, and refusing on it would make every respawn on
+# zellij or cmux impossible rather than making any of them safer - those
+# backends keep exactly the behavior they have today. A task with no metadata,
+# or metadata naming no endpoint, is likewise untouched.
+#
+# Secondmates and orca are excluded outright: a secondmate's recovery is owned
+# by secondmate-provisioning (its remote routes probe across a host boundary),
+# and orca owns its own task identity.
 SPAWN_ADOPTED_WT=
 if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
-  SPAWN_ADOPTED_WT=$(spawn_recorded_worktree_adoptable)
+  SPAWN_RECORDED_ENDPOINT=$(spawn_recorded_endpoint_state)
+  case "$SPAWN_RECORDED_ENDPOINT" in
+    alive|unreadable)
+      echo "error: $ID already records an endpoint that is $SPAWN_RECORDED_ENDPOINT ($(fm_backend_of_meta "$STATE/$ID.meta") $(fm_backend_target_of_meta "$STATE/$ID.meta")); refusing to launch a second agent for this task id. Inspect that endpoint, or tear the task down, before respawning" >&2
+      exit 1
+      ;;
+  esac
+  SPAWN_ADOPTED_WT=$(spawn_recorded_worktree_adoptable "$SPAWN_RECORDED_ENDPOINT")
 fi
 
 W="fm-$ID"
@@ -2536,6 +2603,28 @@ fi
 
 META_WINDOW=$T
 [ "$BACKEND" = orca ] && META_WINDOW=$W
+# The write below is a full overwrite, and every field in it is regenerated from
+# this invocation. Fields other tools bind to the task AFTER a spawn are not:
+# fm-pr-check.sh's pr=/pr_head= (fm-pr-merge.sh records through it) and
+# fm-x-link's Relay binding. A respawn used to drop them silently - the merge
+# poll survived, because its registration binds to the poll sidecar rather than
+# to this file, so nothing complained while teardown's landed-work test and
+# fm-review-diff.sh both lost the PR, and a promised final public reply lost the
+# request AGENTS.md section 14 forbids recovering from a done: sentence. Carry
+# them across, the way bin/fm-x-lib.sh already rewrites one meta field while
+# preserving every other line.
+#
+# An allowlist, not a blanket copy-through: everything else in this file is
+# regenerated below, and carrying a stale line over (a previous backend's
+# endpoint identity, say) would be worse than losing it. Read before the
+# overwrite, emitted last, so a first spawn's metadata stays byte-identical.
+SPAWN_PRESERVED_META=
+for preserve_key in pr pr_head x_request x_request_ts x_followups x_platform x_reply_max_chars; do
+  preserve_value=$(fm_meta_get "$STATE/$ID.meta" "$preserve_key")
+  [ -n "$preserve_value" ] || continue
+  SPAWN_PRESERVED_META="$SPAWN_PRESERVED_META$preserve_key=$preserve_value
+"
+done
 {
   echo "window=$META_WINDOW"
   echo "endpoint_task_id=$ID"
@@ -2577,6 +2666,7 @@ META_WINDOW=$T
     echo "home=$PROJ_ABS"
     echo "projects=$SECONDMATE_PROJECTS"
   fi
+  [ -z "$SPAWN_PRESERVED_META" ] || printf '%s' "$SPAWN_PRESERVED_META"
 } > "$STATE/$ID.meta"
 [ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
 # Metadata is published: fm-teardown.sh now owns the endpoint and the lease,

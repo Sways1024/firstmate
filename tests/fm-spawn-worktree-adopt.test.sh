@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# tests/fm-spawn-worktree-adopt.test.sh - respawn worktree adoption regressions
-# for bin/fm-spawn.sh.
+# tests/fm-spawn-worktree-adopt.test.sh - regressions for what a respawn does
+# with the PREVIOUS worker's record in bin/fm-spawn.sh: whether it may launch at
+# all, whether it re-enters the recorded worktree, and what of that record it
+# carries forward.
 #
 # `treehouse get` never re-issues a slot that is already leased, not even to the
 # holder that leased it, so a respawn of a task whose worktree is still leased
@@ -16,7 +18,12 @@
 #     the pool reports a slot held under this task's holder (a fresh task must
 #     never inherit a slot on the holder name alone);
 #   - fallback when the recorded path is leased to some other holder;
-#   - refusal to adopt while the task's own recorded endpoint is still alive;
+#   - refusal to launch a second agent for a task id whose own recorded endpoint
+#     is still alive in ANOTHER session, or whose read failed;
+#   - a backend with no liveness surface at all still respawning, because the
+#     absence of a reading is not evidence of a live worker;
+#   - post-spawn metadata (a recorded PR, a Relay request binding) surviving the
+#     metadata rewrite an adopting respawn performs;
 #   - the abort path leaving an adopted worktree's lease untouched, because
 #     `treehouse return --force` cleans and resets the worktree it releases;
 #   - the sibling-ownership refusal still firing against an adopted path.
@@ -64,6 +71,15 @@ case "${1:-}" in
         *) shift ;;
       esac
     done
+    # An inventory read that fails with an unrecognized message is how a real
+    # tmux reports a transient problem, and it classifies the endpoint
+    # `unreadable` rather than gone. Scoped to one session so the spawn's own
+    # session still answers normally.
+    if [ "$scoped" = 1 ] && [ -n "${FM_FAKE_WINDOW_LIST_UNREADABLE_SESSION:-}" ] \
+       && [ "$ses" = "$FM_FAKE_WINDOW_LIST_UNREADABLE_SESSION" ]; then
+      printf 'lost server\n' >&2
+      exit 1
+    fi
     if [ "$scoped" = 1 ] && [ -n "${FM_FAKE_WINDOW_LIST_SESSION:-}" ] \
        && [ "$ses" != "$FM_FAKE_WINDOW_LIST_SESSION" ]; then
       exit 0
@@ -292,13 +308,14 @@ test_unleased_recorded_path_falls_back() {
   pass "a recorded worktree the pool no longer reports as leased is never adopted"
 }
 
-# (d) The task's own endpoint is still alive. Adopting would put a second agent
-# in a checkout an agent is already working in, so the spawn must not adopt.
-# The recorded endpoint lives in a different session from the one this spawn
-# creates its window in, which is what keeps the unrelated duplicate-window
-# refusal out of the way and leaves the liveness precondition as the only thing
-# deciding the outcome.
-test_live_own_endpoint_refuses_adoption() {
+# (d) THE cross-session duplicate. The task's own recorded endpoint is alive in
+# session `legacy`, while firstmate has since restarted and this spawn resolves
+# session `firstmate`. tmux's own duplicate protection is a window-name
+# collision check against only the session just resolved, so it sees nothing,
+# and the sibling-ownership guard refuses only when a DIFFERENT task records the
+# worktree. Without the task's own endpoint reading, a second agent launched
+# against the live one.
+test_live_own_endpoint_refuses_duplicate_launch() {
   local rec id out status
   id=adopt-live-d5
   rec=$(make_adopt_case adopt-live "$id")
@@ -320,12 +337,182 @@ test_live_own_endpoint_refuses_adoption() {
     FM_FAKE_WINDOW_LIST="fm-$id" FM_FAKE_WINDOW_LIST_SESSION=legacy \
     FM_FAKE_PANE_COMMAND=codex)
   status=$?
-  expect_code 0 "$status" "a live-endpoint task should still lease normally: $out"
+  expect_code 1 "$status" \
+    "a task whose own endpoint is alive in another session must refuse to launch a second agent: $out"
+  assert_contains "$out" "already records an endpoint that is alive" \
+    "the duplicate-launch refusal did not name the live recorded endpoint"
+  assert_contains "$out" "legacy:fm-$id" \
+    "the duplicate-launch refusal did not name the endpoint to inspect"
+  assert_not_contains "$out" "spawned $id" \
+    "a refused duplicate launch must never report a spawn"
+  assert_no_grep "get --lease" "$TREEHOUSE_LOG" \
+    "a refused duplicate launch must not lease a pool slot"
+  assert_grep "window=legacy:fm-$id" "$HOME_DIR/state/$id.meta" \
+    "a refused duplicate launch must leave the live worker's record intact"
+  pass "a task whose own endpoint is alive in another session refuses a second launch"
+}
+
+# (d2) The same refusal on a readable surface whose read FAILED. A transient
+# inventory failure is not evidence the previous worker is gone, and a false
+# "gone" is the one verdict that puts two agents on one task, so an unreadable
+# endpoint refuses exactly as a live one does. Distinct from a backend with no
+# liveness surface at all, which (d3) pins as still launching.
+test_unreadable_own_endpoint_refuses_duplicate_launch() {
+  local rec id out status
+  id=adopt-unreadable-d6
+  rec=$(make_adopt_case adopt-unreadable "$id")
+  read_adopt_record "$rec"
+  fm_write_meta "$HOME_DIR/state/$id.meta" \
+    "window=legacy:fm-$id" \
+    "endpoint_task_id=$id" \
+    "worktree=$WT_DIR" \
+    "project=$PROJ_DIR" \
+    "harness=codex" \
+    "kind=ship" \
+    "mode=no-mistakes" \
+    "yolo=off"
+
+  out=$(run_adopt_spawn "$id" \
+    FM_FAKE_TREEHOUSE_STATUS_JSON="$(pool_json "$WT_DIR" leased "fm-$id")" \
+    FM_FAKE_TREEHOUSE_WT="$SPARE_DIR" \
+    FM_FAKE_PANE_PATH="$SPARE_DIR" \
+    FM_FAKE_WINDOW_LIST_UNREADABLE_SESSION=legacy)
+  status=$?
+  expect_code 1 "$status" \
+    "an unreadable recorded endpoint must refuse to launch a second agent: $out"
+  assert_contains "$out" "already records an endpoint that is unreadable" \
+    "the duplicate-launch refusal did not name the unreadable recorded endpoint"
+  assert_no_grep "get --lease" "$TREEHOUSE_LOG" \
+    "a refused duplicate launch must not lease a pool slot"
+  pass "a recorded endpoint that cannot be read refuses a second launch"
+}
+
+# (d3) A backend with NO liveness surface at all reads `unverified`, which is the
+# absence of a reading rather than a failed one. Refusing on it would make every
+# respawn on that backend impossible without making any of them safer, so those
+# spawns keep the behavior they have today: no adoption (that still demands
+# proof the endpoint is gone), and an ordinary fresh lease.
+test_unverified_backend_still_respawns() {
+  local rec id out status
+  id=adopt-unverified-d7
+  rec=$(make_adopt_case adopt-unverified "$id")
+  read_adopt_record "$rec"
+  fm_write_meta "$HOME_DIR/state/$id.meta" \
+    "window=fm-$id" \
+    "endpoint_task_id=$id" \
+    "worktree=$WT_DIR" \
+    "project=$PROJ_DIR" \
+    "harness=codex" \
+    "kind=ship" \
+    "mode=no-mistakes" \
+    "yolo=off" \
+    "backend=zellij" \
+    "zellij_session=old" \
+    "zellij_tab_id=1" \
+    "zellij_pane_id=2"
+
+  out=$(run_adopt_spawn "$id" \
+    FM_FAKE_TREEHOUSE_STATUS_JSON="$(pool_json "$WT_DIR" leased "fm-$id")" \
+    FM_FAKE_TREEHOUSE_WT="$SPARE_DIR" \
+    FM_FAKE_PANE_PATH="$SPARE_DIR")
+  status=$?
+  expect_code 0 "$status" \
+    "a recorded endpoint on a backend with no liveness surface should still respawn: $out"
+  assert_contains "$out" "spawned $id" "the respawn did not report success"
+  assert_not_contains "$out" "refusing to launch a second agent" \
+    "the absence of a liveness surface must never read as evidence of a live worker"
   assert_not_contains "$out" "re-entering its own recorded worktree" \
-    "a task whose own endpoint is alive must never adopt its recorded worktree"
+    "an unproven endpoint must never adopt its recorded worktree"
   assert_grep "get --lease --lease-holder fm-$id" "$TREEHOUSE_LOG" \
-    "a live-endpoint task did not fall back to the lease path"
-  pass "a task whose own endpoint is still alive never adopts its recorded worktree"
+    "the respawn did not fall back to the ordinary lease path"
+
+  # Non-vacuity control: the same recorded endpoint on a backend that DOES
+  # classify liveness refuses. Only the backend= line differs, so the guard is
+  # provably reached here and it is the missing liveness surface, not an
+  # unresolvable endpoint, that let the launch through above.
+  local control control_id control_out control_status
+  control_id=adopt-unverified-control-d7
+  control=$(make_adopt_case adopt-unverified-control "$control_id")
+  read_adopt_record "$control"
+  fm_write_meta "$HOME_DIR/state/$control_id.meta" \
+    "window=fm-$control_id" \
+    "endpoint_task_id=$control_id" \
+    "worktree=$WT_DIR" \
+    "project=$PROJ_DIR" \
+    "harness=codex" \
+    "kind=ship" \
+    "mode=no-mistakes" \
+    "yolo=off"
+  control_out=$(run_adopt_spawn "$control_id" \
+    FM_FAKE_TREEHOUSE_STATUS_JSON="$(pool_json "$WT_DIR" leased "fm-$control_id")" \
+    FM_FAKE_TREEHOUSE_WT="$SPARE_DIR" \
+    FM_FAKE_PANE_PATH="$SPARE_DIR")
+  control_status=$?
+  expect_code 1 "$control_status" \
+    "the control endpoint on a liveness-classifying backend should refuse: $control_out"
+  assert_contains "$control_out" "refusing to launch a second agent" \
+    "the control did not exercise the duplicate-launch guard, so the unverified case proves nothing"
+  pass "a recorded endpoint on a backend with no liveness surface still respawns and leases"
+}
+
+# (d4) A legitimate recovery respawn - endpoint confidently gone, worktree still
+# leased to this task - carries the previous worker's post-spawn bindings across
+# the metadata rewrite. Those fields are written AFTER a spawn by other tools and
+# cannot be regenerated from this invocation: bin/fm-teardown.sh's landed-work
+# test and bin/fm-review-diff.sh both read pr=, and a promised final public reply
+# is recovered only from the Relay request binding. The rewrite used to drop them
+# silently, because the merge poll binds elsewhere and kept running. Also the
+# end-to-end proof that this exact path still adopts and launches.
+test_respawn_preserves_pr_and_relay_bindings() {
+  local rec id out status meta
+  id=adopt-preserve-d8
+  rec=$(make_adopt_case adopt-preserve "$id")
+  read_adopt_record "$rec"
+  meta="$HOME_DIR/state/$id.meta"
+  fm_write_meta "$meta" \
+    "window=firstmate:fm-$id" \
+    "endpoint_task_id=$id" \
+    "worktree=$WT_DIR" \
+    "project=$PROJ_DIR" \
+    "harness=codex" \
+    "kind=ship" \
+    "mode=no-mistakes" \
+    "yolo=off" \
+    "herdr_pane_id=pane-from-a-previous-backend" \
+    "pr=https://github.com/example/repo/pull/4242" \
+    "pr_head=1f2e3d4c5b6a7988990a1b2c3d4e5f6071829304" \
+    "x_request=req-77aa" \
+    "x_request_ts=1755000000" \
+    "x_followups=2" \
+    "x_platform=x" \
+    "x_reply_max_chars=280"
+
+  out=$(run_adopt_spawn "$id" \
+    FM_FAKE_TREEHOUSE_STATUS_JSON="$(pool_json "$WT_DIR" leased "fm-$id")" \
+    FM_FAKE_TREEHOUSE_WT="$SPARE_DIR" \
+    FM_FAKE_PANE_PATH="$WT_DIR")
+  status=$?
+  expect_code 0 "$status" "a legitimate recovery respawn should adopt and launch: $out"
+  assert_contains "$out" "spawned $id" "the recovery respawn did not report success"
+  assert_contains "$out" "re-entering its own recorded worktree $WT_DIR" \
+    "the recovery respawn did not adopt the recorded worktree"
+  assert_grep "pr=https://github.com/example/repo/pull/4242" "$meta" \
+    "the respawn dropped the recorded PR, which teardown's landed-work test and review both read"
+  assert_grep "pr_head=1f2e3d4c5b6a7988990a1b2c3d4e5f6071829304" "$meta" \
+    "the respawn dropped the recorded PR head"
+  assert_grep "x_request=req-77aa" "$meta" \
+    "the respawn dropped the Relay request, losing a promised public reply"
+  assert_grep "x_request_ts=1755000000" "$meta" "the respawn dropped the Relay request timestamp"
+  assert_grep "x_followups=2" "$meta" "the respawn dropped the Relay follow-up count"
+  assert_grep "x_platform=x" "$meta" "the respawn dropped the Relay platform"
+  assert_grep "x_reply_max_chars=280" "$meta" "the respawn dropped the Relay reply limit"
+  # An allowlist, not a blanket copy-through: a field this invocation does not
+  # regenerate and did not bind - a previous backend's endpoint identity - must
+  # not survive, because carrying it would describe an endpoint that is gone.
+  assert_no_grep "pane-from-a-previous-backend" "$meta" \
+    "the respawn carried a stale endpoint identity across the rewrite"
+  [ "$(grep -c '^pr=' "$meta")" = 1 ] || fail "the respawn recorded pr= more than once"
+  pass "a recovery respawn adopts, launches, and keeps the PR and Relay bindings it did not regenerate"
 }
 
 # (e) THE safety property. An adopted worktree's lease was not acquired by this
@@ -408,7 +595,10 @@ test_adopts_recorded_worktree
 test_no_metadata_falls_back_to_lease
 test_foreign_lease_falls_back_to_lease
 test_unleased_recorded_path_falls_back
-test_live_own_endpoint_refuses_adoption
+test_live_own_endpoint_refuses_duplicate_launch
+test_unreadable_own_endpoint_refuses_duplicate_launch
+test_unverified_backend_still_respawns
+test_respawn_preserves_pr_and_relay_bindings
 test_abort_never_returns_an_adopted_lease
 test_sibling_ownership_still_refuses_an_adopted_path
 
