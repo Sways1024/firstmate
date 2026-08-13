@@ -760,6 +760,190 @@ EOF
   pass "cross-branch attribution picks the branch's most recent row"
 }
 
+# A crew worktree parked on the head it SUBMITTED to validation, plus a diverged
+# commit standing for the live run's head after the pipeline rebased that run
+# onto a newer base. Neither commit is an ancestor of the other, which is exactly
+# how the two fm/paytier-lint-coverage run lines sat on 2026-08-13: the failed
+# run's line and the live run's line both descended from the same base commit
+# after two other PRs landed underneath. Echoes
+# "<submitted-full> <submitted-short> <live-full> <live-short>".
+make_repo_with_diverged_run_head() {  # <dir> <branch>
+  local dir=$1 branch=$2 base submitted submitted_short live live_short
+  mkdir -p "$dir"
+  git -C "$dir" init -q
+  git -C "$dir" commit -q --allow-empty -m base
+  base=$(git -C "$dir" rev-parse HEAD)
+  git -C "$dir" checkout -q -b "$branch"
+  git -C "$dir" commit -q --allow-empty -m 'crew implementation commit'
+  submitted=$(git -C "$dir" rev-parse HEAD)
+  submitted_short=$(git -C "$dir" rev-parse --short=7 HEAD)
+  git -C "$dir" checkout -q -b nm-rebased "$base"
+  git -C "$dir" commit -q --allow-empty -m 'pipeline rebased the run onto a newer base'
+  live=$(git -C "$dir" rev-parse HEAD)
+  live_short=$(git -C "$dir" rev-parse --short=7 HEAD)
+  git -C "$dir" checkout -q "$branch"
+  printf '%s %s %s %s' "$submitted" "$submitted_short" "$live" "$live_short"
+}
+
+# Assert the fixture above really did produce two diverged heads. This runs in
+# the TEST's shell, never inside the `$(...)` that captures the fixture, because
+# `fail` from a command substitution would only exit that subshell: the test
+# would carry on with empty shas, the run fixture would emit an empty head, and
+# attribution would fail for the wrong reason - passing these cases vacuously.
+assert_diverged_fixture() {  # <dir> <submitted> <live>
+  local dir=$1 submitted=$2 live=$3
+  [ -n "$submitted" ] && [ -n "$live" ] || fail "diverged fixture did not produce both heads"
+  git -C "$dir" merge-base --is-ancestor "$submitted" "$live" 2>/dev/null \
+    && fail "fixture not diverged: submitted head is an ancestor of the live run head"
+  git -C "$dir" merge-base --is-ancestor "$live" "$submitted" 2>/dev/null \
+    && fail "fixture not diverged: live run head is an ancestor of the submitted head"
+  return 0
+}
+
+# The 2026-08-13 defect, found live on task paytier-lint-coverage: a branch
+# carrying BOTH an older FAILED run and a newer LIVE one reported `failed` for
+# the whole life of the task. The live run's head had diverged from the crew's
+# worktree tip (the pipeline rebased it onto a newer base), so the newest row
+# failed the code-identity check - and the coarse scan then walked BACKWARD into
+# history and matched the older failed row, whose head was still exactly the
+# worktree tip. The verdict is doubly wrong: the run it names ended long ago, and
+# the run that is actually live is healthy.
+#
+# The crew had deliberately declared an external wait, so the correct answer is
+# its own `paused:` line. Reading `failed` instead both invites tearing down
+# healthy work and defeats the declared-pause long-cadence recheck.
+test_stale_failed_run_never_shadows_newer_live_run() {
+  reset_fakes
+  local d fixture submitted submitted_short live live_short out
+  d=$(new_case stale-failed-shadow)
+  fixture=$(make_repo_with_diverged_run_head "$d/wt" fm/paytier-lint)
+  submitted=$(printf '%s' "$fixture" | cut -d' ' -f1)
+  submitted_short=$(printf '%s' "$fixture" | cut -d' ' -f2)
+  live=$(printf '%s' "$fixture" | cut -d' ' -f3)
+  live_short=$(printf '%s' "$fixture" | cut -d' ' -f4)
+  assert_diverged_fixture "$d/wt" "$submitted" "$live"
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/lint.meta" "window=fm:fm-lint" "worktree=$d/wt" \
+    "kind=ship" "harness=claude"
+  printf 'paused: PR 44 green, awaiting captain merge decision\n' > "$d/state/lint.status"
+  # `axi status` answers with the live run, whose head diverged from this tip.
+  FM_FAKE_RUN_HEAD="$live"
+  FM_FAKE_AXI_STATUS="$(run_running fm/paytier-lint)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  running    fm/paytier-lint ${live_short}  2026-08-13 12:41
+  failed     fm/paytier-lint ${submitted_short}  2026-08-13 12:27
+EOF
+)"
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" lint
+  out=$(run_crew_state "$d" lint)
+  assert_not_contains "$out" "state: failed" "stale failed run must not become the current verdict"
+  assert_not_contains "$out" "run failed" "stale failed run's detail must not be reported"
+  assert_contains "$out" "state: paused" "the crew's declared external wait is the current state"
+  assert_contains "$out" "source: status-log" "declared pause is status-log sourced"
+  assert_contains "$out" "awaiting captain merge decision" "declared pause keeps its reason"
+  pass "an older failed run never shadows a newer live run on the same branch"
+}
+
+# Same defect, the other consequence: with the false `failed` in place there was
+# no in-band way for a live worker to correct the verdict. Once the stale run is
+# no longer attributed, a busy worker reads as working again.
+test_stale_failed_run_does_not_mask_busy_worker() {
+  reset_fakes
+  local d fixture submitted submitted_short live live_short out
+  d=$(new_case stale-failed-busy)
+  fixture=$(make_repo_with_diverged_run_head "$d/wt" fm/feat-stalebusy)
+  submitted=$(printf '%s' "$fixture" | cut -d' ' -f1)
+  submitted_short=$(printf '%s' "$fixture" | cut -d' ' -f2)
+  live=$(printf '%s' "$fixture" | cut -d' ' -f3)
+  live_short=$(printf '%s' "$fixture" | cut -d' ' -f4)
+  assert_diverged_fixture "$d/wt" "$submitted" "$live"
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/stalebusy.meta" "window=fm:fm-stalebusy" "worktree=$d/wt" \
+    "kind=ship" "harness=claude"
+  FM_FAKE_RUN_HEAD="$live"
+  FM_FAKE_AXI_STATUS="$(run_running fm/feat-stalebusy)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  running    fm/feat-stalebusy ${live_short}  2026-08-13 12:41
+  failed     fm/feat-stalebusy ${submitted_short}  2026-08-13 12:27
+EOF
+)"
+  FM_FAKE_BUSY=1
+  # The busy verdict comes from the crew's own semantic lifecycle record
+  # (bin/fm-busy-lib.sh), not from rendered pane text.
+  local gen; gen=$("$ROOT/bin/fm-busy-event.sh" arm "$d/state" stalebusy)
+  "$ROOT/bin/fm-busy-event.sh" apply "$d/state" stalebusy busy --gen "$gen" \
+    --source claude-hook --event user-prompt-submit
+  out=$(run_crew_state "$d" stalebusy)
+  assert_not_contains "$out" "state: failed" "a busy worker must not read failed from a stale run"
+  assert_contains "$out" "state: working" "busy worker reads working once the stale run is dropped"
+  assert_contains "$out" "source: pane" "busy worker is pane sourced with no attributable run"
+  pass "a stale failed run no longer masks a busy worker"
+}
+
+# Guard for the opposite direction: dropping the backward walk must NOT weaken
+# the coarse run-step source. When the branch's NEWEST row is itself failed and
+# its head still binds to this worktree, the run-step verdict stays authoritative
+# and outranks a cheerful status-log line.
+test_coarse_failed_run_on_current_head_still_reads_failed() {
+  reset_fakes
+  local d short out
+  d=$(new_case coarse-genuine-failed)
+  make_repo_on_branch "$d/wt" fm/feat-genfail
+  short=$(git -C "$d/wt" rev-parse --short=7 HEAD)
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/genfail.meta" "window=fm:fm-genfail" "worktree=$d/wt" \
+    "kind=ship" "harness=claude"
+  printf 'working: picking the pipeline back up\n' > "$d/state/genfail.status"
+  # Repo-wide answer belongs to another crew, so the coarse path decides.
+  FM_FAKE_AXI_STATUS="$(run_running fm/other-crew)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  running    fm/other-crew aaaaaaa  2026-08-13 12:50
+  failed     fm/feat-genfail ${short}  2026-08-13 12:27
+EOF
+)"
+  FM_FAKE_BUSY=1
+  out=$(run_crew_state "$d" genfail)
+  assert_contains "$out" "state: failed" "a genuinely failed current run still reads failed"
+  assert_contains "$out" "source: run-step" "genuine failure keeps the run-step source"
+  pass "a genuinely failed run on the current head still reads failed"
+}
+
+# Guard for the sibling defect fixed in 8e58f24 (a gone endpoint reading as
+# working). Dropping the stale run sends MORE tasks down the no-run fallback, so
+# that path must still refuse to trust a status log when the endpoint is gone.
+# Before the fix this case never even reached the endpoint check: the stale
+# failed run answered first.
+test_stale_failed_run_skipped_still_reports_gone_endpoint() {
+  reset_fakes
+  local d fixture submitted submitted_short live live_short out
+  d=$(new_case stale-failed-gone)
+  fixture=$(make_repo_with_diverged_run_head "$d/wt" fm/feat-stalegone)
+  submitted=$(printf '%s' "$fixture" | cut -d' ' -f1)
+  submitted_short=$(printf '%s' "$fixture" | cut -d' ' -f2)
+  live=$(printf '%s' "$fixture" | cut -d' ' -f3)
+  live_short=$(printf '%s' "$fixture" | cut -d' ' -f4)
+  assert_diverged_fixture "$d/wt" "$submitted" "$live"
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/stalegone.meta" "window=fm:fm-stalegone" "worktree=$d/wt" \
+    "kind=ship" "harness=claude"
+  printf 'working: still going\n' > "$d/state/stalegone.status"
+  FM_FAKE_RUN_HEAD="$live"
+  FM_FAKE_AXI_STATUS="$(run_running fm/feat-stalegone)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  running    fm/feat-stalegone ${live_short}  2026-08-13 12:41
+  failed     fm/feat-stalegone ${submitted_short}  2026-08-13 12:27
+EOF
+)"
+  FM_FAKE_TMUX_MISSING=1
+  out=$(run_crew_state "$d" stalegone)
+  assert_not_contains "$out" "state: failed" "gone endpoint must not inherit the stale run verdict"
+  assert_not_contains "$out" "state: working" "gone endpoint must not trust the status log"
+  assert_contains "$out" "state: unknown" "a gone endpoint with no attributable run is unknown"
+  assert_contains "$out" "backend target gone" "gone endpoint is named as the reason"
+  pass "dropping the stale run still reports a gone endpoint as gone"
+}
+
 test_coarse_run_does_not_probe_other_branch_ci_log_for_ready_status() {
   reset_fakes
   local d short; d=$(new_case coarse-ready-other-log)
@@ -1519,6 +1703,10 @@ test_terminal_passed
 test_terminal_failed
 test_cross_branch_attribution_via_runs_list
 test_cross_branch_attribution_picks_most_recent_row
+test_stale_failed_run_never_shadows_newer_live_run
+test_stale_failed_run_does_not_mask_busy_worker
+test_coarse_failed_run_on_current_head_still_reads_failed
+test_stale_failed_run_skipped_still_reports_gone_endpoint
 test_coarse_run_does_not_probe_other_branch_ci_log_for_ready_status
 test_other_branch_run_ignored
 test_no_run_busy_pane

@@ -27,7 +27,20 @@
 #      A run matches when its head equals the worktree HEAD, or the worktree HEAD
 #      is an ancestor of the run head (pipeline fix commits advanced the run on
 #      the same line of history). Local work that advanced past the run head, or
-#      diverged from it, invalidates attribution.
+#      diverged from it, invalidates attribution. Only ONE run per branch is ever
+#      a candidate - the newest. The coarse fallback stops at the branch's first
+#      (newest) row either way: matched, it answers; unmatched, the answer is no
+#      attributable run. It never falls back to an older run on the same branch,
+#      which is how a finished failed run once shadowed a live one (see
+#      nm_runs_status_for_branch).
+#      Code identity, not recency of writing, is what keeps this source honest,
+#      and it is why a run-step verdict outranks the status log even when the log
+#      was appended later: a run bound to the worktree HEAD describes THIS exact
+#      code, and any real progress by the crew moves HEAD and drops the binding
+#      on its own. So the terminal verdicts are not demoted below a fresher log
+#      line - a run that failed on the current code is a fact about the current
+#      code. What must never happen is exercising that authority on a run the
+#      crew has already moved past, which is an attribution question, above.
 #      The run-step is AUTHORITATIVE: running/fixing -> working, ci -> working,
 #      awaiting_approval/fix_review -> parked (with gate findings), terminal
 #      passed/checks-passed -> done, failed/cancelled -> failed. EXCEPT: while
@@ -368,10 +381,23 @@ nm_runs_status_for_branch() {  # <branch>
     rest=$(trim "$rest")
     sha=${rest%% *}
     if [ "$br" = "$branch" ]; then
-      # Same code-identity rule as axi status: skip a same-branch row whose
-      # short-sha does not match this worktree (rewritten or advanced tip).
+      # NEWEST ROW ONLY. The list is newest-first, so the first row for this
+      # branch is the only run that can describe its current state; every older
+      # row on the same branch is superseded by definition. Same code-identity
+      # rule as axi status - but when that newest row fails it, the answer is
+      # "no attributable run", never a walk back into the branch's history.
+      #
+      # Walking back is how a long-finished FAILED run came to be reported as a
+      # crew's CURRENT state (2026-08-13, task paytier-lint-coverage). The live
+      # run's head had diverged from the crew's worktree tip because the pipeline
+      # rebased it onto a newer base, so the newest row failed identity; the scan
+      # then reached the older failed row, whose head was still exactly the
+      # worktree tip, and matched it. That verdict is wrong twice over: the run
+      # it names ended long ago, and the run that is actually live is healthy.
+      # Returning "no run" instead hands the question to the pane and status-log
+      # fallback, which is where a live crew can still describe itself.
       if ! nm_coarse_head_matches_worktree "$sha"; then
-        continue
+        return 0
       fi
       printf '%s' "$st"
       return 0
