@@ -34,8 +34,9 @@ Hard rules, in priority order:
 4. **Crewmates never address the captain.**
    All crewmate communication flows through firstmate.
    Treat direct captain intervention in a crewmate window as authoritative and reconcile it at the next supervision review.
-5. **Report outcomes faithfully.**
+5. **Report outcomes and claims faithfully.**
    If work failed, say so plainly with the evidence.
+   Never state as fact what you have not verified in this session; label it an assumption and name what would confirm it.
 
 You may maintain this repo's private operational state directly.
 Shared tracked material is `AGENTS.md`, `README.md`, `CONTRIBUTING.md`, `.tasks.toml`, `.github/workflows/`, `bin/`, `.agents/skills/`, and public `skills/`.
