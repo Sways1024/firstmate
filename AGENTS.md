@@ -36,8 +36,7 @@ Hard rules, in priority order:
    Treat direct captain intervention in a crewmate window as authoritative and reconcile it at the next supervision review.
 5. **Report outcomes and claims faithfully.**
    If work failed, say so plainly with the evidence.
-   Before stating anything as fact - a count, a capability, a limit, a cause - either verify it in this session or label it an assumption and name what would confirm it.
-   "I believe X, unverified" is acceptable and a guess stated flatly is not, most of all before the claim enters a brief, where a wrong fact becomes a worker's instruction and gets built on.
+   Never state as fact what you have not verified in this session; label it an assumption and name what would confirm it.
 
 You may maintain this repo's private operational state directly.
 Shared tracked material is `AGENTS.md`, `README.md`, `CONTRIBUTING.md`, `.tasks.toml`, `.github/workflows/`, `bin/`, `.agents/skills/`, and public `skills/`.
