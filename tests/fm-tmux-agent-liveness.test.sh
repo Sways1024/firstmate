@@ -66,6 +66,23 @@ ln -s "$SLEEP_BIN" "$LAB/bin/amuse"
 ln -s "$SLEEP_BIN" "$LAB/bin/muse-binary"
 ln -s "$SLEEP_BIN" "$LAB/bin/muse-bind"
 
+# The symlink target must keep sleeping under any invoked name. A standalone
+# sleep does, but a multicall coreutils (uutils, which Ubuntu 26.04 installs as
+# coreutils, or busybox) picks its applet from argv[0]: `claude-link` runs the
+# `link` applet and an `exec -a` name finds none, so those windows exit at once
+# and read as missing. There, the stand-ins point at a compiled sleeper instead.
+CC_BIN=$(command -v cc 2>/dev/null || command -v gcc 2>/dev/null || true)
+printf '%s\n' '#include <unistd.h>' 'int main(void){for(;;)sleep(60);return 0;}' > "$LAB/spin.c"
+if ! bash -c 'exec -a fm-liveness-probe "$1" 0' _ "$SLEEP_BIN" >/dev/null 2>&1; then
+  if [ -z "$CC_BIN" ] || ! "$CC_BIN" -o "$LAB/spin" "$LAB/spin.c" 2>/dev/null; then
+    echo "skip: sleep dispatches on its invoked name and no C compiler can build a stand-in"
+    exit 0
+  fi
+  for standin in "$LAB"/bin/*; do
+    [ -L "$standin" ] && ln -sf "$LAB/spin" "$standin"
+  done
+fi
+
 # A launcher whose own process identity is a bare shell, running the harness as
 # a child in the same foreground process group - the shape the real Pi Launcher
 # path takes, and the one where trusting a single name source can produce a
@@ -179,9 +196,7 @@ pass "tmux liveness: unrelated muse-containing command names stay ambiguous"
 # real executable file rather than a symlink, because macOS takes the title
 # from the resolved target's name, so it is skipped where no C compiler exists.
 
-CC_BIN=$(command -v cc 2>/dev/null || command -v gcc 2>/dev/null || true)
 if [ -n "$CC_BIN" ] &&
-  printf '%s\n' '#include <unistd.h>' 'int main(void){for(;;)sleep(60);return 0;}' > "$LAB/spin.c" &&
   "$CC_BIN" -o "$LAB/bin/claude/2.1.220" "$LAB/spin.c" 2>/dev/null &&
   "$CC_BIN" -o "$LAB/bin/decoy/2.1.220" "$LAB/spin.c" 2>/dev/null; then
   new_window titled "$LAB/bin/claude/2.1.220"

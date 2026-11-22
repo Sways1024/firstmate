@@ -6,6 +6,14 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 TMP_ROOT=$(fm_test_tmproot fm-pi-watch-extension)
+# The Pi extension and the OpenCode plugin start every arm child as a login
+# shell (`bash -lc`), so the account's ~/.bash_profile or ~/.profile runs before
+# the fixture arm does. Those files are host-specific and can be slow (GitHub's
+# Ubuntu image loads nvm there), while these cases give an arm a few hundred
+# milliseconds to report readiness, so a slow profile lets the extension kill
+# the arm before it records itself. An empty HOME leaves only the system profile.
+export HOME="$TMP_ROOT/home"
+mkdir -p "$HOME"
 EXT="$ROOT/.pi/extensions/fm-primary-pi-watch.ts"
 # Node 24 warns when these test-only dynamic imports load tracked ESM plugins
 # from a clean checkout with no tracked .opencode/package.json. The warning is
