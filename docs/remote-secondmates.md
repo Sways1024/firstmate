@@ -18,14 +18,15 @@ Do not enable agent forwarding for Firstmate.
 `fm-on.sh` also disables agent forwarding, forwarding setup, and configured `SendEnv` patterns on every call, and arms bounded SSH dead-peer detection so a vanished host (a reboot, a dropped link) fails within a bounded window instead of hanging indefinitely; its [script header](../bin/fm-on.sh) owns the keepalive defaults and environment overrides.
 
 Clone Firstmate on the remote host at an absolute code-root path.
-Expose that clone's fixed entrypoint on the account's non-interactive SSH `PATH`, for example on macOS:
+Expose that clone's fixed entrypoint on the account's non-interactive SSH `PATH`.
+A `~/.local/bin` link works only where that directory is already on the account's non-interactive SSH `PATH`:
 
 ```sh
 mkdir -p ~/.local/bin
 ln -s /absolute/path/to/firstmate/bin/fm-remote-entrypoint.sh ~/.local/bin/fm-remote-entrypoint.sh
 ```
 
-On Linux, link it into a system directory instead, because stock Ubuntu's non-interactive SSH `PATH` excludes `~/.local/bin`:
+Otherwise link it into `/usr/local/bin`, for example on stock Ubuntu, whose non-interactive SSH `PATH` excludes `~/.local/bin`:
 
 ```sh
 sudo ln -s /absolute/path/to/firstmate/bin/fm-remote-entrypoint.sh /usr/local/bin/
