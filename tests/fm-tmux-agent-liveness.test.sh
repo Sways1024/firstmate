@@ -67,13 +67,23 @@ ln -s "$SLEEP_BIN" "$LAB/bin/muse-binary"
 ln -s "$SLEEP_BIN" "$LAB/bin/muse-bind"
 
 # The symlink target must keep sleeping under any invoked name. A standalone
-# sleep does, but a multicall coreutils (uutils, which Ubuntu 26.04 installs as
-# coreutils, or busybox) picks its applet from argv[0]: `claude-link` runs the
-# `link` applet and an `exec -a` name finds none, so those windows exit at once
-# and read as missing. There, the stand-ins point at a compiled sleeper instead.
+# sleep does, but a multicall coreutils does not: busybox picks its applet from
+# argv[0], and the uutils build Ubuntu 26.04 installs as coreutils refuses to
+# run at all when invoked through a symlink whose name differs from its own,
+# while still accepting a bare `exec -a` name. Those windows would exit at once
+# and read as missing, so each stand-in is probed exactly as the cases below
+# run it, and on failure they all point at a compiled sleeper instead.
 CC_BIN=$(command -v cc 2>/dev/null || command -v gcc 2>/dev/null || true)
 printf '%s\n' '#include <unistd.h>' 'int main(void){for(;;)sleep(60);return 0;}' > "$LAB/spin.c"
-if ! bash -c 'exec -a fm-liveness-probe "$1" 0' _ "$SLEEP_BIN" >/dev/null 2>&1; then
+standins_run() {
+  local standin
+  for standin in "$LAB"/bin/*; do
+    [ -L "$standin" ] || continue
+    "$standin" 0 >/dev/null 2>&1 || return 1
+  done
+  bash -c 'exec -a 2.1.220 "$1" 0' _ "$LAB/bin/notaharness" >/dev/null 2>&1
+}
+if ! standins_run; then
   if [ -z "$CC_BIN" ] || ! "$CC_BIN" -o "$LAB/spin" "$LAB/spin.c" 2>/dev/null; then
     echo "skip: sleep dispatches on its invoked name and no C compiler can build a stand-in"
     exit 0
