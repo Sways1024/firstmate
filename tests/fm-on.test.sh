@@ -86,9 +86,21 @@ host=$1
 entry=$2
 shift 2
 [ "$host" = remote-mac ] || exit 91
+if [ "$entry" = command ]; then
+  [ "$*" = '-v fm-remote-entrypoint.sh' ] || exit 93
+  case "${FM_FAKE_SSH_MODE:-normal}" in
+    no-entrypoint) exit 1 ;;
+    no-entrypoint-probe-unreachable) exit 255 ;;
+    *) exit 0 ;;
+  esac
+fi
 [ "$entry" = fm-remote-entrypoint.sh ] || exit 92
 case "${FM_FAKE_SSH_MODE:-normal}" in
   unreachable) exit 255 ;;
+  no-entrypoint|no-entrypoint-probe-unreachable)
+    printf 'bash: line 1: fm-remote-entrypoint.sh: command not found\n' >&2
+    exit 127
+    ;;
   ambiguous)
     "$FM_FAKE_REMOTE_ENTRYPOINT" "$@"
     exit 255
@@ -178,6 +190,47 @@ assert_contains "$INVALID_INTERVAL_OUT" 'FM_SSH_ALIVE_INTERVAL must be a positiv
 assert_contains "$INVALID_COUNT_OUT" 'FM_SSH_ALIVE_COUNT_MAX must be a positive integer' "invalid count did not explain its constraint"
 [ "$(cat "$SSH_COUNT")" -eq "$SSH_CALLS_BEFORE_INVALID" ] || fail "invalid keepalive configuration launched ssh"
 pass "fm-on rejects invalid dead-peer settings before launching ssh"
+
+# Stock Ubuntu's non-interactive SSH PATH excludes ~/.local/bin, so the bare
+# entrypoint name fails with 127 before the doctor can run. That failure must
+# name its setup step, while a relayed command's own 127 and an unconfirmable
+# lookup stay silent, and the exit status is returned unchanged in every case.
+set +e
+FM_FAKE_SSH_MODE=no-entrypoint fm_on ios fm-probe-two.sh > "$TMP_ROOT/stdout" 2> "$TMP_ROOT/stderr"
+rc=$?
+set -e
+[ "$rc" -eq 127 ] || fail "a missing remote entrypoint did not preserve exit 127 (got $rc)"
+assert_grep 'command not found' "$TMP_ROOT/stderr" "the remote shell's own error was hidden"
+assert_grep 'fm-remote-entrypoint.sh is not on the non-interactive SSH PATH of remote-mac' "$TMP_ROOT/stderr" \
+  "a missing remote entrypoint did not name itself"
+assert_grep 'docs/remote-secondmates.md, Prerequisites' "$TMP_ROOT/stderr" "the diagnostic did not point at the setup step"
+pass "fm-on names the missing remote entrypoint and its setup step on exit 127"
+
+set +e
+FM_FAKE_SSH_MODE=no-entrypoint-probe-unreachable fm_on ios fm-probe-two.sh >/dev/null 2> "$TMP_ROOT/stderr"
+rc=$?
+set -e
+[ "$rc" -eq 127 ] || fail "an unconfirmable entrypoint lookup changed exit 127 (got $rc)"
+assert_no_grep 'is not on the non-interactive SSH PATH' "$TMP_ROOT/stderr" \
+  "an unreachable lookup was reported as a missing entrypoint"
+pass "fm-on stays silent when the entrypoint lookup cannot confirm it missing"
+
+: > "$SSH_LOG"
+set +e
+fm_on ios fm-probe-one.sh "$REMOTE_HOME/argv127.bin" 127 < /dev/null > /dev/null 2> "$TMP_ROOT/stderr"
+rc=$?
+set -e
+[ "$rc" -eq 127 ] || fail "a relayed command's exit 127 was not preserved (got $rc)"
+assert_no_grep 'is not on the non-interactive SSH PATH' "$TMP_ROOT/stderr" \
+  "a relayed command's own 127 was misreported as a missing entrypoint"
+[ "$(grep -c -- ' command -v fm-remote-entrypoint.sh$' "$SSH_LOG")" -eq 1 ] \
+  || fail "exit 127 did not run exactly one entrypoint lookup"
+set +e
+fm_on ios fm-probe-one.sh "$REMOTE_HOME/argv23.bin" 23 < /dev/null > /dev/null 2>&1
+set -e
+[ "$(grep -c -- ' command -v fm-remote-entrypoint.sh$' "$SSH_LOG")" -eq 1 ] \
+  || fail "a non-127 exit ran an entrypoint lookup"
+pass "fm-on leaves a relayed exit 127 and other exit codes undiagnosed"
 
 out=$(TOP_SECRET='must-not-cross' fm_on remote-mac fm-probe-two.sh)
 assert_contains "$out" "home=$REMOTE_HOME" "remote FM_HOME was not explicit"

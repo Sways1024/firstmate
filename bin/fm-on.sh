@@ -29,6 +29,10 @@
 # is doing, so a legitimately long-but-alive remote command is never falsely
 # killed. FM_SSH_ALIVE_INTERVAL and FM_SSH_ALIVE_COUNT_MAX override the
 # defaults; the worst-case detection window is roughly interval * count.
+#
+# A remote exit 127 triggers one read-only lookup of the entrypoint on the
+# same non-interactive SSH PATH. When that lookup proves it missing, one
+# diagnostic names the setup step; the original exit status is still returned.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -103,10 +107,31 @@ case "$ALIVE_COUNT_MAX" in ''|*[!0-9]*) die "FM_SSH_ALIVE_COUNT_MAX must be a po
 [ "$ALIVE_INTERVAL" -gt 0 ] || die "FM_SSH_ALIVE_INTERVAL must be a positive integer: $ALIVE_INTERVAL"
 [ "$ALIVE_COUNT_MAX" -gt 0 ] || die "FM_SSH_ALIVE_COUNT_MAX must be a positive integer: $ALIVE_COUNT_MAX"
 
-"$SSH_BIN" \
-  -o ForwardAgent=no \
-  -o ClearAllForwardings=yes \
-  -o 'SendEnv=-*' \
-  -o "ServerAliveInterval=$ALIVE_INTERVAL" \
-  -o "ServerAliveCountMax=$ALIVE_COUNT_MAX" \
+SSH_OPTS=(
+  -o ForwardAgent=no
+  -o ClearAllForwardings=yes
+  -o 'SendEnv=-*'
+  -o "ServerAliveInterval=$ALIVE_INTERVAL"
+  -o "ServerAliveCountMax=$ALIVE_COUNT_MAX"
+)
+
+set +e
+"$SSH_BIN" "${SSH_OPTS[@]}" \
   -- "$HOST" fm-remote-entrypoint.sh "$PROTOCOL" "$ROOT_B64" "$HOME_B64" "$ARGV_B64"
+RC=$?
+set -e
+
+# Exit 127 is ambiguous: the remote shell's "command not found" for the
+# entrypoint itself, or a relayed command's own status. Only a read-only
+# lookup of the entrypoint on the same non-interactive PATH separates them;
+# a found entrypoint or an unreachable probe (255) adds nothing.
+if [ "$RC" -eq 127 ]; then
+  set +e
+  "$SSH_BIN" "${SSH_OPTS[@]}" -- "$HOST" command -v fm-remote-entrypoint.sh </dev/null >/dev/null 2>&1
+  PROBE_RC=$?
+  set -e
+  if [ "$PROBE_RC" -ne 0 ] && [ "$PROBE_RC" -ne 255 ]; then
+    printf 'error: fm-remote-entrypoint.sh is not on the non-interactive SSH PATH of %s; link it into a directory that PATH includes, such as /usr/local/bin (docs/remote-secondmates.md, Prerequisites)\n' "$HOST" >&2
+  fi
+fi
+exit "$RC"
