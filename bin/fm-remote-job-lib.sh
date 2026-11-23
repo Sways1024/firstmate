@@ -945,7 +945,10 @@ fm_remote_job_reload_launchagent() { # <account-home> <uid>
 # default, delivered a second SIGTERM inside the child's shutdown handler and
 # killed it mid-cleanup at every reboot. RestartPreventExitStatus is the one
 # exception to never giving up: a worker whose code root is abandoned exits
-# FM_REMOTE_JOB_ABANDONED_EXIT, so the unit cannot outlive its checkout.
+# FM_REMOTE_JOB_ABANDONED_EXIT, so the unit cannot outlive its checkout. The
+# ConditionPathExists pair mirrors fm_remote_job_root_is_live for a start after
+# the checkout is already gone, such as the next boot: a failed condition skips
+# the start instead of entering Restart=always.
 fm_remote_job_render_systemd_unit() { # <remote-root> <account-home> <uid>
   local root=$1 account_home=$2 uid=$3 worker
   worker="$root/bin/fm-remote-job-worker.sh"
@@ -956,6 +959,8 @@ fm_remote_job_render_systemd_unit() { # <remote-root> <account-home> <uid>
 [Unit]
 Description=Firstmate remote job worker
 StartLimitIntervalSec=0
+ConditionPathExists=$root/AGENTS.md
+ConditionPathExists=$worker
 
 [Service]
 Type=simple

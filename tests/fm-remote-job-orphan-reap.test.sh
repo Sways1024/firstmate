@@ -175,6 +175,18 @@ wait_serving() {
   return 1
 }
 
+# start_conditions_hold <unit-file>: 0 when the unit has path conditions and
+# every one exists, the check the user manager makes before each start.
+start_conditions_hold() {
+  local path count=0
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    count=$((count + 1))
+    [ -e "$path" ] || return 1
+  done < <(fm_test_unit_value "$1" Unit.ConditionPathExists)
+  [ "$count" -gt 0 ]
+}
+
 # restart_prevented <unit-file> <exit-status>: 0 when the unit's
 # RestartPreventExitStatus stops Restart=always from relaunching after it.
 restart_prevented() {
@@ -192,6 +204,7 @@ UNIT="$UNIT_CASE/dev.firstmate.remote-job.service"
 bash -c '. "$1" && fm_remote_job_render_systemd_unit "$2" "$3" "$4"' _ "$ROOT/bin/fm-remote-job-lib.sh" \
   "$UNIT_CASE/remote-root" "$UNIT_CASE/account" "$(id -u)" > "$UNIT" || fail "could not render the worker unit"
 [ "$(fm_test_unit_value "$UNIT" Service.Restart)" = always ] || fail "the worker unit does not restart like launchd KeepAlive"
+start_conditions_hold "$UNIT" || fail "the worker unit would skip starting a worker whose checkout is intact"
 
 run_unit_worker "$UNIT" "$UNIT_CASE/remote-jobs"
 track "$UNIT_WORKER"
@@ -214,7 +227,13 @@ UNIT_RC=$?
 wait_gone "$UNIT_SERVE" 20 || fail "a serving child outlived the abandoned unit-run worker"
 restart_prevented "$UNIT" "$UNIT_RC" ||
   fail "the abandoned worker exited $UNIT_RC, which the unit's Restart=always would relaunch forever"
-pass "a unit-managed worker whose checkout is gone exits a status its unit never restarts, and a clean stop does not"
+! start_conditions_hold "$UNIT" ||
+  fail "the worker unit would still start at the next boot with its checkout gone, and Restart=always would retry it forever"
+mkdir -p "$UNIT_CASE/remote-root/bin"
+printf 'fixture\n' > "$UNIT_CASE/remote-root/AGENTS.md"
+! start_conditions_hold "$UNIT" ||
+  fail "the worker unit would start from a checkout that has no worker script"
+pass "a unit-managed worker whose checkout is gone exits a status its unit never restarts, its unit skips any later start, and a clean stop does not"
 
 # --- the belt-and-suspenders sweep over already-orphaned workers -------------
 #

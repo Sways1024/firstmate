@@ -616,6 +616,8 @@ assert_unit "$JOB_UNIT" Service.ExecStart "$ROOT/bin/fm-remote-job-worker.sh" "t
 assert_unit "$JOB_UNIT" Service.Environment.HOME "$CASE_HOME" "the worker unit does not pin the account HOME"
 assert_unit "$JOB_UNIT" Service.Environment.FM_ROOT_OVERRIDE "$ROOT" "the worker unit does not pin its code root"
 assert_unit "$JOB_UNIT" Service.KillMode mixed "the worker unit's stop signal reaches the serving child as well as its supervisor"
+assert_unit "$JOB_UNIT" Unit.ConditionPathExists "$ROOT/AGENTS.md"$'\n'"$ROOT/bin/fm-remote-job-worker.sh" \
+  "the worker unit does not skip a start once its checkout is gone"
 assert_unit "$HERDR_UNIT" Service.ExecStart "$CASE_BIN/herdr server --session fm-remote" \
   "the herdr unit does not run the fm-remote server in the foreground"
 HERDR_UNIT_PATH=$(fm_test_unit_value "$HERDR_UNIT" Service.Environment.PATH)

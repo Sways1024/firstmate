@@ -48,6 +48,7 @@ Linux uses the same queue and worker protocol without the Aqua-session requireme
 Where the account's systemd user manager serves it, the Linux worker is the `dev.firstmate.remote-job.service` user unit, and its logs are in `journalctl --user -u dev.firstmate.remote-job.service`.
 A worker stops itself once its configured code root stops being a Firstmate checkout, so a worker started from a worktree cannot outlive that worktree, and `bin/fm-remote-job-reap-orphans.sh` clears any worker already left behind that way without ever touching one whose checkout still exists.
 That stop exits with a dedicated status the worker unit names in `RestartPreventExitStatus`, so `Restart=always` does not relaunch a worker whose checkout is gone.
+The unit also requires the checkout's `AGENTS.md` and worker script to exist before every start, so after a reboot it skips starting rather than retrying a checkout that is gone.
 The remote account must provide the required toolchain, the selected worker runtime, the selected session backend, and credentials that work on that host.
 The origin URL named for each project must be reachable from the remote account because projects are cloned on that host rather than copied from the primary.
 
