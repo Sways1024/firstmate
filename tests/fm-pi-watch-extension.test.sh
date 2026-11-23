@@ -1337,7 +1337,7 @@ await hooks.event(event);
 // attempt still in flight rather than starting a fresh one. Its lock check walks
 // the ps ancestry, which can outlast any fixed sleep on a loaded runner, so join
 // it here before rewriting the lock; otherwise the second event below inherits
-// this attempt's read-only verdict and the arm never runs.
+// the read-only verdict of this attempt and the arm never runs.
 const denied = await globalThis.__firstmateOpenCodeWatchArm.ensureArmed("session-test", client);
 if (denied !== "read-only") {
   console.error(`expected read-only without the session lock, got ${denied}`);
