@@ -724,6 +724,15 @@ fm_remote_job_process_command() {
   printf '%s\n' "$value"
 }
 
+fm_remote_job_process_ppid() { # <pid>
+  local pid=$1 ps_bin value
+  if [ -x /bin/ps ]; then ps_bin=/bin/ps; elif [ -x /usr/bin/ps ]; then ps_bin=/usr/bin/ps; else return 1; fi
+  value=$("$ps_bin" -p "$pid" -o ppid= 2>/dev/null) || return 1
+  value=$(printf '%s' "$value" | tr -d '[:space:]')
+  case "$value" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$value"
+}
+
 fm_remote_job_process_pgid() { # <pid>
   local pid=$1 ps_bin value
   if [ -x /bin/ps ]; then ps_bin=/bin/ps; elif [ -x /usr/bin/ps ]; then ps_bin=/usr/bin/ps; else return 1; fi
@@ -1011,18 +1020,33 @@ fm_remote_job_systemd_worker_managed() { # <remote-root> <account-home>
   return "$rc"
 }
 
+# True when the serving worker <pid> runs under the worker unit: its restart
+# supervisor is the unit's main process.
+fm_remote_job_unit_runs_worker() { # <serving-pid>
+  local main ppid
+  main=$(fm_remote_systemd_ctl show -p MainPID --value "$FM_REMOTE_JOB_SYSTEMD_UNIT" 2>/dev/null) || return 1
+  case "$main" in ''|0|*[!0-9]*) return 1 ;; esac
+  ppid=$(fm_remote_job_process_ppid "$1") || return 1
+  [ "$ppid" = "$main" ]
+}
+
 fm_remote_job_start_systemd_worker() { # <remote-root> <account-home>
   local root=$1 account_home=$2 pid out
   fm_remote_job_prepare_state "$account_home" || return 1
   if fm_remote_job_worker_owned_alive "$root" "$account_home"; then
     if fm_remote_job_worker_identity_matches "$root" "$account_home"; then return 0; fi
-    # A stale worker, including one started before the unit existed, holds the
-    # worker lock the unit's fresh worker needs, so stop its whole tree first.
+    # A stale worker the unit does not run, including one started before the
+    # unit existed, holds the worker lock the unit's fresh worker needs, so stop
+    # its whole tree first. The unit's own stale worker is left to the restart:
+    # its serving child shares the supervisor's group, so a group signal would
+    # reach it twice, while KillMode=mixed signals the supervisor alone.
     pid=$FM_REMOTE_JOB_OWNER_PID
-    fm_remote_job_stop_worker_tree "$pid" || {
-      FM_REMOTE_JOB_ERROR="stale remote job worker did not stop safely"
-      return 1
-    }
+    if ! fm_remote_job_unit_runs_worker "$pid"; then
+      fm_remote_job_stop_worker_tree "$pid" || {
+        FM_REMOTE_JOB_ERROR="stale remote job worker did not stop safely"
+        return 1
+      }
+    fi
   fi
   if ! out=$(fm_remote_systemd_ctl restart "$FM_REMOTE_JOB_SYSTEMD_UNIT" 2>&1); then
     FM_REMOTE_JOB_ERROR="systemctl --user restart $FM_REMOTE_JOB_SYSTEMD_UNIT refused: ${out:-no diagnostic}"

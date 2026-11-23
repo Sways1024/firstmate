@@ -161,6 +161,12 @@ printf '%s\n' "$*" >> "$FM_FAKE_STATE/systemctl.log"
 shift
 case "${1:-}" in
   show-environment) printf 'HOME=%s\nLANG=C.UTF-8\n' "$FM_FAKE_SYSTEMD_HOME" ;;
+  show)
+    [ "${2:-} ${3:-} ${4:-}" = '-p MainPID --value' ] || exit 1
+    main=$(cat "$FM_FAKE_STATE/main-${5:-}" 2>/dev/null || true)
+    kill -0 "${main:-0}" 2>/dev/null || main=0
+    printf '%s\n' "$main"
+    ;;
   daemon-reload) : ;;
   enable) touch "$FM_FAKE_STATE/enabled-$2" ;;
   is-enabled) if [ -f "$FM_FAKE_STATE/enabled-$2" ]; then printf 'enabled\n'; else printf 'disabled\n'; exit 1; fi ;;
@@ -168,6 +174,14 @@ case "${1:-}" in
     case "$2" in
       dev.firstmate.herdr.fm-remote.service) printf 'true\n' > "$FM_FAKE_HERDR_RUNNING" ;;
       dev.firstmate.remote-job.service)
+        # A restart first stops the running main process as KillMode=mixed
+        # does, with one SIGTERM to it alone, and waits for it to exit.
+        main=$(cat "$FM_FAKE_STATE/main-$2" 2>/dev/null || true)
+        if [ "$1" = restart ] && [ -n "$main" ] && kill -0 "$main" 2>/dev/null; then
+          printf 'stopped main %s\n' "$main" >> "$FM_FAKE_STATE/unit-stops.log"
+          kill -TERM "$main"
+          for _ in $(seq 1 200); do kill -0 "$main" 2>/dev/null || break; sleep 0.05; done
+        fi
         # Run the installed unit's own ExecStart and Environment, as the user
         # manager would, so the contract itself must produce a working worker.
         unit="$FM_FAKE_SYSTEMD_HOME/.config/systemd/user/$2"
@@ -177,6 +191,7 @@ case "${1:-}" in
           < <(sed -n 's/^Environment="\(.*\)"$/\1/p' "$unit")
         nohup env -i PATH="$PATH" "${env_args[@]}" FM_REMOTE_JOB_PLATFORM_OVERRIDE=Linux \
           "$exec_start" >> "$FM_FAKE_STATE/unit-worker.log" 2>&1 < /dev/null &
+        printf '%s\n' "$!" > "$FM_FAKE_STATE/main-$2"
         ;;
     esac
     ;;
@@ -690,16 +705,18 @@ pass "with an installed unit the linux worker is started through that unit"
 # root's own stale unit and starts through it, and leaves another checkout's
 # unit alone.
 
-# lib_ensure_worker: the entrypoint's worker start for this case's account under
-# its stand-in user manager; sets LIB_ENSURE_OUT and LIB_ENSURE_RC.
+# lib_ensure_worker [lib-function]: the entrypoint's worker start, or another
+# job-library start function, for this case's account under its stand-in user
+# manager; sets LIB_ENSURE_OUT and LIB_ENSURE_RC.
 lib_ensure_worker() {
   set +e
   # shellcheck disable=SC2016 # The child shell expands its own arguments and error text.
   LIB_ENSURE_OUT=$(env -i PATH="$CASE_HOME/.local/bin:$CASE_BIN:$BASE_PATH" HOME="$CASE_HOME" \
     FM_FAKE_STATE="$CASE_STATE" FM_FAKE_SYSTEMD_HOME="$CASE_HOME" FM_FAKE_HERDR_RUNNING="$CASE_HERDR_RUNNING" \
     FM_REMOTE_JOB_PLATFORM_OVERRIDE=Linux \
-    bash -c '. "$1/bin/fm-remote-job-lib.sh" && fm_remote_job_ensure_worker "$1" "$2" ||
-      { printf "%s\n" "$FM_REMOTE_JOB_ERROR"; exit 1; }' _ "$ROOT" "$CASE_HOME" 2>&1)
+    bash -c '. "$1/bin/fm-remote-job-lib.sh" && "$3" "$1" "$2" ||
+      { printf "%s\n" "$FM_REMOTE_JOB_ERROR"; exit 1; }' _ "$ROOT" "$CASE_HOME" \
+    "${1:-fm_remote_job_ensure_worker}" 2>&1)
   LIB_ENSURE_RC=$?
   set -e
 }
@@ -745,6 +762,46 @@ assert_no_regex '^--user \(daemon-reload\|enable\|restart\|start\)' "$CASE_STATE
   "the start reloaded or restarted a worker unit that belongs to another checkout"
 stop_case_worker
 pass "a stale worker unit for this root is republished and started through, and another checkout's unit is left alone"
+
+# --- a stale worker is replaced without a second SIGTERM to its child --------
+# The unit's serving child shares its supervisor's process group, so stopping
+# that group would deliver a second SIGTERM inside the child's shutdown
+# handler. The unit's own stale worker is left to the restart, which signals
+# the supervisor alone; a worker the unit does not run is still stopped first.
+CASE_JOB_STATE="$CASE_HOME/.firstmate/remote-job"
+render_worker_unit "$ROOT" > "$JOB_UNIT"
+lib_ensure_worker
+expect_code 0 "$LIB_ENSURE_RC" "the worker did not start through its current unit"$'\n'"$LIB_ENSURE_OUT"
+UNIT_MAIN=$(cat "$CASE_STATE/main-dev.firstmate.remote-job.service")
+OLD_SERVE=$(cat "$CASE_JOB_STATE/worker.pid")
+printf 'stale\n' > "$CASE_JOB_STATE/worker.identity"
+: > "$CASE_STATE/unit-stops.log"
+lib_ensure_worker
+expect_code 0 "$LIB_ENSURE_RC" "the unit's own stale worker was not replaced"$'\n'"$LIB_ENSURE_OUT"
+assert_line "stopped main $UNIT_MAIN" "$CASE_STATE/unit-stops.log" \
+  "the unit's own stale worker was signalled as a group before its restart, so its serving child took a second SIGTERM"
+! kill -0 "$OLD_SERVE" 2>/dev/null || fail "the unit's own stale serving child survived its restart"
+[ "$(cat "$CASE_JOB_STATE/worker.pid")" != "$OLD_SERVE" ] || fail "the restart did not start a fresh worker"
+stop_case_worker
+
+lib_ensure_worker fm_remote_job_start_linux_worker
+expect_code 0 "$LIB_ENSURE_RC" "a detached worker did not start"$'\n'"$LIB_ENSURE_OUT"
+for _ in $(seq 1 100); do
+  [ -f "$CASE_JOB_STATE/worker.ready" ] && [ -f "$CASE_JOB_STATE/worker.identity" ] && break
+  sleep 0.05
+done
+DETACHED_SERVE=$(cat "$CASE_JOB_STATE/worker.pid")
+printf 'stale\n' > "$CASE_JOB_STATE/worker.identity"
+: > "$CASE_STATE/unit-stops.log"
+: > "$CASE_STATE/systemctl.log"
+lib_ensure_worker
+expect_code 0 "$LIB_ENSURE_RC" "a stale detached worker was not replaced by the unit's worker"$'\n'"$LIB_ENSURE_OUT"
+! kill -0 "$DETACHED_SERVE" 2>/dev/null || fail "a stale worker the unit does not run was left beside the unit's worker"
+assert_line '--user restart dev.firstmate.remote-job.service' "$CASE_STATE/systemctl.log" \
+  "the stale detached worker was not replaced through the unit"
+[ "$(cat "$CASE_JOB_STATE/worker.pid")" != "$DETACHED_SERVE" ] || fail "the unit did not start a fresh worker"
+stop_case_worker
+pass "the unit's own stale worker is stopped only by its restart, and a worker the unit does not run is stopped first"
 
 # --- a user manager without lingering is a human gap ------------------------
 
