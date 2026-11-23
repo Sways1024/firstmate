@@ -418,8 +418,182 @@ assert_absent "$PARENT/state/procevent/$SID.source" \
   "refused retirement left the reply source running past its pending-result check"
 remote_env "$ADAPTER" handle ios 11 "$RESULT_ELEVEN" >/dev/null 2>&1 || [ "$?" -eq 3 ] \
   || fail "pending continuity result could not be acknowledged after retirement refusal"
+touch "$PARENT/state/remote-replies/ios.transport-lost"
 remote_env "$ADAPTER" retire ios >/dev/null
 assert_absent "$PARENT/state/remote-replies/ios.cursor" "adapter retirement left its cursor"
+assert_absent "$PARENT/state/remote-replies/ios.transport-lost" "adapter retirement left its transport-lost marker"
 pass "remote reply retirement quiesces and refuses unhandled captured results"
+
+# --- mid-session liveness: the relay's recovery after SSH failure ----------
+# A copied code root with stub fm-on.sh and fm-spawn.sh isolates the relaunch
+# decision: the stubs answer the readiness doctor, the endpoint state probe, and
+# the delta poll from scenario files, and log every remote call and spawn.
+LROOT="$TMP_ROOT/liveness-root"
+LHOME="$TMP_ROOT/liveness-home"
+LIVE="$TMP_ROOT/liveness-scenario"
+mkdir -p "$LROOT" "$LHOME/state" "$LHOME/data" "$LIVE"
+cp -R "$ROOT/bin" "$LROOT/bin"
+printf 'fixture\n' > "$LROOT/AGENTS.md"
+cat > "$LROOT/bin/fm-on.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'on %s\n' "$*" >> "$FM_FAKE_LIVE/calls.log"
+[ ! -f "$FM_FAKE_LIVE/host-down" ] || exit 255
+case "$2" in
+  fm-remote-doctor.sh)
+    if [ -f "$FM_FAKE_LIVE/readiness-gap" ]; then
+      printf 'check linger=human: lingering is not enabled for fm\n'
+      exit 1
+    fi
+    printf 'ok: remote second-mate readiness confirmed on this host\n'
+    ;;
+  fm-remote-secondmate-control.sh)
+    case "$3" in
+      state) cat "$FM_FAKE_LIVE/state" ;;
+      route) printf 'backend=herdr\n' ;;
+    esac
+    ;;
+  fm-remote-delta-read.sh) exit "$(cat "$FM_FAKE_LIVE/poll-rc" 2>/dev/null || printf 75)" ;;
+esac
+SH
+cat > "$LROOT/bin/fm-spawn.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'spawn %s\n' "$*" >> "$FM_FAKE_LIVE/calls.log"
+[ ! -f "$FM_FAKE_LIVE/spawn-fail" ] || { printf 'remote host-local secondmate launch failed\n' >&2; exit 1; }
+[ ! -f "$FM_FAKE_LIVE/spawn-unknown" ] || { printf 'error: remote secondmate is unavailable or launch completion is unknown\n' >&2; exit 255; }
+SH
+chmod +x "$LROOT/bin/fm-on.sh" "$LROOT/bin/fm-spawn.sh"
+printf 'kind=secondmate\nwindow=2ndmate-ios\nremote_host=remote-mac\nharness=claude\n' > "$LHOME/state/ios.meta"
+MARKER="$LHOME/state/remote-replies/ios.transport-lost"
+
+live_source() { # runs one relay source pass; sets LIVE_RC
+  : > "$LIVE/calls.log"
+  set +e
+  FM_HOME="$LHOME" FM_ROOT_OVERRIDE="$LROOT" FM_FAKE_LIVE="$LIVE" \
+    "$LROOT/bin/fm-procevent-remote-reply.sh" source ios > "$LIVE/source.out" 2>&1
+  LIVE_RC=$?
+  set -e
+}
+spawn_count() { grep -c '^spawn ' "$LIVE/calls.log" || true; }
+
+printf 'dead\n' > "$LIVE/state"
+printf '255\n' > "$LIVE/poll-rc"
+live_source
+[ "$LIVE_RC" -eq 255 ] || fail "a failed poll did not keep its SSH status: $LIVE_RC"
+assert_present "$MARKER" "an SSH failure did not mark the relay transport as lost"
+assert_no_grep 'fm-remote-secondmate-control.sh' "$LIVE/calls.log" "a healthy relay probed liveness before any SSH failure"
+
+touch "$LIVE/host-down"
+live_source
+[ "$LIVE_RC" -eq 255 ] || fail "recovery against an unreachable host did not report unknown transport: $LIVE_RC"
+assert_present "$MARKER" "an unreachable host cleared the transport-lost marker"
+assert_no_grep 'fm-remote-delta-read.sh' "$LIVE/calls.log" "the relay polled before the host answered"
+[ "$(spawn_count)" -eq 0 ] || fail "a relaunch ran while the host was unreachable"
+pass "an SSH failure arms recovery, and an unreachable host keeps it armed without relaunching"
+
+rm -f "$LIVE/host-down"
+printf '75\n' > "$LIVE/poll-rc"
+live_source
+[ "$LIVE_RC" -eq 75 ] || fail "the poll did not resume after recovery: $LIVE_RC"
+assert_grep 'on ios fm-remote-doctor.sh' "$LIVE/calls.log" "recovery skipped the readiness gate"
+assert_grep 'on ios fm-remote-secondmate-control.sh state ios' "$LIVE/calls.log" "recovery skipped the endpoint state probe"
+[ "$(spawn_count)" -eq 1 ] || fail "a dead endpoint was not relaunched exactly once"$'\n'"$(cat "$LIVE/calls.log")"
+assert_grep 'spawn ios --secondmate' "$LIVE/calls.log" "recovery did not relaunch through the secondmate spawn"
+[ "$(grep -n '^spawn ' "$LIVE/calls.log" | cut -d: -f1)" -lt "$(grep -n 'fm-remote-delta-read.sh' "$LIVE/calls.log" | cut -d: -f1)" ] \
+  || fail "the poll resumed before the relaunch decision"
+assert_absent "$MARKER" "a completed recovery left the transport-lost marker"
+live_source
+[ "$(spawn_count)" -eq 0 ] || fail "a healthy relay relaunched again on the next poll"
+assert_no_grep 'fm-remote-doctor.sh' "$LIVE/calls.log" "a healthy relay reran the readiness gate"
+pass "once the host answers, a dead remote second mate is relaunched once and the poll resumes"
+
+for endpoint_state in alive missing ambiguous unreadable unverified; do
+  printf '%s\n' "$endpoint_state" > "$LIVE/state"
+  touch "$MARKER"
+  live_source
+  case "$endpoint_state" in
+    missing) [ "$(spawn_count)" -eq 1 ] || fail "a missing endpoint was not relaunched" ;;
+    *) [ "$(spawn_count)" -eq 0 ] || fail "recovery relaunched an endpoint whose state was $endpoint_state" ;;
+  esac
+  assert_absent "$MARKER" "recovery kept its marker after a $endpoint_state probe"
+done
+pass "recovery relaunches only a dead or missing endpoint and never duplicates a live or uncertain one"
+
+: > "$LHOME/state/ios.status"
+printf 'dead\n' > "$LIVE/state"
+touch "$LIVE/spawn-unknown" "$MARKER"
+live_source
+rm -f "$LIVE/spawn-unknown"
+[ "$LIVE_RC" -eq 255 ] || fail "a relaunch whose completion is unknown resumed the poll: $LIVE_RC"
+[ "$(spawn_count)" -eq 1 ] || fail "a dead endpoint was not relaunched before its completion went unknown"
+assert_no_grep 'fm-remote-delta-read.sh' "$LIVE/calls.log" "the relay polled after a relaunch whose completion is unknown"
+assert_present "$MARKER" "a relaunch whose completion is unknown disarmed recovery"
+assert_no_grep 'remote-liveness-ios' "$LHOME/state/ios.status" "a relaunch whose completion is unknown was escalated as a failure"
+printf 'alive\n' > "$LIVE/state"
+live_source
+[ "$LIVE_RC" -eq 75 ] || fail "the poll did not resume once the landed launch was found alive: $LIVE_RC"
+[ "$(spawn_count)" -eq 0 ] || fail "recovery relaunched a launch that had landed"
+assert_absent "$MARKER" "recovery stayed armed after finding the landed launch alive"
+assert_no_grep 'remote-liveness-ios' "$LHOME/state/ios.status" "finding the landed launch alive raised a blocker"
+pass "a relaunch whose completion is unknown keeps recovery armed without a blocker, and a landed launch clears it silently"
+
+printf 'dead\n' > "$LIVE/state"
+touch "$LIVE/spawn-fail" "$MARKER"
+live_source
+touch "$MARKER"
+live_source
+rm -f "$LIVE/spawn-fail"
+[ "$(grep -cF 'blocked [key=remote-liveness-ios]: remote secondmate ios was not recovered' "$LHOME/state/ios.status")" -eq 1 ] \
+  || fail "a failed relaunch was not escalated exactly once"
+assert_grep 'respawn failed after remote endpoint dead on its configured host' "$LHOME/state/ios.status" \
+  "the relaunch escalation did not carry its cause"
+touch "$LIVE/readiness-gap" "$MARKER"
+live_source
+rm -f "$LIVE/readiness-gap"
+[ "$(grep -c '^blocked \[key=remote-liveness-ios\]' "$LHOME/state/ios.status")" -eq 1 ] \
+  || fail "a later outage raised a second liveness blocker while the first was still open"
+printf 'resolved [key=remote-liveness-ios]: relaunched by hand\n' >> "$LHOME/state/ios.status"
+touch "$LIVE/spawn-fail" "$MARKER"
+live_source
+rm -f "$LIVE/spawn-fail"
+[ "$(grep -cF 'blocked [key=remote-liveness-ios]: remote secondmate ios was not recovered' "$LHOME/state/ios.status")" -eq 2 ] \
+  || fail "a later outage failing the same way after the blocker was resolved raised no new blocker"
+pass "the liveness blocker is raised once per outage and never again while it is still open"
+: > "$LHOME/state/ios.status"
+touch "$LIVE/readiness-gap" "$MARKER"
+live_source
+rm -f "$LIVE/readiness-gap"
+[ "$(spawn_count)" -eq 0 ] || fail "recovery relaunched past a readiness gap"
+assert_grep 'remote readiness failed on remote-mac: check linger=human:' "$LHOME/state/ios.status" \
+  "a readiness gap during recovery was not escalated with its check"
+assert_absent "$MARKER" "an escalated recovery kept retrying on every poll"
+pass "a failed relaunch or readiness gap during recovery is escalated once instead of retried every poll"
+
+# liveness_blocker_open: the shared decision fold's own reading of the blocker.
+liveness_blocker_open() {
+  bash -c '. "$1" && status_decision_open "$2" "$3"' _ "$ROOT/bin/fm-classify-lib.sh" \
+    "$LHOME/state/ios.status" remote-liveness-ios
+}
+resolved_count() { grep -c '^resolved \[key=remote-liveness-ios\]' "$LHOME/state/ios.status" || true; }
+liveness_blocker_open || fail "the readiness-gap blocker this case starts from is not open"
+printf 'dead\n' > "$LIVE/state"
+touch "$MARKER"
+live_source
+[ "$(spawn_count)" -eq 1 ] || fail "a dead endpoint behind an open blocker was not relaunched"
+! liveness_blocker_open || fail "a relaunch that recovered the second mate left its liveness blocker open"
+[ "$(resolved_count)" -eq 1 ] || fail "the recovering relaunch did not resolve its blocker exactly once"
+touch "$LIVE/spawn-fail" "$MARKER"
+live_source
+rm -f "$LIVE/spawn-fail"
+liveness_blocker_open || fail "a later failed relaunch did not raise a new blocker"
+printf 'alive\n' > "$LIVE/state"
+touch "$MARKER"
+live_source
+[ "$(spawn_count)" -eq 0 ] || fail "recovery relaunched an alive endpoint"
+! liveness_blocker_open || fail "finding the second mate alive left its liveness blocker open"
+[ "$(resolved_count)" -eq 2 ] || fail "finding the second mate alive did not resolve its blocker exactly once"
+touch "$MARKER"
+live_source
+[ "$(resolved_count)" -eq 2 ] || fail "a successful check with no open blocker wrote a resolution"
+pass "a later check that relaunches the second mate or finds it alive resolves an open liveness blocker, and is silent otherwise"
 
 echo "ALL TESTS PASSED"

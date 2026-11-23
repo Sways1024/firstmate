@@ -150,6 +150,8 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 . "$SCRIPT_DIR/fm-backend.sh"
 # shellcheck source=bin/fm-remote-readiness-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-remote-readiness-lib.sh"
+# shellcheck source=bin/fm-remote-liveness-lib.sh disable=SC1091
+. "$SCRIPT_DIR/fm-remote-liveness-lib.sh"
 # fm-timing-lib.sh is inert unless FM_TIMING_LOG names a file, which only the
 # deferred network stage sets, so an ordinary bootstrap run records nothing.
 # shellcheck source=bin/fm-timing-lib.sh disable=SC1091
@@ -581,8 +583,10 @@ secondmate_liveness_sweep() {
   # lacked.
   # A meta with no window remains owned by secondmate-provisioning recovery.
   # Secondmate homes never contain kind=secondmate meta, so this is naturally a
-  # primary-only no-op there. Mid-session liveness remains explicitly out of
-  # scope and requires a separate periodic signal.
+  # primary-only no-op there. A remote route's check is owned by
+  # bin/fm-remote-liveness-lib.sh, which the reply relay also runs mid-session
+  # once its transport recovers after an SSH failure; local mid-session
+  # liveness remains out of scope.
   [ -d "$STATE" ] || return 0
   local meta id remote_host label __fm_timing_stamp
   SECONDMATE_RESPAWNED_IDS=""
@@ -609,75 +613,22 @@ secondmate_liveness_sweep() {
 # unchanged.
 secondmate_liveness_one() {  # <meta> <id>
   local meta=$1 id=$2
-  local window harness backend target agent_state out cause remote_host remote_rc readiness_reason route_out remote_backend
+  local window harness backend target agent_state out cause remote_host
   window=$(fm_meta_get "$meta" window)
   [ -n "$window" ] || return 0
   harness=$(fm_meta_get "$meta" harness)
   remote_host=$(fm_meta_get "$meta" remote_host)
   if [ -n "$remote_host" ]; then
-    remote_rc=0
-    fm_remote_readiness_ensure "$SCRIPT_DIR" "$id" || remote_rc=$?
-    if [ "$remote_rc" -eq 255 ]; then
-      echo "SECONDMATE_LIVENESS: secondmate $id: skipped: remote host unavailable or endpoint state unknown; route preserved on $remote_host"
-      return 0
-    fi
-    if [ "$remote_rc" -ne 0 ]; then
-      readiness_reason=$(printf '%s\n' "$FM_REMOTE_READINESS_OUT" \
-        | awk '/^check [^=]+=(fixable|human):|^action:|^error:/ { print; exit }')
-      [ -n "$readiness_reason" ] || readiness_reason=$(first_line "$FM_REMOTE_READINESS_OUT")
-      [ -n "$readiness_reason" ] || readiness_reason="unknown readiness failure"
-      echo "SECONDMATE_LIVENESS: secondmate $id: skipped: remote readiness failed on $remote_host: $readiness_reason"
-      return 0
-    fi
-    if out=$("$SCRIPT_DIR/fm-on.sh" "$id" fm-remote-secondmate-control.sh state "$id" < /dev/null 2>/dev/null); then
-      remote_rc=0
-    else
-      remote_rc=$?
-    fi
-    if [ "$remote_rc" -eq 255 ]; then
-      echo "SECONDMATE_LIVENESS: secondmate $id: skipped: remote host unavailable or endpoint state unknown; route preserved on $remote_host"
-      return 0
-    fi
-    if [ "$remote_rc" -ne 0 ]; then
-      echo "SECONDMATE_LIVENESS: secondmate $id: skipped: remote endpoint probe unreadable on $remote_host"
-      return 0
-    fi
-    agent_state=$(printf '%s\n' "$out" | tail -1)
-    case "$agent_state" in
+    fm_remote_secondmate_liveness "$SCRIPT_DIR" "$FM_ROOT/bin" "$id" "$remote_host" "$STATE/$id.status" || true
+    case "$FM_REMOTE_LIVENESS_OUTCOME" in
       alive)
-        if route_out=$("$SCRIPT_DIR/fm-on.sh" "$id" fm-remote-secondmate-control.sh route "$id" < /dev/null 2>/dev/null); then
-          remote_rc=0
-        else
-          remote_rc=$?
-        fi
-        if [ "$remote_rc" -eq 255 ]; then
-          echo "SECONDMATE_LIVENESS: secondmate $id: skipped: remote host unavailable or endpoint route unknown; route preserved on $remote_host"
-          return 0
-        fi
-        if [ "$remote_rc" -ne 0 ]; then
-          echo "SECONDMATE_LIVENESS: secondmate $id: skipped: alive remote endpoint route is unreadable on $remote_host; inspect and migrate or retire it explicitly"
-          return 0
-        fi
-        remote_backend=$(printf '%s\n' "$route_out" | sed -n 's/^backend=//p' | tail -1)
-        if [ "$remote_backend" != herdr ]; then
-          echo "SECONDMATE_LIVENESS: secondmate $id: skipped: alive remote endpoint is recorded on backend '${remote_backend:-missing}'; migrate or retire it explicitly"
-          return 0
-        fi
-        [ "${FM_BOOTSTRAP_VERBOSE_FACTS:-0}" != 1 ] || echo "BOOTSTRAP_INFO: remote secondmate $id already live (host=$remote_host)"
+        [ "${FM_BOOTSTRAP_VERBOSE_FACTS:-0}" != 1 ] || echo "BOOTSTRAP_INFO: $FM_REMOTE_LIVENESS_MESSAGE"
         ;;
-      dead|missing)
-        cause="remote endpoint $agent_state on its configured host"
-        if out=$(FM_SPAWN_NO_GUARD=1 "$FM_ROOT/bin/fm-spawn.sh" "$id" --secondmate 2>&1); then
-          SECONDMATE_RESPAWNED_IDS="$SECONDMATE_RESPAWNED_IDS $id"
-          report_relaunch "$id" "$cause" "host=$remote_host"
-        else
-          echo "SECONDMATE_LIVENESS: secondmate $id: respawn failed after $cause: $(first_line "$out")"
-        fi
+      relaunched)
+        SECONDMATE_RESPAWNED_IDS="$SECONDMATE_RESPAWNED_IDS $id"
+        report_relaunch "$id" "$FM_REMOTE_LIVENESS_CAUSE" "host=$remote_host"
         ;;
-      ambiguous|unreadable|unverified)
-        echo "SECONDMATE_LIVENESS: secondmate $id: skipped: remote endpoint state is $agent_state on $remote_host"
-        ;;
-      *) echo "SECONDMATE_LIVENESS: secondmate $id: skipped: remote endpoint returned an invalid state" ;;
+      *) echo "SECONDMATE_LIVENESS: secondmate $id: $FM_REMOTE_LIVENESS_MESSAGE" ;;
     esac
     return 0
   fi

@@ -10,12 +10,15 @@
 # worker itself.
 #
 # A remote second mate always runs on the Herdr backend in the dedicated
-# fm-remote session. Its account therefore needs the Firstmate-owned Aqua Herdr
-# agent plus the sibling dev.firstmate.remote-job worker that runs normal fm-on
-# commands through the Aqua or Linux job-worker path. Doctor remains invokable
-# over the plain-SSH bootstrap path to inspect and repair that worker. SSH cannot
-# create an Aqua session, so a host with no GUI login is a human gap rather than
-# something --fix attempts to bypass.
+# fm-remote session. Its account therefore needs a Firstmate-owned keeper for
+# that Herdr server plus the sibling dev.firstmate.remote-job worker that runs
+# normal fm-on commands. On macOS both are Aqua LaunchAgents; SSH cannot create
+# an Aqua session, so a host with no GUI login is a human gap rather than
+# something --fix attempts to bypass. On Linux both are systemd user units with
+# Restart=always, dev.firstmate.remote-job.service and
+# dev.firstmate.herdr.fm-remote.service, so they come back after a reboot; that
+# needs lingering, which only a person with sudo can enable. Doctor remains
+# invokable over the plain-SSH bootstrap path to inspect and repair the worker.
 #
 # Line protocol, one fact per line, stable for script consumers:
 #   mode=check|fix
@@ -37,12 +40,16 @@
 # exits non-zero.
 #
 # --fix is idempotent and closes only automatable gaps: it writes and reloads
-# both Firstmate-owned Aqua agents, starts the Linux workers where no Aqua agent
-# applies, recreates the entrypoint symlink, and may add an owned ~/.local/bin
-# wrapper for a required tool it can discover under nvm, asdf, or mise. It never
-# installs packages, creates a login session, writes an auto-login password,
-# changes FileVault, stores an account password, or replaces a non-Firstmate
-# wrapper; those remain reported gaps.
+# both Firstmate-owned Aqua agents on macOS; on Linux it writes and enables
+# both user units where the account's systemd user manager serves it and starts
+# the worker and Herdr server through them, or starts them directly where no
+# user manager exists; it recreates the entrypoint symlink, and may add an
+# owned ~/.local/bin wrapper for a required tool it can discover under nvm,
+# asdf, or mise. It never restarts a running Herdr server, because that ends
+# every pane in it, so a rewritten Herdr unit applies from its next start. It
+# never installs packages, creates a login session, enables lingering, writes
+# an auto-login password, changes FileVault, stores an account password, or
+# replaces a non-Firstmate wrapper; those remain reported gaps.
 set -eu
 
 # Resolve this script's directory with builtins only: a host missing a required
@@ -69,6 +76,14 @@ LAUNCH_AGENT_PLIST="$LAUNCH_AGENT_DIR/$LAUNCH_AGENT_LABEL.plist"
 LAUNCH_AGENT_LOG_DIR="${HOME:-}/Library/Logs"
 LAUNCH_AGENT_LOG="$LAUNCH_AGENT_LOG_DIR/$LAUNCH_AGENT_LABEL.log"
 ENTRYPOINT_LINK="${HOME:-}/.local/bin/fm-remote-entrypoint.sh"
+# The documented Linux link: stock Ubuntu's non-interactive SSH PATH excludes
+# ~/.local/bin. The override exists only for tests; the fixed entrypoint runs
+# this doctor under env -i, so a real run always inspects /usr/local/bin.
+ENTRYPOINT_SYSTEM_LINK="${FM_REMOTE_DOCTOR_SYSTEM_BIN:-/usr/local/bin}/fm-remote-entrypoint.sh"
+HERDR_SYSTEMD_UNIT=$(fm_remote_systemd_herdr_unit "$HERDR_SESSION_NAME")
+# Set once per run_checks pass: yes when this account's systemd user manager
+# serves it, so Linux keeps the worker and Herdr server in user units.
+SYSTEMD_USER=no
 
 usage() { sed -n '2,5p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
@@ -224,6 +239,61 @@ launch_agent_loaded_contract_matches() {
   [[ "$loaded" == *'properties=keepalive|runatload'* ]] || return 1
 }
 
+# The Linux counterpart of the Aqua Herdr agent above. The server runs in the
+# foreground under the unit, with the same filesystem-composed PATH a job child
+# receives, so panes see the tools the worker does. Restart=always with no start
+# limit mirrors KeepAlive. A Herdr live handoff under systemd ends every pane,
+# so this server must never be updated that way.
+render_herdr_unit() { # <resolved-herdr-path>
+  local herdr_bin=$1 child_path
+  fm_remote_job_compose_operator_path "${HOME:-}" >/dev/null
+  child_path=$(fm_remote_job_build_child_path "$FM_ROOT")
+  fm_remote_systemd_safe_value "$herdr_bin" && fm_remote_systemd_safe_value "${HOME:-}" &&
+    fm_remote_systemd_safe_value "$child_path" || return 1
+  case "$UID_NUM" in ''|*[!0-9]*) return 1 ;; esac
+  cat <<UNIT
+# Firstmate-owned unit: bin/fm-remote-doctor.sh --fix writes and enables it.
+# Never update this server with a Herdr live handoff: under systemd that ends every pane.
+[Unit]
+Description=Firstmate Herdr server for the $HERDR_SESSION_NAME session
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=$herdr_bin server --session $HERDR_SESSION_NAME
+Environment="HOME=${HOME:-}"
+Environment="PATH=$child_path"
+Environment="LANG=C.UTF-8"
+Environment="XDG_RUNTIME_DIR=/run/user/$UID_NUM"
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+UNIT
+}
+
+# Renders one Linux unit contract into a temp file named by RENDERED_UNIT.
+render_unit_to_temp() { # remote-job|herdr
+  local herdr_bin
+  RENDERED_UNIT=$(mktemp "${TMPDIR:-/tmp}/fm-remote-doctor-unit.XXXXXX") || return 1
+  case "$1" in
+    remote-job) fm_remote_job_render_systemd_unit_to "$FM_ROOT" "${HOME:-}" "$RENDERED_UNIT" ;;
+    herdr)
+      herdr_bin=$(command -v herdr 2>/dev/null) &&
+        render_herdr_unit "$herdr_bin" > "$RENDERED_UNIT"
+      ;;
+  esac || { rm -f -- "$RENDERED_UNIT"; return 1; }
+}
+
+unit_contract_matches() { # remote-job|herdr <unit>
+  local rc=1
+  render_unit_to_temp "$1" || return 1
+  fm_remote_systemd_unit_matches "${HOME:-}" "$2" "$RENDERED_UNIT" && rc=0
+  rm -f -- "$RENDERED_UNIT"
+  return "$rc"
+}
+
 # --- remote job and tool checks ---------------------------------------------
 
 remote_job_existing_state() {
@@ -285,6 +355,7 @@ check_remote_job_worker() {
     fi
   else
     local pid
+    check_unit remote-job-unit remote-job "$FM_REMOTE_JOB_SYSTEMD_UNIT" "the remote job worker"
     pid=$(cat "${FM_REMOTE_JOB_STATE_ROOT:-${HOME:-}/.firstmate/remote-job}/worker.pid" 2>/dev/null || true)
     if [ "${FM_REMOTE_JOB_ACTIVE:-}" = 1 ] ||
       { remote_job_existing_state && case "$pid" in ''|*[!0-9]*) false ;; *) kill -0 "$pid" 2>/dev/null ;; esac; }; then
@@ -483,6 +554,56 @@ check_gui_session() {
     "log that account in once at the console, and enable automatic login in System Settings > Users & Groups if the machine runs headless; SSH cannot create a GUI session, and Firstmate never writes an auto-login password or changes FileVault"
 }
 
+# A user manager that is not lingering stops every user unit when the last
+# session ends and does not start at boot, so the units would not survive a
+# reboot. Enabling it needs root, so it stays a human step.
+check_linger() {
+  local user linger
+  if [ "$PLATFORM" != linux ]; then
+    record linger "skip: lingering applies only to systemd user managers on linux"
+    return 0
+  fi
+  if [ "$SYSTEMD_USER" != yes ]; then
+    record linger "skip: no systemd user manager serves this account"
+    return 0
+  fi
+  user=$(id -un 2>/dev/null || true)
+  linger=$(loginctl show-user "$user" --property=Linger --value 2>/dev/null || true)
+  if [ "$linger" = yes ]; then
+    record linger "ok: lingering is enabled for ${user:-this account}"
+    return 0
+  fi
+  record linger "human: lingering is not enabled for ${user:-this account}, so its user units stop at logout and do not start after a reboot" \
+    "run 'sudo loginctl enable-linger ${user:-<user>}' on that host; Firstmate never runs sudo"
+}
+
+# One Linux user unit: its file matches the current contract and is enabled.
+check_unit() { # <check> remote-job|herdr <unit> <what it keeps alive>
+  local check=$1 kind=$2 unit=$3 what=$4
+  if [ "$SYSTEMD_USER" != yes ]; then
+    record "$check" "skip: no systemd user manager serves this account, so $what is started directly and does not return after a reboot"
+    return 0
+  fi
+  if unit_contract_matches "$kind" "$unit"; then
+    record "$check" "ok: $unit matches the Firstmate-owned contract and is enabled"
+    return 0
+  fi
+  record "$check" "fixable: $unit is missing, stale, or not enabled, so $what would not return after a reboot" \
+    "rerun this command with --fix to write and enable $unit"
+}
+
+check_herdr_unit() {
+  if [ "$PLATFORM" != linux ]; then
+    record herdr-unit "skip: systemd user units apply only on linux"
+    return 0
+  fi
+  if ! command -v herdr >/dev/null 2>&1; then
+    record herdr-unit "skip: herdr does not resolve, so no unit can run it"
+    return 0
+  fi
+  check_unit herdr-unit herdr "$HERDR_SYSTEMD_UNIT" "the $HERDR_SESSION_NAME herdr server"
+}
+
 check_launch_agent() {
   if [ "$PLATFORM" != darwin ]; then
     record launchagent "skip: launch agents apply only on darwin"
@@ -565,6 +686,10 @@ check_entrypoint_link() {
     record entrypoint-link "ok: $ENTRYPOINT_LINK"
     return 0
   fi
+  if [ "$PLATFORM" = linux ] && [ -L "$ENTRYPOINT_SYSTEM_LINK" ] && [ "$ENTRYPOINT_SYSTEM_LINK" -ef "$want" ]; then
+    record entrypoint-link "ok: $ENTRYPOINT_SYSTEM_LINK"
+    return 0
+  fi
   if [ -e "$ENTRYPOINT_LINK" ] || [ -L "$ENTRYPOINT_LINK" ]; then
     record entrypoint-link "human: $ENTRYPOINT_LINK exists but is not the symlink to $want" \
       "inspect that path yourself and replace it with 'ln -sfn $want $ENTRYPOINT_LINK' if it is stale; Firstmate never overwrites a file it did not create there"
@@ -578,10 +703,14 @@ run_checks() {
   CHECK_NAMES=()
   CHECK_VALUES=()
   CHECK_ACTIONS=()
+  SYSTEMD_USER=no
+  if [ "$PLATFORM" = linux ] && fm_remote_systemd_available "${HOME:-}"; then SYSTEMD_USER=yes; fi
   check_herdr
   check_gui_session
+  check_linger
   check_remote_job_worker
   check_launch_agent
+  check_herdr_unit
   check_herdr_server
   check_entrypoint_link
 }
@@ -672,6 +801,24 @@ start_herdr_server() {
   return 1
 }
 
+# Writes and enables one Linux unit. It never starts or restarts the unit's
+# process: the worker and Herdr server checks own that, so a running Herdr
+# server is never ended by a contract rewrite.
+write_unit() { # <check> remote-job|herdr <unit>
+  local check=$1 kind=$2 unit=$3 rc=0
+  if ! render_unit_to_temp "$kind"; then
+    fix_report "$check" failed "the $unit contract cannot be rendered with paths that embed safely in a unit file"
+    return 1
+  fi
+  fm_remote_systemd_publish "${HOME:-}" "$unit" "$RENDERED_UNIT" || rc=$?
+  rm -f -- "$RENDERED_UNIT"
+  if [ "$rc" -ne 0 ]; then
+    fix_report "$check" failed "$FM_REMOTE_SYSTEMD_ERROR"
+    return 1
+  fi
+  fix_report "$check" applied "wrote and enabled $unit"
+}
+
 link_entrypoint() {
   local want="${FM_ROOT_OVERRIDE:-}/bin/fm-remote-entrypoint.sh"
   if ! mkdir -p "$(dirname "$ENTRYPOINT_LINK")" 2>/dev/null; then
@@ -695,6 +842,8 @@ apply_fixes() {
     i=$((i + 1))
     case "$value" in fixable:*) ;; *) continue ;; esac
     case "$name" in
+      remote-job-unit) write_unit remote-job-unit remote-job "$FM_REMOTE_JOB_SYSTEMD_UNIT" || true ;;
+      herdr-unit) write_unit herdr-unit herdr "$HERDR_SYSTEMD_UNIT" || true ;;
       remote-job-worker|remote-job-worker-loaded|remote-job-probe)
         [ "$remote_job_fixed" -eq 0 ] || continue
         remote_job_fixed=1
@@ -725,6 +874,8 @@ apply_fixes() {
           reload_launch_agent herdr-server || true
           continue
         fi
+        # On linux the herdr adapter starts the server through its installed
+        # unit, written earlier in this same pass, never as a plain child.
         start_herdr_server || true
         ;;
       entrypoint-link) link_entrypoint || true ;;

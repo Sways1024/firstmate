@@ -453,10 +453,12 @@ spawn_remote_secondmate() {
       [ -n "$effort" ] || effort=-
     fi
   fi
-  # A remote second mate always runs on Herdr: its server belongs to the host's
-  # own GUI login session, so the endpoint outlives every SSH connection that
-  # supervises it. bin/fm-remote-doctor.sh gates that host on the same
-  # requirement, and the remote home's config/backend never overrides it.
+  # A remote second mate always runs on Herdr: its server is kept by the host
+  # itself (a launchd agent in the GUI login session on macOS, a systemd user
+  # unit on Linux), not by the SSH connection, so the endpoint outlives every
+  # SSH connection that supervises it. bin/fm-remote-doctor.sh gates that host
+  # on the same requirement, and the remote home's config/backend never
+  # overrides it.
   case "${BACKEND_ARG:--}" in
     -|herdr) backend=herdr ;;
     *)

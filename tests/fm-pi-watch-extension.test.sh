@@ -1333,6 +1333,16 @@ const hooks = await mod.FmPrimaryWatchArm({
 const event = { event: { type: "session.idle", properties: { sessionID: "session-test" } } };
 writeFileSync(`${process.env.FM_HOME}/state/.lock`, "999999\n");
 await hooks.event(event);
+// The event hook does not await its arm attempt, and a later event joins an
+// attempt still in flight rather than starting a fresh one. Its lock check walks
+// the ps ancestry, which can outlast any fixed sleep on a loaded runner, so join
+// it here before rewriting the lock; otherwise the second event below inherits
+// the read-only verdict of this attempt and the arm never runs.
+const denied = await globalThis.__firstmateOpenCodeWatchArm.ensureArmed("session-test", client);
+if (denied !== "read-only") {
+  console.error(`expected read-only without the session lock, got ${denied}`);
+  process.exit(1);
+}
 await new Promise((resolve) => setTimeout(resolve, 120));
 if (existsSync(process.env.FM_ARM_LOG)) {
   console.error("watch arm ran without owning the session lock");

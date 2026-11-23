@@ -32,7 +32,7 @@ cleanup_remote_job_fixture() {
 }
 trap cleanup_remote_job_fixture EXIT
 
-cp "$ROOT/bin/fm-remote-job-lib.sh" "$ROOT/bin/fm-remote-job-worker.sh" \
+cp "$ROOT/bin/fm-remote-job-lib.sh" "$ROOT/bin/fm-remote-systemd-lib.sh" "$ROOT/bin/fm-remote-job-worker.sh" \
   "$ROOT/bin/fm-remote-delta-read.sh" "$REMOTE_ROOT/bin/"
 printf 'fixture\n' > "$REMOTE_ROOT/AGENTS.md"
 cat > "$REMOTE_ROOT/bin/fm-probe-job.sh" <<'SH'
@@ -280,6 +280,23 @@ kill "$OTHER_PID" 2>/dev/null || true
 wait "$OTHER_PID" 2>/dev/null || true
 OTHER_PID=
 pass "stale ownership is reclaimed without signaling a reused pid"
+
+# A worker killed between creating a lock temp file and renaming it - a second
+# SIGTERM inside its shutdown handler, a SIGKILL, or a power loss - leaves the
+# temp behind. Reclaiming that stale lock must still succeed, or no worker ever
+# starts again, not even after a reboot.
+fm_remote_job_stop_worker_tree "$(cat "$STATE_ROOT/worker.pid")" || fail "could not stop the fixture worker"
+for _ in $(seq 1 100); do [ ! -e "$STATE_ROOT/worker.lock" ] && break; sleep 0.05; done
+rm -rf "$STATE_ROOT/worker.lock" "$STATE_ROOT/worker.ready" "$STATE_ROOT/worker.pid"
+mkdir -m 700 "$STATE_ROOT/worker.lock"
+: > "$STATE_ROOT/worker.lock/.quarantine.AbC123"
+: > "$STATE_ROOT/worker.lock/.start.XyZ789"
+touch -t 200001010000 "$STATE_ROOT/worker.lock"
+fm_remote_job_ensure_worker "$REMOTE_ROOT" "$ACCOUNT_HOME" \
+  || fail "a stale lock holding an interrupted shutdown's temp files blocked every new worker: $FM_REMOTE_JOB_ERROR"
+fm_remote_job_probe "$ACCOUNT_HOME" || fail "the worker that reclaimed an interrupted lock is not ready"
+assert_absent "$STATE_ROOT/worker.lock/.quarantine.AbC123" "the reclaimed lock kept an interrupted quarantine temp"
+pass "a stale lock left mid-publish by an interrupted worker is reclaimed"
 
 FM_REMOTE_JOB_TIMEOUT=1
 fm_remote_job_stage "$ACCOUNT_HOME" "$REMOTE_ROOT" "$REMOTE_HOME" fm-timeout-job.sh < /dev/null > /dev/null
@@ -615,5 +632,74 @@ kill -TERM "$RECOVERY_WORKER_PID"
 wait "$RECOVERY_WORKER_PID" 2>/dev/null || true
 RECOVERY_WORKER_PID=
 pass "quarantine clears only after recorded execution has stopped"
+
+# A half-published quarantine temp means the interrupted worker never confirmed
+# its execution stopped, so the stale-lock reclaim must refuse while a recorded
+# running job's supervisor is alive, and it must never remove a symlinked temp.
+TEMP_HOME="$TMP_ROOT/temp-reclaim-account"
+TEMP_STATE="$TMP_ROOT/temp-reclaim-jobs"
+TEMP_LOCK="$TEMP_STATE/worker.lock"
+TEMP_JOB="$TEMP_STATE/jobs/job-interrupted"
+mkdir -p "$TEMP_HOME" "$TEMP_STATE/jobs" "$TEMP_STATE/logs" "$TEMP_LOCK" "$TEMP_JOB/.claim"
+chmod 700 "$TEMP_HOME" "$TEMP_STATE" "$TEMP_STATE/jobs" "$TEMP_STATE/logs" "$TEMP_LOCK" \
+  "$TEMP_JOB" "$TEMP_JOB/.claim"
+sleep 30 &
+TEMP_SUPERVISOR_PID=$!
+sleep 0.01 &
+TEMP_OWNER_PID=$!
+wait "$TEMP_OWNER_PID" 2>/dev/null || true
+printf '%s\n' "$TEMP_OWNER_PID" > "$TEMP_LOCK/pid"
+printf 'stale\n' > "$TEMP_LOCK/start"
+printf 'stale\n' > "$TEMP_LOCK/command"
+: > "$TEMP_LOCK/.quarantine.Half01"
+printf 'running\n' > "$TEMP_JOB/state"
+printf '%s\n' "$TEMP_OWNER_PID" > "$TEMP_JOB/.claim/owner"
+printf '%s\n' "$TEMP_SUPERVISOR_PID" > "$TEMP_JOB/.claim/supervisor"
+: > "$TEMP_JOB/stdout"
+: > "$TEMP_JOB/stderr"
+chmod 600 "$TEMP_LOCK"/* "$TEMP_LOCK"/.quarantine.Half01 "$TEMP_JOB/state" "$TEMP_JOB/.claim"/* \
+  "$TEMP_JOB/stdout" "$TEMP_JOB/stderr"
+# temp_reclaim_worker [--background]: one serving worker against the stale lock,
+# aged past the reclaim's recency window first.
+temp_reclaim_worker() {
+  touch -t 200001010000 "$TEMP_LOCK"
+  if [ "${1:-}" = --background ]; then
+    HOME="$TEMP_HOME" FM_ROOT_OVERRIDE="$REMOTE_ROOT" FM_REMOTE_JOB_STATE_ROOT="$TEMP_STATE" \
+      FM_REMOTE_JOB_PLATFORM_OVERRIDE=Linux "$REMOTE_ROOT/bin/fm-remote-job-worker.sh" --serve \
+      >> "$TMP_ROOT/temp-reclaim.out" 2>> "$TMP_ROOT/temp-reclaim.err" &
+    TEMP_WORKER_PID=$!
+    return 0
+  fi
+  set +e
+  HOME="$TEMP_HOME" FM_ROOT_OVERRIDE="$REMOTE_ROOT" FM_REMOTE_JOB_STATE_ROOT="$TEMP_STATE" \
+    FM_REMOTE_JOB_PLATFORM_OVERRIDE=Linux "$REMOTE_ROOT/bin/fm-remote-job-worker.sh" --serve \
+    >> "$TMP_ROOT/temp-reclaim.out" 2>> "$TMP_ROOT/temp-reclaim.err"
+  TEMP_RC=$?
+  set -e
+}
+temp_reclaim_worker
+[ "$TEMP_RC" -ne 0 ] || fail "the reclaim took a lock whose half-published quarantine still has a live recorded execution"
+assert_present "$TEMP_LOCK/.quarantine.Half01" "the reclaim removed a half-published quarantine while a recorded execution was alive"
+assert_absent "$TEMP_STATE/worker.ready" "a worker started while a recorded execution of the interrupted worker was alive"
+kill "$TEMP_SUPERVISOR_PID" 2>/dev/null || true
+wait "$TEMP_SUPERVISOR_PID" 2>/dev/null || true
+printf 'operator file\n' > "$TMP_ROOT/temp-reclaim-target"
+ln -s "$TMP_ROOT/temp-reclaim-target" "$TEMP_LOCK/.pid.Link01"
+temp_reclaim_worker
+[ "$TEMP_RC" -ne 0 ] || fail "the reclaim took a lock holding a symlinked temp"
+[ -L "$TEMP_LOCK/.pid.Link01" ] || fail "the reclaim removed a symlinked lock temp"
+[ "$(cat "$TMP_ROOT/temp-reclaim-target")" = 'operator file' ] || fail "the reclaim followed a symlinked lock temp"
+assert_present "$TEMP_LOCK/.quarantine.Half01" "a refused reclaim still removed the quarantine temp"
+rm -f "$TEMP_LOCK/.pid.Link01"
+temp_reclaim_worker --background
+for _ in $(seq 1 300); do
+  [ -f "$TEMP_STATE/worker.ready" ] && break
+  sleep 0.05
+done
+assert_present "$TEMP_STATE/worker.ready" "the reclaim still refused once the recorded execution stopped and no symlink remained"
+assert_absent "$TEMP_LOCK/.quarantine.Half01" "the reclaimed lock kept the half-published quarantine temp"
+kill -TERM "$TEMP_WORKER_PID"
+wait "$TEMP_WORKER_PID" 2>/dev/null || true
+pass "the interrupted-lock reclaim refuses a live recorded execution and a symlinked temp"
 
 echo "ALL TESTS PASSED"

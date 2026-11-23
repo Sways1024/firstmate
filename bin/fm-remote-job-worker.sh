@@ -2,7 +2,9 @@
 # Long-lived per-account worker for remote fm-on jobs.
 #
 # This process is launched by the Firstmate-owned dev.firstmate.remote-job
-# LaunchAgent on macOS and by a detached restart supervisor on Linux. It claims
+# LaunchAgent on macOS. On Linux it runs as a restart supervisor, launched by
+# the dev.firstmate.remote-job.service user unit where one is installed and as
+# a detached process otherwise. It claims
 # only complete 0700 records staged by fm-remote-job-lib.sh under the fixed
 # account queue, refuses symlinks and malformed records, and executes only a
 # tracked non-symlink fm-*.sh under this worker's configured FM_ROOT/bin.
@@ -20,15 +22,22 @@
 # pooled worktree, or a removed test fixture root leaves behind. It can never
 # validate or execute another job from a root that is gone, so both the serving
 # loop and the Linux restart supervisor stop instead of polling forever
-# reparented to init. FM_REMOTE_JOB_ORPHAN_GRACE_SECONDS is how long the root
-# must stay missing before that counts, so an ordinary transient never stops a
-# healthy worker. The supervisor additionally refuses to restart a child that
+# reparented to init. Both exit FM_REMOTE_JOB_ABANDONED_EXIT rather than 0, the
+# status the systemd worker unit excludes from Restart=always, so a
+# unit-managed worker cannot outlive its checkout either. A worker that finds
+# another live worker already owning the account's lock exits
+# FM_REMOTE_JOB_LOCK_HELD_EXIT, which the unit excludes the same way, so a clash
+# stops instead of repeating every RestartSec; every other clean stop still
+# exits 0. FM_REMOTE_JOB_ORPHAN_GRACE_SECONDS is how long the root
+# must stay missing before it counts as abandoned, so an ordinary transient
+# never stops a healthy worker. The supervisor additionally refuses to restart a child that
 # keeps failing immediately: it backs off up to
 # FM_REMOTE_JOB_SUPERVISOR_MAX_BACKOFF_SECONDS and gives up after
 # FM_REMOTE_JOB_SUPERVISOR_MAX_RESTARTS consecutive failures, since a restart
 # loop that never stays up only burns CPU and grows its log without bound. A
 # child that stays up for FM_REMOTE_JOB_SUPERVISOR_HEALTHY_SECONDS clears that
-# count. fm-on's ensure path restarts a worker that gave up.
+# count. fm-on's ensure path restarts a worker that gave up, and so does the
+# systemd unit's Restart=always where one manages the worker.
 set -u
 
 # A non-numeric override falls back to the default rather than crashing the
@@ -120,9 +129,14 @@ worker_lock_recent() {
 }
 
 worker_quarantined_execution_stopped() { # <account-home>
-  local account_home=$1 job state kind file pid
   fm_remote_job_regular_bounded "$WORKER_LOCK/quarantine" 256 || return 1
-  fm_remote_job_lock_owner_matches_process "$account_home" && return 1
+  fm_remote_job_lock_owner_matches_process "$1" && return 1
+  worker_recorded_execution_stopped
+}
+
+# No running job's recorded supervisor process or group is still alive.
+worker_recorded_execution_stopped() {
+  local job state kind file pid
   for job in "$FM_REMOTE_JOB_JOBS"/job-*; do
     [ -d "$job" ] && [ ! -L "$job" ] || continue
     state=$(fm_remote_job_read_state "$job" 2>/dev/null || true)
@@ -141,6 +155,23 @@ worker_recover_quarantine() { # <account-home>
   worker_quarantined_execution_stopped "$1" || return 1
   [ ! -L "$WORKER_LOCK/quarantine" ] || return 1
   rm -f -- "$WORKER_LOCK/quarantine"
+}
+
+# A worker killed between creating one of its lock temp files and renaming it
+# into place - a second SIGTERM inside its shutdown handler, a SIGKILL, or a
+# power loss - leaves that temp behind, and the stale-lock reclaim could then
+# never remove the directory, so no worker would start again, not even after a
+# reboot. Only this worker's own temp names are removed, never a symlink, and a
+# half-published quarantine still requires every recorded execution to be gone.
+worker_reclaim_lock_temps() {
+  local temp quarantine=0
+  for temp in "$WORKER_LOCK"/.pid.* "$WORKER_LOCK"/.start.* "$WORKER_LOCK"/.command.* "$WORKER_LOCK"/.quarantine.*; do
+    [ -e "$temp" ] || [ -L "$temp" ] || continue
+    [ -f "$temp" ] && [ ! -L "$temp" ] || return 1
+    case "$temp" in "$WORKER_LOCK"/.quarantine.*) quarantine=1 ;; esac
+  done
+  [ "$quarantine" -eq 0 ] || worker_recorded_execution_stopped || return 1
+  rm -f -- "$WORKER_LOCK"/.pid.* "$WORKER_LOCK"/.start.* "$WORKER_LOCK"/.command.* "$WORKER_LOCK"/.quarantine.*
 }
 
 worker_acquire_lock() {
@@ -164,6 +195,7 @@ worker_acquire_lock() {
     fi
     [ ! -L "$WORKER_LOCK/pid" ] && [ ! -L "$WORKER_LOCK/start" ] && [ ! -L "$WORKER_LOCK/command" ] || return 1
     rm -f -- "$WORKER_LOCK/pid" "$WORKER_LOCK/start" "$WORKER_LOCK/command" || return 1
+    worker_reclaim_lock_temps || return 1
     rmdir "$WORKER_LOCK" || return 1
   done
   return 1
@@ -679,7 +711,7 @@ main() {
   lock_status=$?
   case "$lock_status" in
     0) ;;
-    2) exit 0 ;;
+    2) exit "$FM_REMOTE_JOB_LOCK_HELD_EXIT" ;;
     3) worker_error "worker ownership is quarantined after an unconfirmed shutdown"; exit 75 ;;
     *) worker_error "cannot acquire or safely reclaim worker ownership"; exit 1 ;;
   esac
@@ -692,7 +724,7 @@ main() {
     # still-healthy worker read as unready to a concurrent probe.
     if worker_code_root_abandoned; then
       worker_error "configured FM_ROOT $FM_ROOT no longer exists; stopping the abandoned worker"
-      exit 0
+      exit "$FM_REMOTE_JOB_ABANDONED_EXIT"
     fi
     worker_reap=0
     if [ "$worker_reap" -eq 0 ]; then
@@ -743,7 +775,7 @@ worker_supervise_linux() {
   while :; do
     if worker_code_root_abandoned; then
       worker_error "configured FM_ROOT $FM_ROOT no longer exists; stopping the abandoned worker supervisor"
-      return 0
+      return "$FM_REMOTE_JOB_ABANDONED_EXIT"
     fi
     started=$SECONDS
     "$SCRIPT_DIR/fm-remote-job-worker.sh" --serve &
@@ -754,9 +786,10 @@ worker_supervise_linux() {
       WORKER_SUPERVISED_PID=
       return 0
     fi
-    if [ "$child_status" -eq 75 ]; then
+    if [ "$child_status" -eq 75 ] || [ "$child_status" -eq "$FM_REMOTE_JOB_ABANDONED_EXIT" ] ||
+      [ "$child_status" -eq "$FM_REMOTE_JOB_LOCK_HELD_EXIT" ]; then
       WORKER_SUPERVISED_PID=
-      return 75
+      return "$child_status"
     fi
     worker_supervisor_cleanup_dead_child "$account_home" "$WORKER_SUPERVISED_PID" || true
     WORKER_SUPERVISED_PID=

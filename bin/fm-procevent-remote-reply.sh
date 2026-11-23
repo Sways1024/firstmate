@@ -47,6 +47,20 @@
 #     cannot make the parent's status file unsafe to read
 # Line framing and size bounding belong to bin/fm-remote-delta-read.sh, which
 # delivers only whole lines and breaks continuity on an over-long one.
+#
+# The source is also the mid-session liveness trigger for the remote second
+# mate itself. Its long poll is in flight almost continuously, so a host reboot
+# or a dropped link ends it with SSH exit 255, which leaves a transport-lost
+# marker beside the cursor. While that marker exists, every restart of the
+# source first runs bin/fm-remote-liveness-lib.sh - the same readiness gate,
+# state probe, and dead-or-missing relaunch the session-start sweep runs - and
+# exits 255 again without polling while the host is still unreachable. Once the
+# host answers, the marker is cleared and the poll resumes, so recovery runs
+# once per outage instead of on every poll. A relaunch that fails, or a
+# readiness gap, is escalated as a keyed blocker on the parent status stream,
+# and not again while that blocker is still open, so a later outage after the
+# captain resolved it raises a new one. A Herdr crash that never interrupts SSH
+# is not a trigger; the session-start sweep still covers it.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -72,7 +86,7 @@ DOCUMENT_LOCAL_FAILURE=2
 . "$SCRIPT_DIR/fm-pending-reply-lib.sh"
 
 die() { printf 'error: %s\n' "$1" >&2; exit 1; }
-usage() { sed -n '2,49p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,63p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
 sha256_file() {
   if command -v shasum >/dev/null 2>&1; then
@@ -102,6 +116,7 @@ source_id() {
 }
 
 cursor_path() { printf '%s/%s.cursor\n' "$CURSOR_DIR" "$1"; }
+transport_lost_path() { printf '%s/%s.transport-lost\n' "$CURSOR_DIR" "$1"; }
 ingest_receipt_path() { printf '%s/%s.%s.ingested\n' "$CURSOR_DIR" "$1" "$2"; }
 
 read_cursor() { # <id>; sets CURSOR_OFFSET and CURSOR_HASH
@@ -224,12 +239,52 @@ cmd_arm() {
   )
 }
 
+mark_transport_lost() { # <id>
+  local path
+  mkdir -p "$CURSOR_DIR" || return 1
+  chmod 700 "$CURSOR_DIR" 2>/dev/null || true
+  path=$(transport_lost_path "$1")
+  [ ! -L "$path" ] || return 1
+  (umask 077; : > "$path")
+}
+
+# Runs the shared remote liveness check after the transport was lost. Returns
+# non-zero only while the host is still unreachable, keeping the marker so the
+# next restart tries again; every other outcome clears it.
+recover_after_transport_loss() { # <id>
+  local id=$1 meta remote_host window rc=0 line
+  meta="$STATE/$id.meta"
+  if ! declare -F fm_meta_get >/dev/null 2>&1; then
+    # shellcheck source=bin/fm-backend.sh
+    . "$SCRIPT_DIR/fm-backend.sh" || return 1
+  fi
+  # shellcheck source=bin/fm-remote-liveness-lib.sh
+  declare -F fm_remote_secondmate_liveness >/dev/null 2>&1 || . "$SCRIPT_DIR/fm-remote-liveness-lib.sh" || return 1
+  remote_host=$(fm_meta_get "$meta" remote_host)
+  window=$(fm_meta_get "$meta" window)
+  # The session-start sweep's own scope: a launched remote secondmate record.
+  if grep -q '^kind=secondmate$' "$meta" 2>/dev/null && [ -n "$remote_host" ] && [ -n "$window" ]; then
+    fm_remote_secondmate_liveness "$SCRIPT_DIR" "$FM_ROOT/bin" "$id" "$remote_host" "$STATE/$id.status" >&2 || rc=$?
+    [ "$rc" -ne "$SSH_UNAVAILABLE" ] || return 1
+    if [ "$FM_REMOTE_LIVENESS_OUTCOME" = failed ]; then
+      line="blocked [key=remote-liveness-$id]: remote secondmate $id was not recovered after its host became reachable again ($FM_REMOTE_LIVENESS_MESSAGE)"
+      append_status_unless_open "$STATE/$id.status" "$line" || true
+    fi
+  fi
+  rm -f -- "$(transport_lost_path "$id")"
+}
+
 cmd_source() {
-  local id=${1:-}
+  local id=${1:-} rc=0
   validate_id "$id"
+  if [ -e "$(transport_lost_path "$id")" ]; then
+    recover_after_transport_loss "$id" || exit "$SSH_UNAVAILABLE"
+  fi
   read_cursor "$id"
-  exec "$SCRIPT_DIR/fm-on.sh" "$id" fm-remote-delta-read.sh \
-    "$REMOTE_LOG" "$CURSOR_OFFSET" "$CURSOR_HASH" "$WAIT_SECONDS" < /dev/null
+  "$SCRIPT_DIR/fm-on.sh" "$id" fm-remote-delta-read.sh \
+    "$REMOTE_LOG" "$CURSOR_OFFSET" "$CURSOR_HASH" "$WAIT_SECONDS" < /dev/null || rc=$?
+  [ "$rc" -ne "$SSH_UNAVAILABLE" ] || mark_transport_lost "$id" || true
+  exit "$rc"
 }
 
 safe_doc_path() {
@@ -279,14 +334,27 @@ normalize_payload() { # <source> <destination>
   LC_ALL=C tr '\000-\010\013-\037\177' '?' < "$1" > "$2"
 }
 
-# The one place a line enters the parent status stream. A captured generation can
-# be replayed, so every append - a mirrored line or an escalation this adapter
-# raises itself - is at most once on exact bytes.
+# The one place a line from a captured delta enters the parent status stream. A
+# captured generation can be replayed, so every such append - a mirrored line or
+# an escalation raised while ingesting it - is at most once on exact bytes.
 # Returns 0 appended, 1 already present, 2 the write itself failed.
 append_status_once() { # <status-file> <line>
   grep -Fqx -- "$2" "$1" 2>/dev/null && return 1
   printf '%s\n' "$2" >> "$1" || return 2
   return 0
+}
+
+# A keyed escalation raised outside any captured generation, so no replay can
+# repeat it. It is skipped only while its key is still open in the parent
+# stream, as the shared decision fold in bin/fm-classify-lib.sh reads it, so a
+# resolved blocker is raised again by the next failure.
+# Returns 0 appended, 1 still open, 2 the write itself failed.
+append_status_unless_open() { # <status-file> <keyed-line>
+  local key
+  key=$(_fm_decision_key "$2") || return 2
+  [ ! -L "$1" ] || return 2
+  ! status_decision_open "$1" "$key" || return 1
+  printf '%s\n' "$2" >> "$1" || return 2
 }
 
 cmd_ingest() {
@@ -499,7 +567,7 @@ cmd_retire_finalize_locked() {
       done
     fi
   fi
-  rm -f -- "$(cursor_path "$id")"
+  rm -f -- "$(cursor_path "$id")" "$(transport_lost_path "$id")"
   rm -f -- "$CURSOR_DIR/$id".*.ingested
 }
 

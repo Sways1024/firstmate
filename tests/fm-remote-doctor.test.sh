@@ -2,9 +2,10 @@
 # tests/fm-remote-doctor.test.sh - the remote second-mate readiness gate.
 #
 # Drives the real bin/fm-remote-doctor.sh against a controlled account fixture:
-# a private HOME, a fake launchctl backed by state files, a fake herdr CLI, and
-# a fake uname that selects the platform under test. Nothing here touches the
-# runner's own launch agents, login session, or herdr server.
+# a private HOME, a fake launchctl backed by state files, fake systemctl and
+# loginctl standing in for a Linux user manager, a fake herdr CLI, and a fake
+# uname that selects the platform under test. Nothing here touches the runner's
+# own launch agents, systemd user units, login session, or herdr server.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -39,6 +40,7 @@ new_case() {
   local platform=$1 want_herdr=${2:-with-herdr} want_gui=${3:-gui}
   unset CASE_REMOTE_JOB_ACTIVE
   unset CASE_PLATFORM_OVERRIDE
+  unset CASE_SYSTEMD_HOME
   CASE_N=$((CASE_N + 1))
   CASE_DIR="$TMP_ROOT/case$CASE_N"
   CASE_BIN="$CASE_DIR/bin"
@@ -148,6 +150,65 @@ esac
 exit 0
 SH
 
+  # A Linux user manager. It serves this fixture account only when the case
+  # creates systemd-user, so the runner's own systemctl is never reached.
+  cat > "$CASE_BIN/systemctl" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "$*" >> "$FM_FAKE_STATE/systemctl.log"
+[ -f "$FM_FAKE_STATE/systemd-user" ] || { printf 'Failed to connect to bus: No medium found\n' >&2; exit 1; }
+[ "${1:-}" = --user ] || exit 64
+shift
+case "${1:-}" in
+  show-environment) printf 'HOME=%s\nLANG=C.UTF-8\n' "$FM_FAKE_SYSTEMD_HOME" ;;
+  show)
+    [ "${2:-} ${3:-} ${4:-}" = '-p MainPID --value' ] || exit 1
+    main=$(cat "$FM_FAKE_STATE/main-${5:-}" 2>/dev/null || true)
+    kill -0 "${main:-0}" 2>/dev/null || main=0
+    printf '%s\n' "$main"
+    ;;
+  daemon-reload) : ;;
+  enable) touch "$FM_FAKE_STATE/enabled-$2" ;;
+  is-enabled) if [ -f "$FM_FAKE_STATE/enabled-$2" ]; then printf 'enabled\n'; else printf 'disabled\n'; exit 1; fi ;;
+  start|restart)
+    case "$2" in
+      dev.firstmate.herdr.fm-remote.service) printf 'true\n' > "$FM_FAKE_HERDR_RUNNING" ;;
+      dev.firstmate.remote-job.service)
+        # A restart first stops the running main process as KillMode=mixed
+        # does, with one SIGTERM to it alone, and waits for it to exit.
+        main=$(cat "$FM_FAKE_STATE/main-$2" 2>/dev/null || true)
+        if [ "$1" = restart ] && [ -n "$main" ] && kill -0 "$main" 2>/dev/null; then
+          printf 'stopped main %s\n' "$main" >> "$FM_FAKE_STATE/unit-stops.log"
+          kill -TERM "$main"
+          for _ in $(seq 1 200); do kill -0 "$main" 2>/dev/null || break; sleep 0.05; done
+        fi
+        # Run the installed unit's own ExecStart and Environment, as the user
+        # manager would, so the contract itself must produce a working worker.
+        unit="$FM_FAKE_SYSTEMD_HOME/.config/systemd/user/$2"
+        exec_start=$(sed -n 's/^ExecStart=//p' "$unit")
+        env_args=()
+        while IFS= read -r assignment; do env_args+=("$assignment"); done \
+          < <(sed -n 's/^Environment="\(.*\)"$/\1/p' "$unit")
+        nohup env -i PATH="$PATH" "${env_args[@]}" FM_REMOTE_JOB_PLATFORM_OVERRIDE=Linux \
+          "$exec_start" >> "$FM_FAKE_STATE/unit-worker.log" 2>&1 < /dev/null &
+        printf '%s\n' "$!" > "$FM_FAKE_STATE/main-$2"
+        ;;
+    esac
+    ;;
+  *) exit 1 ;;
+esac
+exit 0
+SH
+  cat > "$CASE_BIN/loginctl" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_FAKE_STATE/loginctl.log"
+case "${1:-}" in
+  show-user) cat "$FM_FAKE_STATE/linger" 2>/dev/null || printf 'no\n' ;;
+  *) exit 1 ;;
+esac
+SH
+  chmod +x "$CASE_BIN/systemctl" "$CASE_BIN/loginctl"
+
   # Any attempt to reach for auto-login, FileVault, or the keychain records
   # itself here so the test can prove the doctor never goes near them.
   local forbidden
@@ -165,6 +226,7 @@ SH
 #!/usr/bin/env bash
 set -u
 running=$(cat "$FM_FAKE_HERDR_RUNNING" 2>/dev/null || printf 'false')
+printf '%s\n' "$*" >> "$FM_FAKE_STATE/herdr.log"
 case "${1:-} ${2:-}" in
   "status --json")
     if [ -f "$FM_FAKE_STATE/herdr-delay" ]; then
@@ -229,6 +291,8 @@ doctor() {
     FM_FAKE_JOB_PLIST="$CASE_JOB_PLIST" \
     FM_FAKE_JOB_WORKER="$ROOT/bin/fm-remote-job-worker.sh" \
     FM_FAKE_LAUNCH_AGENT_LOG="$CASE_HOME/Library/Logs/$LABEL.log" \
+    FM_FAKE_SYSTEMD_HOME="${CASE_SYSTEMD_HOME:-$CASE_HOME}" \
+    FM_REMOTE_DOCTOR_SYSTEM_BIN="$CASE_DIR/usr-local-bin" \
     FM_REMOTE_JOB_PLATFORM_OVERRIDE="${CASE_PLATFORM_OVERRIDE-}" \
     FM_REMOTE_JOB_ACTIVE="${CASE_REMOTE_JOB_ACTIVE-1}" \
     "$ROOT/bin/fm-remote-doctor.sh" "$@" 2>&1
@@ -260,6 +324,20 @@ assert_no_dangerous_calls() { # <msg>
   assert_absent "$CASE_HOME/Library/Preferences/com.apple.loginwindow.plist" \
     "the doctor wrote a loginwindow preference"
   assert_absent "$CASE_HOME/kcpassword" "the doctor wrote an auto-login password"
+}
+
+# assert_line <exact-line> <file> <msg>, assert_regex / assert_no_regex
+# <basic-regex> <file> <msg>: the shared helpers match fixed substrings only.
+assert_line() { grep -Fqx -- "$1" "$2" || fail "$3"; }
+assert_regex() { grep -q -- "$1" "$2" || fail "$3"; }
+assert_no_regex() { ! grep -q -- "$1" "$2" || fail "$3"; }
+
+# assert_unit <unit-file> <section>.<key> <value> <msg>: the unit, parsed by
+# section, gives that directive exactly this one value.
+assert_unit() {
+  local got
+  got=$(fm_test_unit_value "$1" "$2")
+  [ "$got" = "$3" ] || fail "$4 ($2 was '$got')"
 }
 
 # --- a host with no herdr is never ready, and --fix cannot install one -------
@@ -500,7 +578,7 @@ assert_contains "$DOCTOR_OUT" 'error: this host is not ready for a remote second
 assert_no_dangerous_calls "the doctor tried to create a login session by force"
 pass "human gaps are reported with their operator step and never claimed as fixed"
 
-# --- linux has no launch agent, and --fix starts the server directly ---------
+# --- linux has no launch agent, and a job never starts the server ------------
 
 new_case Linux with-herdr no-gui
 doctor
@@ -509,16 +587,253 @@ assert_contains "$DOCTOR_OUT" 'platform=linux' "the platform was misreported"
 assert_contains "$DOCTOR_OUT" 'check launchagent=skip:' "launch agents were checked on linux"
 assert_contains "$DOCTOR_OUT" 'check gui-session=skip:' "an Aqua login session was required on linux"
 assert_contains "$DOCTOR_OUT" 'check herdr-server=fixable:' "a stopped linux herdr server was not tagged fixable"
+assert_contains "$DOCTOR_OUT" 'check linger=skip: no systemd user manager serves this account' \
+  "lingering was required on a host with no user manager"
+assert_contains "$DOCTOR_OUT" 'check remote-job-unit=skip: no systemd user manager serves this account' \
+  "the worker unit was required on a host with no user manager"
+assert_contains "$DOCTOR_OUT" 'check herdr-unit=skip: no systemd user manager serves this account' \
+  "the herdr unit was required on a host with no user manager"
+# This fixture runs as a remote job (FM_REMOTE_JOB_ACTIVE=1), the context in
+# which a started server would become the job's child and die at its timeout.
 doctor --fix
-expect_code 0 "$DOCTOR_RC" "--fix did not start the herdr server on linux"
-assert_contains "$DOCTOR_OUT" 'fix herdr-server=applied:' "--fix did not report starting the server"
-assert_contains "$DOCTOR_OUT" 'check herdr-server=ok:' "the started server was not confirmed by the re-check"
+expect_code 1 "$DOCTOR_RC" "a remote job reported the herdr server started"
+assert_contains "$DOCTOR_OUT" 'fix herdr-server=failed:' "--fix did not report the refused start"
+assert_no_regex '^server' "$CASE_STATE/herdr.log" "a remote job started the herdr server as its own child"
 [ ! -s "$CASE_LAUNCHCTL_LOG" ] || fail "the linux path invoked launchctl"
-pass "a non-darwin host skips launch agents and starts its herdr server directly"
+assert_absent "$CASE_HOME/.config/systemd" "a host with no user manager received unit files"
+pass "a non-darwin host skips launch agents and a remote job never starts the herdr server as its child"
+
+# --- a linux user manager keeps both processes in Restart=always units -------
+
+new_case Linux with-herdr no-gui
+touch "$CASE_STATE/systemd-user"
+printf 'yes\n' > "$CASE_STATE/linger"
+CASE_UID=$(id -u)
+UNIT_DIR="$CASE_HOME/.config/systemd/user"
+JOB_UNIT="$UNIT_DIR/dev.firstmate.remote-job.service"
+HERDR_UNIT="$UNIT_DIR/dev.firstmate.herdr.fm-remote.service"
+doctor
+expect_code 1 "$DOCTOR_RC" "a linux host without its units was reported ready"
+assert_contains "$DOCTOR_OUT" 'check linger=ok:' "enabled lingering was not confirmed"
+assert_contains "$DOCTOR_OUT" 'check remote-job-unit=fixable:' "a missing worker unit was not tagged fixable"
+assert_contains "$DOCTOR_OUT" 'check herdr-unit=fixable:' "a missing herdr unit was not tagged fixable"
+assert_absent "$UNIT_DIR" "the read-only check wrote unit files"
+doctor --fix
+expect_code 0 "$DOCTOR_RC" "--fix did not converge a linux host with a user manager"$'\n'"$DOCTOR_OUT"
+assert_contains "$DOCTOR_OUT" 'fix remote-job-unit=applied: wrote and enabled dev.firstmate.remote-job.service' \
+  "--fix did not report the worker unit"
+assert_contains "$DOCTOR_OUT" 'fix herdr-unit=applied: wrote and enabled dev.firstmate.herdr.fm-remote.service' \
+  "--fix did not report the herdr unit"
+assert_contains "$DOCTOR_OUT" 'check remote-job-unit=ok:' "the worker unit was not confirmed by the re-check"
+assert_contains "$DOCTOR_OUT" 'check herdr-unit=ok:' "the herdr unit was not confirmed by the re-check"
+assert_contains "$DOCTOR_OUT" 'check herdr-server=ok:' "the server started through its unit was not confirmed"
+assert_unit "$JOB_UNIT" Service.ExecStart "$ROOT/bin/fm-remote-job-worker.sh" "the worker unit runs the wrong program"
+assert_unit "$JOB_UNIT" Service.Environment.HOME "$CASE_HOME" "the worker unit does not pin the account HOME"
+assert_unit "$JOB_UNIT" Service.Environment.FM_ROOT_OVERRIDE "$ROOT" "the worker unit does not pin its code root"
+assert_unit "$JOB_UNIT" Service.KillMode mixed "the worker unit's stop signal reaches the serving child as well as its supervisor"
+assert_unit "$JOB_UNIT" Unit.ConditionPathExists "$ROOT/AGENTS.md"$'\n'"$ROOT/bin/fm-remote-job-worker.sh" \
+  "the worker unit does not skip a start once its checkout is gone"
+assert_unit "$HERDR_UNIT" Service.ExecStart "$CASE_BIN/herdr server --session fm-remote" \
+  "the herdr unit does not run the fm-remote server in the foreground"
+HERDR_UNIT_PATH=$(fm_test_unit_value "$HERDR_UNIT" Service.Environment.PATH)
+case "$HERDR_UNIT_PATH" in
+  "$ROOT/bin:"*) ;;
+  *) fail "the herdr unit does not give panes the worker job PATH: '$HERDR_UNIT_PATH'" ;;
+esac
+for unit in "$JOB_UNIT" "$HERDR_UNIT"; do
+  assert_unit "$unit" Service.Restart always "$unit does not restart like launchd KeepAlive"
+  assert_unit "$unit" Unit.StartLimitIntervalSec 0 "$unit can stop restarting after a burst"
+  assert_unit "$unit" Install.WantedBy default.target "$unit is not started with the user manager at boot"
+  assert_unit "$unit" Service.Environment.LANG C.UTF-8 "$unit leaves the boot locale unset"
+  assert_unit "$unit" Service.Environment.XDG_RUNTIME_DIR "/run/user/$CASE_UID" "$unit leaves the runtime directory unset"
+done
+assert_line '--user enable dev.firstmate.remote-job.service' "$CASE_STATE/systemctl.log" "the worker unit was not enabled"
+assert_line '--user enable dev.firstmate.herdr.fm-remote.service' "$CASE_STATE/systemctl.log" "the herdr unit was not enabled"
+assert_line '--user start dev.firstmate.herdr.fm-remote.service' "$CASE_STATE/systemctl.log" \
+  "the herdr server was not started through its unit"
+assert_no_regex '^server' "$CASE_STATE/herdr.log" "the herdr server was started outside its unit"
+
+# A running server is never restarted to apply a rewritten contract: that would
+# end every pane in it. The rewrite lands and applies at its next start.
+printf '# stale\n' >> "$HERDR_UNIT"
+: > "$CASE_STATE/systemctl.log"
+doctor --fix
+expect_code 0 "$DOCTOR_RC" "--fix did not repair a stale herdr unit"
+assert_contains "$DOCTOR_OUT" 'fix herdr-unit=applied:' "--fix did not rewrite the stale herdr unit"
+assert_no_grep '# stale' "$HERDR_UNIT" "the stale herdr unit contract survived --fix"
+assert_no_regex '^--user \(start\|stop\|restart\|kill\) dev.firstmate.herdr.fm-remote.service' "$CASE_STATE/systemctl.log" \
+  "--fix restarted a running herdr server to apply its unit"
+pass "a linux user manager receives enabled Restart=always units and starts the server through its own"
+
+# --- the worker starts through its unit, not as a detached process ----------
+
+new_case Linux with-herdr no-gui
+CASE_REMOTE_JOB_ACTIVE=
+CASE_PLATFORM_OVERRIDE=Linux
+touch "$CASE_STATE/systemd-user"
+printf 'yes\n' > "$CASE_STATE/linger"
+printf 'true\n' > "$CASE_HERDR_RUNNING"
+rm -f "$CASE_BIN/sleep" "$CASE_BIN/uname"
+mkdir -p "$CASE_HOME/.local/bin"
+for tool in herdr tasks-axi treehouse claude; do
+  ln -s "$CASE_BIN/$tool" "$CASE_HOME/.local/bin/$tool"
+done
+doctor --fix
+if [ -f "$CASE_HOME/.firstmate/remote-job/worker.pid" ]; then
+  DOCTOR_WORKER_PID=$(cat "$CASE_HOME/.firstmate/remote-job/worker.pid")
+fi
+expect_code 0 "$DOCTOR_RC" "--fix did not start the worker through its unit"$'\n'"$DOCTOR_OUT"
+assert_contains "$DOCTOR_OUT" 'fix remote-job-worker=applied:' "--fix did not report starting the worker"
+assert_contains "$DOCTOR_OUT" 'check remote-job-worker=ok:' "the unit-started worker was not confirmed"
+assert_contains "$DOCTOR_OUT" 'check remote-job-probe=ok: the remote job worker completed the required-tool probe' \
+  "the unit-started worker did not run the required-tool probe"
+assert_line '--user restart dev.firstmate.remote-job.service' "$CASE_STATE/systemctl.log" \
+  "the worker was not started through its unit"
+[ -n "$DOCTOR_WORKER_PID" ] && kill -TERM "$DOCTOR_WORKER_PID" 2>/dev/null
+for _ in $(seq 1 100); do
+  kill -0 "$DOCTOR_WORKER_PID" 2>/dev/null || break
+  sleep 0.05
+done
+kill -KILL "$DOCTOR_WORKER_PID" 2>/dev/null || true
+DOCTOR_WORKER_PID=
+pass "with an installed unit the linux worker is started through that unit"
+
+# --- a code update that changes this root's worker unit republishes it -------
+# The unit template and the worker identity share one library, so an update
+# that changes the template must not leave the unit relaunching every
+# RestartSec against a detached worker: the entrypoint's start republishes this
+# root's own stale unit and starts through it, and leaves another checkout's
+# unit alone.
+
+# lib_ensure_worker [lib-function]: the entrypoint's worker start, or another
+# job-library start function, for this case's account under its stand-in user
+# manager; sets LIB_ENSURE_OUT and LIB_ENSURE_RC.
+lib_ensure_worker() {
+  set +e
+  # shellcheck disable=SC2016 # The child shell expands its own arguments and error text.
+  LIB_ENSURE_OUT=$(env -i PATH="$CASE_HOME/.local/bin:$CASE_BIN:$BASE_PATH" HOME="$CASE_HOME" \
+    FM_FAKE_STATE="$CASE_STATE" FM_FAKE_SYSTEMD_HOME="$CASE_HOME" FM_FAKE_HERDR_RUNNING="$CASE_HERDR_RUNNING" \
+    FM_REMOTE_JOB_PLATFORM_OVERRIDE=Linux \
+    bash -c '. "$1/bin/fm-remote-job-lib.sh" && "$3" "$1" "$2" ||
+      { printf "%s\n" "$FM_REMOTE_JOB_ERROR"; exit 1; }' _ "$ROOT" "$CASE_HOME" \
+    "${1:-fm_remote_job_ensure_worker}" 2>&1)
+  LIB_ENSURE_RC=$?
+  set -e
+}
+# render_worker_unit <remote-root>: the worker unit contract for this account.
+render_worker_unit() {
+  bash -c '. "$1/bin/fm-remote-job-lib.sh" && fm_remote_job_render_systemd_unit "$2" "$3" "$4"' _ \
+    "$ROOT" "$1" "$CASE_HOME" "$(id -u)"
+}
+stop_case_worker() {
+  local pid
+  pid=$(cat "$CASE_HOME/.firstmate/remote-job/worker.pid" 2>/dev/null || true)
+  [ -n "$pid" ] || return 0
+  kill -TERM "$pid" 2>/dev/null || true
+  for _ in $(seq 1 100); do
+    kill -0 "$pid" 2>/dev/null || [ -e "$CASE_HOME/.firstmate/remote-job/worker.lock" ] || break
+    sleep 0.05
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+}
+
+JOB_UNIT="$CASE_HOME/.config/systemd/user/dev.firstmate.remote-job.service"
+grep -v '^RestartPreventExitStatus=' "$JOB_UNIT" > "$CASE_STATE/older-unit"
+cp "$CASE_STATE/older-unit" "$JOB_UNIT"
+: > "$CASE_STATE/systemctl.log"
+lib_ensure_worker
+expect_code 0 "$LIB_ENSURE_RC" "the worker did not start from this root's stale unit"$'\n'"$LIB_ENSURE_OUT"
+render_worker_unit "$ROOT" > "$CASE_STATE/current-unit"
+cmp -s "$CASE_STATE/current-unit" "$JOB_UNIT" || fail "this root's stale worker unit was not republished before the start"
+[ -n "$(fm_test_unit_value "$JOB_UNIT" Service.RestartPreventExitStatus)" ] ||
+  fail "the republished worker unit still lets Restart=always relaunch a worker that must stop"
+assert_line '--user daemon-reload' "$CASE_STATE/systemctl.log" "the republished worker unit was not reloaded"
+assert_line '--user restart dev.firstmate.remote-job.service' "$CASE_STATE/systemctl.log" \
+  "the worker did not start through its republished unit"
+stop_case_worker
+
+render_worker_unit "$CASE_DIR/other-checkout" > "$JOB_UNIT"
+cp "$JOB_UNIT" "$CASE_STATE/other-unit"
+: > "$CASE_STATE/systemctl.log"
+lib_ensure_worker
+expect_code 0 "$LIB_ENSURE_RC" "the worker did not start beside another checkout's unit"$'\n'"$LIB_ENSURE_OUT"
+cmp -s "$CASE_STATE/other-unit" "$JOB_UNIT" || fail "the start rewrote a worker unit that belongs to another checkout"
+assert_no_regex '^--user \(daemon-reload\|enable\|restart\|start\)' "$CASE_STATE/systemctl.log" \
+  "the start reloaded or restarted a worker unit that belongs to another checkout"
+stop_case_worker
+pass "a stale worker unit for this root is republished and started through, and another checkout's unit is left alone"
+
+# --- a stale worker is replaced without a second SIGTERM to its child --------
+# The unit's serving child shares its supervisor's process group, so stopping
+# that group would deliver a second SIGTERM inside the child's shutdown
+# handler. The unit's own stale worker is left to the restart, which signals
+# the supervisor alone; a worker the unit does not run is still stopped first.
+CASE_JOB_STATE="$CASE_HOME/.firstmate/remote-job"
+render_worker_unit "$ROOT" > "$JOB_UNIT"
+lib_ensure_worker
+expect_code 0 "$LIB_ENSURE_RC" "the worker did not start through its current unit"$'\n'"$LIB_ENSURE_OUT"
+UNIT_MAIN=$(cat "$CASE_STATE/main-dev.firstmate.remote-job.service")
+OLD_SERVE=$(cat "$CASE_JOB_STATE/worker.pid")
+printf 'stale\n' > "$CASE_JOB_STATE/worker.identity"
+: > "$CASE_STATE/unit-stops.log"
+lib_ensure_worker
+expect_code 0 "$LIB_ENSURE_RC" "the unit's own stale worker was not replaced"$'\n'"$LIB_ENSURE_OUT"
+assert_line "stopped main $UNIT_MAIN" "$CASE_STATE/unit-stops.log" \
+  "the unit's own stale worker was signalled as a group before its restart, so its serving child took a second SIGTERM"
+! kill -0 "$OLD_SERVE" 2>/dev/null || fail "the unit's own stale serving child survived its restart"
+[ "$(cat "$CASE_JOB_STATE/worker.pid")" != "$OLD_SERVE" ] || fail "the restart did not start a fresh worker"
+stop_case_worker
+
+lib_ensure_worker fm_remote_job_start_linux_worker
+expect_code 0 "$LIB_ENSURE_RC" "a detached worker did not start"$'\n'"$LIB_ENSURE_OUT"
+for _ in $(seq 1 100); do
+  [ -f "$CASE_JOB_STATE/worker.ready" ] && [ -f "$CASE_JOB_STATE/worker.identity" ] && break
+  sleep 0.05
+done
+DETACHED_SERVE=$(cat "$CASE_JOB_STATE/worker.pid")
+printf 'stale\n' > "$CASE_JOB_STATE/worker.identity"
+: > "$CASE_STATE/unit-stops.log"
+: > "$CASE_STATE/systemctl.log"
+lib_ensure_worker
+expect_code 0 "$LIB_ENSURE_RC" "a stale detached worker was not replaced by the unit's worker"$'\n'"$LIB_ENSURE_OUT"
+! kill -0 "$DETACHED_SERVE" 2>/dev/null || fail "a stale worker the unit does not run was left beside the unit's worker"
+assert_line '--user restart dev.firstmate.remote-job.service' "$CASE_STATE/systemctl.log" \
+  "the stale detached worker was not replaced through the unit"
+[ "$(cat "$CASE_JOB_STATE/worker.pid")" != "$DETACHED_SERVE" ] || fail "the unit did not start a fresh worker"
+stop_case_worker
+pass "the unit's own stale worker is stopped only by its restart, and a worker the unit does not run is stopped first"
+
+# --- a user manager without lingering is a human gap ------------------------
+
+new_case Linux with-herdr no-gui
+touch "$CASE_STATE/systemd-user"
+printf 'no\n' > "$CASE_STATE/linger"
+doctor --fix
+expect_code 1 "$DOCTOR_RC" "a linux host without lingering was reported ready"
+assert_contains "$DOCTOR_OUT" 'check linger=human: lingering is not enabled for' \
+  "missing lingering was not reported as a human gap"
+assert_contains "$DOCTOR_OUT" "action: linger: run 'sudo loginctl enable-linger $(id -un)' on that host" \
+  "the lingering gap did not name the exact operator step"
+assert_not_contains "$DOCTOR_OUT" 'fix linger=' "--fix claimed to change lingering"
+assert_no_grep 'enable-linger' "$CASE_STATE/loginctl.log" "--fix tried to enable lingering itself"
+pass "lingering is a human gap whose action names the sudo step"
+
+# --- a user manager for another HOME never receives this account's units ----
+
+new_case Linux with-herdr no-gui
+touch "$CASE_STATE/systemd-user"
+CASE_SYSTEMD_HOME="$TMP_ROOT"
+doctor --fix
+assert_contains "$DOCTOR_OUT" 'check remote-job-unit=skip: no systemd user manager serves this account' \
+  "a user manager for another HOME was treated as this account's"
+assert_absent "$CASE_HOME/.config/systemd" "units were written where no user manager loads them"
+pass "units are written only where this account's own user manager loads them"
 
 # --- --fix may add only owned wrappers for version-manager tools -------------
 
 new_case Linux with-herdr no-gui
+# A running server keeps this case about wrappers: a remote job never starts one.
+printf 'true\n' > "$CASE_HERDR_RUNNING"
 MANAGER_BIN="$CASE_HOME/.nvm/versions/node/v24/bin"
 mkdir -p "$MANAGER_BIN"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$MANAGER_BIN/codex"
@@ -588,6 +903,8 @@ assert_contains "$DOCTOR_OUT" 'fix remote-job-worker=applied:' "--fix did not re
 assert_contains "$DOCTOR_OUT" 'check remote-job-worker=ok:' "the refreshed worker was not confirmed ready"
 assert_contains "$DOCTOR_OUT" 'check remote-job-probe=ok: the remote job worker completed the required-tool probe' \
   "doctor did not probe tools through the refreshed worker"
+assert_contains "$DOCTOR_OUT" 'check herdr-server=ok:' "the doctor over plain SSH did not start the herdr server directly"
+assert_regex '^server' "$CASE_STATE/herdr.log" "outside a job with no user manager the herdr server was not started directly"
 DOCTOR_WORKER_PID=$(cat "$CASE_HOME/.firstmate/remote-job/worker.pid")
 kill -TERM "$DOCTOR_WORKER_PID"
 for _ in $(seq 1 100); do
@@ -623,3 +940,25 @@ assert_contains "$DOCTOR_OUT" 'check entrypoint-link=human:' "an operator-owned 
   || fail "--fix overwrote a file it did not create"
 unset FM_ROOT_OVERRIDE
 pass "the entrypoint symlink is recreated when absent and never overwritten when operator-owned"
+
+# --- the documented linux /usr/local/bin link satisfies the entrypoint check -
+
+new_case Linux with-herdr no-gui
+REMOTE_ROOT="$CASE_DIR/remote-root"
+mkdir -p "$REMOTE_ROOT/bin" "$CASE_DIR/usr-local-bin"
+printf '#!/usr/bin/env bash\n' > "$REMOTE_ROOT/bin/fm-remote-entrypoint.sh"
+ln -s "$REMOTE_ROOT/bin/fm-remote-entrypoint.sh" "$CASE_DIR/usr-local-bin/fm-remote-entrypoint.sh"
+export FM_ROOT_OVERRIDE="$REMOTE_ROOT"
+doctor
+assert_contains "$DOCTOR_OUT" "check entrypoint-link=ok: $CASE_DIR/usr-local-bin/fm-remote-entrypoint.sh" \
+  "the documented /usr/local/bin link was not accepted on linux"
+doctor --fix
+assert_not_contains "$DOCTOR_OUT" 'fix entrypoint-link=' "--fix added a redundant ~/.local/bin link"
+assert_absent "$CASE_HOME/.local/bin/fm-remote-entrypoint.sh" "--fix created a redundant ~/.local/bin link"
+new_case Darwin with-herdr gui
+mkdir -p "$CASE_DIR/usr-local-bin"
+ln -s "$REMOTE_ROOT/bin/fm-remote-entrypoint.sh" "$CASE_DIR/usr-local-bin/fm-remote-entrypoint.sh"
+doctor
+assert_contains "$DOCTOR_OUT" 'check entrypoint-link=fixable:' "darwin accepted a link outside its documented ~/.local/bin"
+unset FM_ROOT_OVERRIDE
+pass "linux accepts the documented /usr/local/bin entrypoint link without adding a redundant one"
