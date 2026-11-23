@@ -1670,16 +1670,55 @@ fm_backend_herdr_projection_order_best_effort() {  # <session> <created-workspac
   return 0
 }
 
+# fm_backend_herdr_systemd_owner: set FM_BACKEND_HERDR_SYSTEMD_UNIT to the
+# systemd user unit that owns <session>'s server on this Linux account, or fail
+# when none does. Runs in the caller's shell, never a subshell, because it loads
+# the remote job library: that library owns the platform rule and
+# bin/fm-remote-systemd-lib.sh owns user-manager reachability, so neither is
+# restated here, and both load only on this not-running path.
+fm_backend_herdr_systemd_owner() {  # <session>
+  local session=$1 unit
+  FM_BACKEND_HERDR_SYSTEMD_UNIT=
+  if ! declare -F fm_remote_job_platform >/dev/null 2>&1; then
+    # shellcheck source=bin/fm-remote-job-lib.sh
+    . "$FM_BACKEND_HERDR_ROOT/bin/fm-remote-job-lib.sh" || return 1
+  fi
+  [ "$(fm_remote_job_platform)" = linux ] || return 1
+  unit=$(fm_remote_systemd_herdr_unit "$session")
+  fm_remote_systemd_unit_installed "${HOME:-}" "$unit" || return 1
+  fm_remote_systemd_available "${HOME:-}" || return 1
+  FM_BACKEND_HERDR_SYSTEMD_UNIT=$unit
+}
+
 # fm_backend_herdr_server_ensure: start the herdr server for <session>
 # headless (no TUI client) if not already running, mirroring tmux's `tmux
 # has-session || tmux new-session -d`. Verified: a bare socket CLI call does
 # NOT auto-start the server, so this must run before any workspace/tab/pane
 # call. Bounded poll for the server to report running.
+#
+# On a Linux remote account a session whose Firstmate systemd user unit is
+# installed (bin/fm-remote-doctor.sh writes dev.firstmate.herdr.fm-remote.service)
+# is started only through that unit, so the server never becomes the child of a
+# remote job: the job worker kills a job's whole process group at its timeout,
+# which would take the server and every pane with it. Inside a remote job
+# (FM_REMOTE_JOB_ACTIVE=1) on Linux with no such unit, this refuses rather than
+# starting one there; the doctor over plain SSH owns starting it.
 fm_backend_herdr_server_ensure() {  # <session>
   local session=$1 running out i
   running=$(fm_backend_herdr_cli "$session" status --json 2>/dev/null | jq -r '.server.running // false' 2>/dev/null)
   [ "$running" = "true" ] && return 0
-  ( fm_backend_herdr_cli "$session" server >/dev/null 2>&1 & ) || return 1
+  if fm_backend_herdr_systemd_owner "$session"; then
+    out=$(fm_remote_systemd_ctl start "$FM_BACKEND_HERDR_SYSTEMD_UNIT" 2>&1) || {
+      echo "error: systemctl --user start $FM_BACKEND_HERDR_SYSTEMD_UNIT refused: ${out:-no diagnostic}" >&2
+      return 1
+    }
+  elif [ "${FM_REMOTE_JOB_ACTIVE:-}" = 1 ] && declare -F fm_remote_job_platform >/dev/null 2>&1 &&
+    [ "$(fm_remote_job_platform)" = linux ]; then
+    echo "error: herdr server for session '$session' is not running and a remote job never starts one as its own child; run fm-on.sh <route> fm-remote-doctor.sh --fix" >&2
+    return 1
+  else
+    ( fm_backend_herdr_cli "$session" server >/dev/null 2>&1 & ) || return 1
+  fi
   for i in $(seq 1 20); do
     running=$(fm_backend_herdr_cli "$session" status --json 2>/dev/null | jq -r '.server.running // false' 2>/dev/null)
     [ "$running" = "true" ] && return 0

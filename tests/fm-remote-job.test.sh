@@ -32,7 +32,7 @@ cleanup_remote_job_fixture() {
 }
 trap cleanup_remote_job_fixture EXIT
 
-cp "$ROOT/bin/fm-remote-job-lib.sh" "$ROOT/bin/fm-remote-job-worker.sh" \
+cp "$ROOT/bin/fm-remote-job-lib.sh" "$ROOT/bin/fm-remote-systemd-lib.sh" "$ROOT/bin/fm-remote-job-worker.sh" \
   "$ROOT/bin/fm-remote-delta-read.sh" "$REMOTE_ROOT/bin/"
 printf 'fixture\n' > "$REMOTE_ROOT/AGENTS.md"
 cat > "$REMOTE_ROOT/bin/fm-probe-job.sh" <<'SH'
@@ -280,6 +280,23 @@ kill "$OTHER_PID" 2>/dev/null || true
 wait "$OTHER_PID" 2>/dev/null || true
 OTHER_PID=
 pass "stale ownership is reclaimed without signaling a reused pid"
+
+# A worker killed between creating a lock temp file and renaming it - a second
+# SIGTERM inside its shutdown handler, a SIGKILL, or a power loss - leaves the
+# temp behind. Reclaiming that stale lock must still succeed, or no worker ever
+# starts again, not even after a reboot.
+fm_remote_job_stop_worker_tree "$(cat "$STATE_ROOT/worker.pid")" || fail "could not stop the fixture worker"
+for _ in $(seq 1 100); do [ ! -e "$STATE_ROOT/worker.lock" ] && break; sleep 0.05; done
+rm -rf "$STATE_ROOT/worker.lock" "$STATE_ROOT/worker.ready" "$STATE_ROOT/worker.pid"
+mkdir -m 700 "$STATE_ROOT/worker.lock"
+: > "$STATE_ROOT/worker.lock/.quarantine.AbC123"
+: > "$STATE_ROOT/worker.lock/.start.XyZ789"
+touch -t 200001010000 "$STATE_ROOT/worker.lock"
+fm_remote_job_ensure_worker "$REMOTE_ROOT" "$ACCOUNT_HOME" \
+  || fail "a stale lock holding an interrupted shutdown's temp files blocked every new worker: $FM_REMOTE_JOB_ERROR"
+fm_remote_job_probe "$ACCOUNT_HOME" || fail "the worker that reclaimed an interrupted lock is not ready"
+assert_absent "$STATE_ROOT/worker.lock/.quarantine.AbC123" "the reclaimed lock kept an interrupted quarantine temp"
+pass "a stale lock left mid-publish by an interrupted worker is reclaimed"
 
 FM_REMOTE_JOB_TIMEOUT=1
 fm_remote_job_stage "$ACCOUNT_HOME" "$REMOTE_ROOT" "$REMOTE_HOME" fm-timeout-job.sh < /dev/null > /dev/null

@@ -2,7 +2,9 @@
 # Long-lived per-account worker for remote fm-on jobs.
 #
 # This process is launched by the Firstmate-owned dev.firstmate.remote-job
-# LaunchAgent on macOS and by a detached restart supervisor on Linux. It claims
+# LaunchAgent on macOS. On Linux it runs as a restart supervisor, launched by
+# the dev.firstmate.remote-job.service user unit where one is installed and as
+# a detached process otherwise. It claims
 # only complete 0700 records staged by fm-remote-job-lib.sh under the fixed
 # account queue, refuses symlinks and malformed records, and executes only a
 # tracked non-symlink fm-*.sh under this worker's configured FM_ROOT/bin.
@@ -120,9 +122,14 @@ worker_lock_recent() {
 }
 
 worker_quarantined_execution_stopped() { # <account-home>
-  local account_home=$1 job state kind file pid
   fm_remote_job_regular_bounded "$WORKER_LOCK/quarantine" 256 || return 1
-  fm_remote_job_lock_owner_matches_process "$account_home" && return 1
+  fm_remote_job_lock_owner_matches_process "$1" && return 1
+  worker_recorded_execution_stopped
+}
+
+# No running job's recorded supervisor process or group is still alive.
+worker_recorded_execution_stopped() {
+  local job state kind file pid
   for job in "$FM_REMOTE_JOB_JOBS"/job-*; do
     [ -d "$job" ] && [ ! -L "$job" ] || continue
     state=$(fm_remote_job_read_state "$job" 2>/dev/null || true)
@@ -141,6 +148,23 @@ worker_recover_quarantine() { # <account-home>
   worker_quarantined_execution_stopped "$1" || return 1
   [ ! -L "$WORKER_LOCK/quarantine" ] || return 1
   rm -f -- "$WORKER_LOCK/quarantine"
+}
+
+# A worker killed between creating one of its lock temp files and renaming it
+# into place - a second SIGTERM inside its shutdown handler, a SIGKILL, or a
+# power loss - leaves that temp behind, and the stale-lock reclaim could then
+# never remove the directory, so no worker would start again, not even after a
+# reboot. Only this worker's own temp names are removed, never a symlink, and a
+# half-published quarantine still requires every recorded execution to be gone.
+worker_reclaim_lock_temps() {
+  local temp quarantine=0
+  for temp in "$WORKER_LOCK"/.pid.* "$WORKER_LOCK"/.start.* "$WORKER_LOCK"/.command.* "$WORKER_LOCK"/.quarantine.*; do
+    [ -e "$temp" ] || [ -L "$temp" ] || continue
+    [ -f "$temp" ] && [ ! -L "$temp" ] || return 1
+    case "$temp" in "$WORKER_LOCK"/.quarantine.*) quarantine=1 ;; esac
+  done
+  [ "$quarantine" -eq 0 ] || worker_recorded_execution_stopped || return 1
+  rm -f -- "$WORKER_LOCK"/.pid.* "$WORKER_LOCK"/.start.* "$WORKER_LOCK"/.command.* "$WORKER_LOCK"/.quarantine.*
 }
 
 worker_acquire_lock() {
@@ -164,6 +188,7 @@ worker_acquire_lock() {
     fi
     [ ! -L "$WORKER_LOCK/pid" ] && [ ! -L "$WORKER_LOCK/start" ] && [ ! -L "$WORKER_LOCK/command" ] || return 1
     rm -f -- "$WORKER_LOCK/pid" "$WORKER_LOCK/start" "$WORKER_LOCK/command" || return 1
+    worker_reclaim_lock_temps || return 1
     rmdir "$WORKER_LOCK" || return 1
   done
   return 1

@@ -7,7 +7,8 @@ Firstmate does not support placing an individual worker remotely or failing a re
 The remote second-mate agent itself always runs on the [Herdr backend](herdr-backend.md) in the shared `fm-remote` session, and every path that provisions or launches one refuses a host that is not ready for it.
 `fm-remote` is reserved for remote fleet work and must not be used for personal work.
 The user's interactive Herdr session remains `default` and is not a remote-secondmate prerequisite.
-Herdr's remote-session server belongs to the host's own GUI login session rather than to the SSH connection, so the agent's endpoint survives every disconnection the primary's supervision depends on.
+Herdr's remote-session server is kept by the host itself rather than by the SSH connection, so the agent's endpoint survives every disconnection the primary's supervision depends on.
+On macOS that keeper is a launch agent in the account's GUI login session, and on Linux it is a systemd user unit, so a headless Linux server needs no GUI login.
 Local second mates are unaffected and keep their ordinary backend and session selection, as do the workers a remote second mate supervises inside its own home.
 
 ## Prerequisites
@@ -44,6 +45,7 @@ After that bootstrap every non-doctor `fm-on.sh` target runs through that worker
 The worker runs one staged job at a time and preempts a running reply long-poll as soon as any command other than another reply long-poll is queued, so interactive commands and startup checks are never serialized behind a poll window.
 `bin/fm-remote-job-lib.sh` owns that preemption contract, and a preempted poll is indistinguishable from one whose wait window closed with no data, so the re-armed poll loses nothing.
 Linux uses the same queue and worker protocol without the Aqua-session requirement.
+Where the account's systemd user manager serves it, the Linux worker is the `dev.firstmate.remote-job.service` user unit, and its logs are in `journalctl --user -u dev.firstmate.remote-job.service`.
 A worker stops itself once its configured code root stops being a Firstmate checkout, so a worker started from a worktree cannot outlive that worktree, and `bin/fm-remote-job-reap-orphans.sh` clears any worker already left behind that way without ever touching one whose checkout still exists.
 The remote account must provide the required toolchain, the selected worker runtime, the selected session backend, and credentials that work on that host.
 The origin URL named for each project must be reachable from the remote account because projects are cloned on that host rather than copied from the primary.
@@ -104,15 +106,21 @@ bin/fm-on.sh <secondmate-id|ssh-alias> fm-remote-doctor.sh --fix
 ```
 
 Over the plain SSH doctor bootstrap, it writes and reloads the Firstmate-owned `dev.firstmate.remote-job` and `dev.firstmate.herdr.fm-remote` launch agents on macOS, both scoped with `LimitLoadToSessionType=Aqua` and bootstrapped in `gui/<uid>`.
-It starts the same workers directly on Linux, recreates the `~/.local/bin/fm-remote-entrypoint.sh` symlink when it is absent, and creates only Firstmate-owned required-tool wrappers that it can prove resolve to a version-manager target, stopping after one harness satisfies the at-least-one requirement.
+On Linux it writes and enables the matching `dev.firstmate.remote-job.service` and `dev.firstmate.herdr.fm-remote.service` systemd user units under `~/.config/systemd/user`, both with `Restart=always` like launchd's `KeepAlive`, and starts the worker and the Herdr server through them.
+The units set `LANG=C.UTF-8` and `XDG_RUNTIME_DIR=/run/user/<uid>`, and the Herdr unit runs `herdr server --session fm-remote` in the foreground with the same `PATH` a worker job receives.
+On Linux the `fm-remote` server is started only through that unit and never as the child of a worker job, whose timeout would end the server and every pane with it.
+A rewritten Herdr unit takes effect at the server's next start, because restarting a running server ends every pane in it; never update that server with a Herdr live handoff either.
+A Linux host whose systemd user manager does not serve the account keeps the older behavior of starting both directly, which does not survive a reboot, and reports those unit checks as skipped.
+It recreates the `~/.local/bin/fm-remote-entrypoint.sh` symlink when neither it nor, on Linux, the documented `/usr/local/bin/fm-remote-entrypoint.sh` link points at this code root, and creates only Firstmate-owned required-tool wrappers that it can prove resolve to a version-manager target, stopping after one harness satisfies the at-least-one requirement.
 It never installs packages or overwrites a non-Firstmate file at a reserved wrapper path.
 The dedicated Herdr launch agent owns only the remote-secondmate `fm-remote` server and does not inspect, rewrite, start, stop, or require the user's interactive `default` session or its `dev.firstmate.herdr` launch agent.
 It re-derives every check from the host afterwards, so what it prints is the state after the repair rather than the intent of one.
 
-These steps are never automated and are always reported rather than silently attempted, because SSH cannot create a GUI session from nothing:
+These steps are never automated and are always reported rather than silently attempted, because SSH cannot create a GUI session from nothing and Firstmate never runs `sudo`:
 
 - The first console login on that Mac, and automatic login in System Settings > Users & Groups when the machine runs headless and must come back on its own after a reboot.
 - FileVault, which holds a reboot at pre-boot authentication before any login session exists.
+- On Linux, lingering for the account, so its user units start at boot and keep running without a login: `sudo loginctl enable-linger <user>`.
 - Installing any missing required tool that no safe wrapper can resolve.
 - The required remote tool set is `git`, `jq`, `herdr`, compatible `tasks-axi`, `treehouse`, and at least one of `claude`, `codex`, `opencode`, `pi`, `pi-signed`, `grok`, or `kimi`.
 - Each worker runtime's own `/login`, and any keychain password prompt that login needs.
@@ -170,6 +178,9 @@ Raw launch commands are not accepted for remote secondmates.
 Backends that already refuse secondmate launch, currently Orca and cmux, remain unsupported on the remote host.
 
 Startup liveness recovery relaunches a dead or missing remote second mate through this same command, so recovery passes the same readiness gate rather than a weaker one.
+The reply relay runs that same check mid-session: once its poll has failed with SSH exit 255, as a host reboot or dropped link makes it, the next poll first runs the readiness gate, the endpoint state probe, and the dead-or-missing relaunch, and the poll resumes once the host answers.
+[`bin/fm-remote-liveness-lib.sh`](../bin/fm-remote-liveness-lib.sh) owns that decision for both callers, and a remote launch re-checks the endpoint before creating one, so neither path can start a duplicate.
+A Herdr crash that never interrupts SSH is still recovered only at the next session start.
 
 Send routed requests normally:
 
@@ -249,7 +260,7 @@ bin/fm-test-run.sh tests/fm-remote-secondmate-lifecycle-e2e.test.sh
 bin/fm-test-run.sh tests/fm-remote-secondmate-trace-context.test.sh
 ```
 
-The account-level checks the doctor performs - a real Aqua login session, a real `launchctl` domain, and a real herdr server - are only ever exercised against fixtures here, so the readiness gate's behavior on a genuine Mac remains an operator-run smoke test.
+The account-level checks the doctor performs - a real Aqua login session, a real `launchctl` domain, a real systemd user manager with lingering, and a real herdr server - are only ever exercised against fixtures here, so the readiness gate's behavior on a genuine Mac or Linux server remains an operator-run smoke test.
 
 For a real-host smoke test, provision a disposable remote account and project, run the doctor and its repair against that account, launch the second mate, send one marked request, verify its correlated reply and structured fleet projection, simulate an unreachable host to confirm unknown-without-failover behavior, then retire only after the remote queue is empty.
 The deterministic suite is automated; real-host validation is still an operator-run smoke test and is not claimed by the repository tests.

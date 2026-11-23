@@ -35,8 +35,14 @@
 # On macOS the worker is Firstmate's Aqua LaunchAgent
 # dev.firstmate.remote-job at ~/Library/LaunchAgents/dev.firstmate.remote-job.plist
 # with logs under ~/Library/Logs. Linux starts the same worker process without
-# an Aqua requirement. The launch-agent renderer and repair helpers here are
-# shared by the entrypoint and remote doctor so their ownership cannot drift.
+# an Aqua requirement. Where the account's systemd user manager serves it, the
+# doctor installs the dev.firstmate.remote-job.service user unit rendered here
+# (Restart=always, the launchd KeepAlive counterpart, so the worker returns
+# after a reboot), and every later Linux start or restart goes through that
+# unit; bin/fm-remote-systemd-lib.sh owns reaching the user manager. Without an
+# installed unit Linux keeps starting the worker as a detached process. The
+# launch-agent and unit renderers and repair helpers here are shared by the
+# entrypoint and remote doctor so their ownership cannot drift.
 #
 # The Linux start path puts the worker tree in its own process group, so
 # stopping a worker signals its restart supervisor, its serving child, and any
@@ -50,7 +56,13 @@
 # bin/fm-remote-job-reap-orphans.sh uses it to reap workers that were already
 # orphaned that way.
 
+FM_REMOTE_JOB_LIB_DIR=${BASH_SOURCE[0]%/*}
+[ "$FM_REMOTE_JOB_LIB_DIR" != "${BASH_SOURCE[0]}" ] || FM_REMOTE_JOB_LIB_DIR=.
+# shellcheck source=bin/fm-remote-systemd-lib.sh
+. "$FM_REMOTE_JOB_LIB_DIR/fm-remote-systemd-lib.sh"
+
 FM_REMOTE_JOB_LABEL=dev.firstmate.remote-job
+FM_REMOTE_JOB_SYSTEMD_UNIT=$FM_REMOTE_JOB_LABEL.service
 FM_REMOTE_JOB_MAX_BYTES=${FM_REMOTE_JOB_MAX_BYTES:-1048576}
 FM_REMOTE_JOB_QUEUE_TIMEOUT=${FM_REMOTE_JOB_QUEUE_TIMEOUT:-360}
 FM_REMOTE_JOB_TIMEOUT=${FM_REMOTE_JOB_TIMEOUT:-360}
@@ -919,6 +931,97 @@ fm_remote_job_reload_launchagent() { # <account-home> <uid>
   fi
 }
 
+# The systemd user unit for the Linux worker: the counterpart of the Aqua
+# LaunchAgent above. Restart=always with no start limit mirrors launchd's
+# KeepAlive, WantedBy=default.target starts it when the user manager starts at
+# boot (which needs lingering), and the explicit LANG and XDG_RUNTIME_DIR give
+# the worker the locale and runtime directory a bare boot environment lacks.
+# KillMode=mixed sends the stop signal to the restart supervisor alone, which
+# stops its serving child once; signalling the whole group at once, systemd's
+# default, delivered a second SIGTERM inside the child's shutdown handler and
+# killed it mid-cleanup at every reboot.
+fm_remote_job_render_systemd_unit() { # <remote-root> <account-home> <uid>
+  local root=$1 account_home=$2 uid=$3 worker
+  worker="$root/bin/fm-remote-job-worker.sh"
+  fm_remote_systemd_safe_value "$worker" && fm_remote_systemd_safe_value "$account_home" || return 1
+  case "$uid" in ''|*[!0-9]*) return 1 ;; esac
+  cat <<UNIT
+# Firstmate-owned unit: bin/fm-remote-doctor.sh --fix writes and enables it.
+[Unit]
+Description=Firstmate remote job worker
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=$worker
+Environment="HOME=$account_home"
+Environment="FM_ROOT_OVERRIDE=$root"
+Environment="LANG=C.UTF-8"
+Environment="XDG_RUNTIME_DIR=/run/user/$uid"
+Restart=always
+RestartSec=5
+KillMode=mixed
+
+[Install]
+WantedBy=default.target
+UNIT
+}
+
+# Renders the worker unit for <remote-root> into <file>; non-zero when the
+# paths cannot be embedded safely.
+fm_remote_job_render_systemd_unit_to() { # <remote-root> <account-home> <file>
+  local uid
+  uid=$(id -u 2>/dev/null) || return 1
+  fm_remote_job_render_systemd_unit "$1" "$2" "$uid" > "$3"
+}
+
+# True when Linux starts of the worker for <remote-root> must go through the
+# installed unit: the user manager serves this account and the installed unit
+# is this code root's own contract. A unit written for another checkout never
+# runs this root's worker, so that case keeps the detached-process path.
+fm_remote_job_systemd_worker_managed() { # <remote-root> <account-home>
+  local root=$1 account_home=$2 rendered path rc=1
+  path=$(fm_remote_systemd_unit_path "$account_home" "$FM_REMOTE_JOB_SYSTEMD_UNIT")
+  [ -f "$path" ] && [ ! -L "$path" ] || return 1
+  fm_remote_systemd_available "$account_home" || return 1
+  rendered=$(mktemp "${TMPDIR:-/tmp}/fm-remote-job-unit.XXXXXX") || return 1
+  if fm_remote_job_render_systemd_unit_to "$root" "$account_home" "$rendered" && cmp -s "$rendered" "$path"; then
+    rc=0
+  fi
+  rm -f -- "$rendered"
+  return "$rc"
+}
+
+fm_remote_job_start_systemd_worker() { # <remote-root> <account-home>
+  local root=$1 account_home=$2 pid out
+  fm_remote_job_prepare_state "$account_home" || return 1
+  if fm_remote_job_worker_owned_alive "$root" "$account_home"; then
+    if fm_remote_job_worker_identity_matches "$root" "$account_home"; then return 0; fi
+    # A stale worker, including one started before the unit existed, holds the
+    # worker lock the unit's fresh worker needs, so stop its whole tree first.
+    pid=$FM_REMOTE_JOB_OWNER_PID
+    fm_remote_job_stop_worker_tree "$pid" || {
+      FM_REMOTE_JOB_ERROR="stale remote job worker did not stop safely"
+      return 1
+    }
+  fi
+  if ! out=$(fm_remote_systemd_ctl restart "$FM_REMOTE_JOB_SYSTEMD_UNIT" 2>&1); then
+    FM_REMOTE_JOB_ERROR="systemctl --user restart $FM_REMOTE_JOB_SYSTEMD_UNIT refused: ${out:-no diagnostic}"
+    return 1
+  fi
+  FM_REMOTE_JOB_REPAIRED=1
+}
+
+# The one Linux start entry: through the installed unit when it owns this
+# worker, otherwise as a detached process.
+fm_remote_job_start_linux() { # <remote-root> <account-home>
+  if fm_remote_job_systemd_worker_managed "$1" "$2"; then
+    fm_remote_job_start_systemd_worker "$1" "$2"
+  else
+    fm_remote_job_start_linux_worker "$1" "$2"
+  fi
+}
+
 fm_remote_job_start_linux_worker() { # <remote-root> <account-home>
   local root=$1 account_home=$2 worker pid
   worker="$root/bin/fm-remote-job-worker.sh"
@@ -992,7 +1095,7 @@ fm_remote_job_ensure_worker() { # <remote-root> <account-home>
       FM_REMOTE_JOB_REPAIRED=1
     fi
   else
-    fm_remote_job_start_linux_worker "$root" "$account_home" || return 1
+    fm_remote_job_start_linux "$root" "$account_home" || return 1
   fi
   fm_remote_job_wait_for_probe "$root" "$account_home" && return 0
   if [ "$platform" = darwin ]; then
@@ -1004,7 +1107,7 @@ fm_remote_job_ensure_worker() { # <remote-root> <account-home>
     # prior supervisor finishes releasing the shared worker lock. Retry the
     # idempotent start once, matching the bounded recovery already used above
     # for launchd, before reporting a startup failure.
-    fm_remote_job_start_linux_worker "$root" "$account_home" || return 1
+    fm_remote_job_start_linux "$root" "$account_home" || return 1
     FM_REMOTE_JOB_REPAIRED=1
     fm_remote_job_wait_for_probe "$root" "$account_home" && return 0
   fi
