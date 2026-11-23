@@ -57,9 +57,10 @@
 # exits 255 again without polling while the host is still unreachable. Once the
 # host answers, the marker is cleared and the poll resumes, so recovery runs
 # once per outage instead of on every poll. A relaunch that fails, or a
-# readiness gap, is escalated once as a keyed blocker on the parent status
-# stream. A Herdr crash that never interrupts SSH is not a trigger; the
-# session-start sweep still covers it.
+# readiness gap, is escalated as a keyed blocker on the parent status stream,
+# and not again while that blocker is still open, so a later outage after the
+# captain resolved it raises a new one. A Herdr crash that never interrupts SSH
+# is not a trigger; the session-start sweep still covers it.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -85,7 +86,7 @@ DOCUMENT_LOCAL_FAILURE=2
 . "$SCRIPT_DIR/fm-pending-reply-lib.sh"
 
 die() { printf 'error: %s\n' "$1" >&2; exit 1; }
-usage() { sed -n '2,62p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,63p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
 sha256_file() {
   if command -v shasum >/dev/null 2>&1; then
@@ -267,7 +268,7 @@ recover_after_transport_loss() { # <id>
     [ "$rc" -ne "$SSH_UNAVAILABLE" ] || return 1
     if [ "$FM_REMOTE_LIVENESS_OUTCOME" = failed ]; then
       line="blocked [key=remote-liveness-$id]: remote secondmate $id was not recovered after its host became reachable again ($FM_REMOTE_LIVENESS_MESSAGE)"
-      append_status_once "$STATE/$id.status" "$line" || true
+      append_status_unless_open "$STATE/$id.status" "$line" || true
     fi
   fi
   rm -f -- "$(transport_lost_path "$id")"
@@ -333,14 +334,30 @@ normalize_payload() { # <source> <destination>
   LC_ALL=C tr '\000-\010\013-\037\177' '?' < "$1" > "$2"
 }
 
-# The one place a line enters the parent status stream. A captured generation can
-# be replayed, so every append - a mirrored line or an escalation this adapter
-# raises itself - is at most once on exact bytes.
+# The one place a line from a captured delta enters the parent status stream. A
+# captured generation can be replayed, so every such append - a mirrored line or
+# an escalation raised while ingesting it - is at most once on exact bytes.
 # Returns 0 appended, 1 already present, 2 the write itself failed.
 append_status_once() { # <status-file> <line>
   grep -Fqx -- "$2" "$1" 2>/dev/null && return 1
   printf '%s\n' "$2" >> "$1" || return 2
   return 0
+}
+
+# A keyed escalation raised outside any captured generation, so no replay can
+# repeat it. It is skipped only while its key is still open in the parent
+# stream, as the shared decision fold in bin/fm-classify-lib.sh reads it, so a
+# resolved blocker is raised again by the next failure.
+# Returns 0 appended, 1 still open, 2 the write itself failed.
+append_status_unless_open() { # <status-file> <keyed-line>
+  local key open
+  key=$(_fm_decision_key "$2") || return 2
+  [ ! -L "$1" ] || return 2
+  open=$(status_open_decisions "$1")
+  case "$open" in
+    "$key"$'\t'*|*$'\n'"$key"$'\t'*) return 1 ;;
+  esac
+  printf '%s\n' "$2" >> "$1" || return 2
 }
 
 cmd_ingest() {

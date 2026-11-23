@@ -63,6 +63,10 @@ FM_REMOTE_JOB_LIB_DIR=${BASH_SOURCE[0]%/*}
 
 FM_REMOTE_JOB_LABEL=dev.firstmate.remote-job
 FM_REMOTE_JOB_SYSTEMD_UNIT=$FM_REMOTE_JOB_LABEL.service
+# The worker's exit status once its configured code root is abandoned. The
+# worker unit names it in RestartPreventExitStatus, so Restart=always never
+# relaunches a worker whose checkout is gone.
+FM_REMOTE_JOB_ABANDONED_EXIT=78
 FM_REMOTE_JOB_MAX_BYTES=${FM_REMOTE_JOB_MAX_BYTES:-1048576}
 FM_REMOTE_JOB_QUEUE_TIMEOUT=${FM_REMOTE_JOB_QUEUE_TIMEOUT:-360}
 FM_REMOTE_JOB_TIMEOUT=${FM_REMOTE_JOB_TIMEOUT:-360}
@@ -939,7 +943,9 @@ fm_remote_job_reload_launchagent() { # <account-home> <uid>
 # KillMode=mixed sends the stop signal to the restart supervisor alone, which
 # stops its serving child once; signalling the whole group at once, systemd's
 # default, delivered a second SIGTERM inside the child's shutdown handler and
-# killed it mid-cleanup at every reboot.
+# killed it mid-cleanup at every reboot. RestartPreventExitStatus is the one
+# exception to never giving up: a worker whose code root is abandoned exits
+# FM_REMOTE_JOB_ABANDONED_EXIT, so the unit cannot outlive its checkout.
 fm_remote_job_render_systemd_unit() { # <remote-root> <account-home> <uid>
   local root=$1 account_home=$2 uid=$3 worker
   worker="$root/bin/fm-remote-job-worker.sh"
@@ -960,6 +966,7 @@ Environment="LANG=C.UTF-8"
 Environment="XDG_RUNTIME_DIR=/run/user/$uid"
 Restart=always
 RestartSec=5
+RestartPreventExitStatus=$FM_REMOTE_JOB_ABANDONED_EXIT
 KillMode=mixed
 
 [Install]

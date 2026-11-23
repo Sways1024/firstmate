@@ -527,6 +527,18 @@ rm -f "$LIVE/spawn-fail"
   || fail "a failed relaunch was not escalated exactly once"
 assert_grep 'respawn failed after remote endpoint dead on its configured host' "$LHOME/state/ios.status" \
   "the relaunch escalation did not carry its cause"
+touch "$LIVE/readiness-gap" "$MARKER"
+live_source
+rm -f "$LIVE/readiness-gap"
+[ "$(grep -c '^blocked \[key=remote-liveness-ios\]' "$LHOME/state/ios.status")" -eq 1 ] \
+  || fail "a later outage raised a second liveness blocker while the first was still open"
+printf 'resolved [key=remote-liveness-ios]: relaunched by hand\n' >> "$LHOME/state/ios.status"
+touch "$LIVE/spawn-fail" "$MARKER"
+live_source
+rm -f "$LIVE/spawn-fail"
+[ "$(grep -cF 'blocked [key=remote-liveness-ios]: remote secondmate ios was not recovered' "$LHOME/state/ios.status")" -eq 2 ] \
+  || fail "a later outage failing the same way after the blocker was resolved raised no new blocker"
+pass "the liveness blocker is raised once per outage and never again while it is still open"
 : > "$LHOME/state/ios.status"
 touch "$LIVE/readiness-gap" "$MARKER"
 live_source

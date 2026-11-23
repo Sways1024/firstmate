@@ -259,6 +259,30 @@ fm_write_secondmate_meta() {
     "projects=$projects"
 }
 
+# fm_test_unit_value <unit-file> <section>.<key>: every value a systemd unit
+# file gives that directive, one per line, parsed by section the way the user
+# manager reads it, so a directive in the wrong section is not found. Each
+# quoted Environment assignment is its own <section>.Environment.<name> key.
+fm_test_unit_value() {
+  awk -v want="$2" '
+    /^[[:space:]]*([#;]|$)/ { next }
+    /^\[.*\]$/ { section = substr($0, 2, length($0) - 2); next }
+    {
+      eq = index($0, "=")
+      if (eq == 0) next
+      key = substr($0, 1, eq - 1)
+      value = substr($0, eq + 1)
+      if (key == "Environment") {
+        if (value ~ /^".*"$/) value = substr(value, 2, length(value) - 2)
+        eq = index(value, "=")
+        key = "Environment." substr(value, 1, eq - 1)
+        value = substr(value, eq + 1)
+      }
+      if (section "." key == want) print value
+    }
+  ' "$1"
+}
+
 # --- common assertions ------------------------------------------------------
 
 # assert_contains <haystack> <needle> <msg>

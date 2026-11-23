@@ -22,7 +22,10 @@
 # pooled worktree, or a removed test fixture root leaves behind. It can never
 # validate or execute another job from a root that is gone, so both the serving
 # loop and the Linux restart supervisor stop instead of polling forever
-# reparented to init. FM_REMOTE_JOB_ORPHAN_GRACE_SECONDS is how long the root
+# reparented to init. Both exit FM_REMOTE_JOB_ABANDONED_EXIT rather than 0, the
+# status the systemd worker unit excludes from Restart=always, so a
+# unit-managed worker cannot outlive its checkout either; every other clean stop
+# still exits 0. FM_REMOTE_JOB_ORPHAN_GRACE_SECONDS is how long the root
 # must stay missing before that counts, so an ordinary transient never stops a
 # healthy worker. The supervisor additionally refuses to restart a child that
 # keeps failing immediately: it backs off up to
@@ -30,7 +33,8 @@
 # FM_REMOTE_JOB_SUPERVISOR_MAX_RESTARTS consecutive failures, since a restart
 # loop that never stays up only burns CPU and grows its log without bound. A
 # child that stays up for FM_REMOTE_JOB_SUPERVISOR_HEALTHY_SECONDS clears that
-# count. fm-on's ensure path restarts a worker that gave up.
+# count. fm-on's ensure path restarts a worker that gave up, and so does the
+# systemd unit's Restart=always where one manages the worker.
 set -u
 
 # A non-numeric override falls back to the default rather than crashing the
@@ -717,7 +721,7 @@ main() {
     # still-healthy worker read as unready to a concurrent probe.
     if worker_code_root_abandoned; then
       worker_error "configured FM_ROOT $FM_ROOT no longer exists; stopping the abandoned worker"
-      exit 0
+      exit "$FM_REMOTE_JOB_ABANDONED_EXIT"
     fi
     worker_reap=0
     if [ "$worker_reap" -eq 0 ]; then
@@ -768,7 +772,7 @@ worker_supervise_linux() {
   while :; do
     if worker_code_root_abandoned; then
       worker_error "configured FM_ROOT $FM_ROOT no longer exists; stopping the abandoned worker supervisor"
-      return 0
+      return "$FM_REMOTE_JOB_ABANDONED_EXIT"
     fi
     started=$SECONDS
     "$SCRIPT_DIR/fm-remote-job-worker.sh" --serve &
@@ -779,9 +783,9 @@ worker_supervise_linux() {
       WORKER_SUPERVISED_PID=
       return 0
     fi
-    if [ "$child_status" -eq 75 ]; then
+    if [ "$child_status" -eq 75 ] || [ "$child_status" -eq "$FM_REMOTE_JOB_ABANDONED_EXIT" ]; then
       WORKER_SUPERVISED_PID=
-      return 75
+      return "$child_status"
     fi
     worker_supervisor_cleanup_dead_child "$account_home" "$WORKER_SUPERVISED_PID" || true
     WORKER_SUPERVISED_PID=

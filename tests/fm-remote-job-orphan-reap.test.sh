@@ -138,6 +138,84 @@ wait_gone "$WORKER" 60 || fail "the worker survived its code root being pruned"
 wait_gone "$SURVIVOR" 60 || fail "a serving child outlived the abandoned supervisor"
 pass "a worker stops its whole tree once its code root is pruned"
 
+# --- a unit-managed worker whose checkout is gone is not relaunched ---------
+#
+# Restart=always relaunches a worker after any exit, so the unit's own
+# RestartPreventExitStatus is the only thing that keeps a worker from outliving
+# its checkout. The worker runs here exactly as the user manager starts it: the
+# rendered unit's ExecStart under its Environment, as the unit's main process.
+
+# run_unit_worker <unit-file> <state-root>: start the unit's worker in its own
+# group and set UNIT_WORKER to its pid.
+run_unit_worker() {
+  local unit=$1 state_root=$2 exec_start
+  exec_start=$(fm_test_unit_value "$unit" Service.ExecStart)
+  set -m
+  env -i PATH="$PATH" \
+    HOME="$(fm_test_unit_value "$unit" Service.Environment.HOME)" \
+    FM_ROOT_OVERRIDE="$(fm_test_unit_value "$unit" Service.Environment.FM_ROOT_OVERRIDE)" \
+    LANG="$(fm_test_unit_value "$unit" Service.Environment.LANG)" \
+    FM_REMOTE_JOB_STATE_ROOT="$state_root" \
+    FM_REMOTE_JOB_PLATFORM_OVERRIDE=Linux \
+    FM_REMOTE_JOB_ORPHAN_GRACE_SECONDS=1 \
+    "$exec_start" >> "$state_root.log" 2>&1 < /dev/null &
+  UNIT_WORKER=$!
+  set +m
+}
+
+# wait_serving <supervisor-pid> <state-root>: wait until the supervisor's
+# serving child owns the worker and has published its pid.
+wait_serving() {
+  local deadline=$(( $(date +%s) + 15 )) child
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    child=$(pgrep -P "$1" 2>/dev/null | head -n 1)
+    [ -n "$child" ] && [ "$(cat "$2/worker.pid" 2>/dev/null)" = "$child" ] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+# restart_prevented <unit-file> <exit-status>: 0 when the unit's
+# RestartPreventExitStatus stops Restart=always from relaunching after it.
+restart_prevented() {
+  local status
+  for status in $(fm_test_unit_value "$1" Service.RestartPreventExitStatus); do
+    [ "$status" = "$2" ] && return 0
+  done
+  return 1
+}
+
+UNIT_CASE="$TMP_ROOT/case3"
+mkdir -p "$UNIT_CASE/account"
+build_remote_root "$UNIT_CASE/remote-root"
+UNIT="$UNIT_CASE/dev.firstmate.remote-job.service"
+bash -c '. "$1" && fm_remote_job_render_systemd_unit "$2" "$3" "$4"' _ "$ROOT/bin/fm-remote-job-lib.sh" \
+  "$UNIT_CASE/remote-root" "$UNIT_CASE/account" "$(id -u)" > "$UNIT" || fail "could not render the worker unit"
+[ "$(fm_test_unit_value "$UNIT" Service.Restart)" = always ] || fail "the worker unit does not restart like launchd KeepAlive"
+
+run_unit_worker "$UNIT" "$UNIT_CASE/remote-jobs"
+track "$UNIT_WORKER"
+wait_serving "$UNIT_WORKER" "$UNIT_CASE/remote-jobs" || fail "the unit-run worker never started serving"
+kill -TERM "$UNIT_WORKER"
+wait_gone "$UNIT_WORKER" 20 || fail "the unit-run worker ignored the user manager's stop signal"
+wait "$UNIT_WORKER"
+UNIT_RC=$?
+[ "$UNIT_RC" -eq 0 ] || fail "a stopped worker with an intact checkout did not exit cleanly: $UNIT_RC"
+! restart_prevented "$UNIT" "$UNIT_RC" || fail "a clean worker stop is exempt from Restart=always"
+
+run_unit_worker "$UNIT" "$UNIT_CASE/remote-jobs"
+track "$UNIT_WORKER"
+wait_serving "$UNIT_WORKER" "$UNIT_CASE/remote-jobs" || fail "the unit-run worker never started serving"
+UNIT_SERVE=$(pgrep -P "$UNIT_WORKER" | head -n 1)
+rm -rf "$UNIT_CASE/remote-root"
+wait_gone "$UNIT_WORKER" 60 || fail "the unit-run worker survived its code root being pruned"
+wait "$UNIT_WORKER"
+UNIT_RC=$?
+wait_gone "$UNIT_SERVE" 20 || fail "a serving child outlived the abandoned unit-run worker"
+restart_prevented "$UNIT" "$UNIT_RC" ||
+  fail "the abandoned worker exited $UNIT_RC, which the unit's Restart=always would relaunch forever"
+pass "a unit-managed worker whose checkout is gone exits a status its unit never restarts, and a clean stop does not"
+
 # --- the belt-and-suspenders sweep over already-orphaned workers -------------
 #
 # A current worker stops itself, so the sweep is exercised against a stand-in

@@ -317,6 +317,14 @@ assert_line() { grep -Fqx -- "$1" "$2" || fail "$3"; }
 assert_regex() { grep -q -- "$1" "$2" || fail "$3"; }
 assert_no_regex() { ! grep -q -- "$1" "$2" || fail "$3"; }
 
+# assert_unit <unit-file> <section>.<key> <value> <msg>: the unit, parsed by
+# section, gives that directive exactly this one value.
+assert_unit() {
+  local got
+  got=$(fm_test_unit_value "$1" "$2")
+  [ "$got" = "$3" ] || fail "$4 ($2 was '$got')"
+}
+
 # --- a host with no herdr is never ready, and --fix cannot install one -------
 
 new_case Darwin no-herdr gui
@@ -604,18 +612,23 @@ assert_contains "$DOCTOR_OUT" 'fix herdr-unit=applied: wrote and enabled dev.fir
 assert_contains "$DOCTOR_OUT" 'check remote-job-unit=ok:' "the worker unit was not confirmed by the re-check"
 assert_contains "$DOCTOR_OUT" 'check herdr-unit=ok:' "the herdr unit was not confirmed by the re-check"
 assert_contains "$DOCTOR_OUT" 'check herdr-server=ok:' "the server started through its unit was not confirmed"
-assert_line "ExecStart=$ROOT/bin/fm-remote-job-worker.sh" "$JOB_UNIT" "the worker unit runs the wrong program"
-assert_line "Environment=\"HOME=$CASE_HOME\"" "$JOB_UNIT" "the worker unit does not pin the account HOME"
-assert_line "Environment=\"FM_ROOT_OVERRIDE=$ROOT\"" "$JOB_UNIT" "the worker unit does not pin its code root"
-assert_line "ExecStart=$CASE_BIN/herdr server --session fm-remote" "$HERDR_UNIT" \
+assert_unit "$JOB_UNIT" Service.ExecStart "$ROOT/bin/fm-remote-job-worker.sh" "the worker unit runs the wrong program"
+assert_unit "$JOB_UNIT" Service.Environment.HOME "$CASE_HOME" "the worker unit does not pin the account HOME"
+assert_unit "$JOB_UNIT" Service.Environment.FM_ROOT_OVERRIDE "$ROOT" "the worker unit does not pin its code root"
+assert_unit "$JOB_UNIT" Service.KillMode mixed "the worker unit's stop signal reaches the serving child as well as its supervisor"
+assert_unit "$HERDR_UNIT" Service.ExecStart "$CASE_BIN/herdr server --session fm-remote" \
   "the herdr unit does not run the fm-remote server in the foreground"
-assert_grep "Environment=\"PATH=$ROOT/bin:" "$HERDR_UNIT" "the herdr unit does not give panes the worker job PATH"
+HERDR_UNIT_PATH=$(fm_test_unit_value "$HERDR_UNIT" Service.Environment.PATH)
+case "$HERDR_UNIT_PATH" in
+  "$ROOT/bin:"*) ;;
+  *) fail "the herdr unit does not give panes the worker job PATH: '$HERDR_UNIT_PATH'" ;;
+esac
 for unit in "$JOB_UNIT" "$HERDR_UNIT"; do
-  assert_line 'Restart=always' "$unit" "$unit does not restart like launchd KeepAlive"
-  assert_line 'StartLimitIntervalSec=0' "$unit" "$unit can stop restarting after a burst"
-  assert_line 'WantedBy=default.target' "$unit" "$unit is not started with the user manager at boot"
-  assert_line 'Environment="LANG=C.UTF-8"' "$unit" "$unit leaves the boot locale unset"
-  assert_line "Environment=\"XDG_RUNTIME_DIR=/run/user/$CASE_UID\"" "$unit" "$unit leaves the runtime directory unset"
+  assert_unit "$unit" Service.Restart always "$unit does not restart like launchd KeepAlive"
+  assert_unit "$unit" Unit.StartLimitIntervalSec 0 "$unit can stop restarting after a burst"
+  assert_unit "$unit" Install.WantedBy default.target "$unit is not started with the user manager at boot"
+  assert_unit "$unit" Service.Environment.LANG C.UTF-8 "$unit leaves the boot locale unset"
+  assert_unit "$unit" Service.Environment.XDG_RUNTIME_DIR "/run/user/$CASE_UID" "$unit leaves the runtime directory unset"
 done
 assert_line '--user enable dev.firstmate.remote-job.service' "$CASE_STATE/systemctl.log" "the worker unit was not enabled"
 assert_line '--user enable dev.firstmate.herdr.fm-remote.service' "$CASE_STATE/systemctl.log" "the herdr unit was not enabled"
