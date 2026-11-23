@@ -1332,10 +1332,11 @@ test_correlations_reuse_only_for_matching_open_task
 test_tick_end_to_end_missed_then_escalate
 test_failed_send_discards_undelivered_expectation
 test_correlated_progress_line_does_not_resolve
-test_delegated_work_suppresses_recovery_until_it_drains
-test_resumed_turn_forgets_earlier_turn_end
-test_recovery_and_escalation_wait_grace_after_turn_end
-test_recovery_delivery_error_is_recorded_and_named
-test_unknown_recovery_delivery_is_recorded_unknown
+# These run in subshells, where fail() exits only the subshell; stop the suite.
+test_delegated_work_suppresses_recovery_until_it_drains || exit 1
+test_resumed_turn_forgets_earlier_turn_end || exit 1
+test_recovery_and_escalation_wait_grace_after_turn_end || exit 1
+test_recovery_delivery_error_is_recorded_and_named || exit 1
+test_unknown_recovery_delivery_is_recorded_unknown || exit 1
 
 printf 'ok - all pending-reply tests passed\n'
