@@ -459,6 +459,7 @@ cat > "$LROOT/bin/fm-spawn.sh" <<'SH'
 #!/usr/bin/env bash
 printf 'spawn %s\n' "$*" >> "$FM_FAKE_LIVE/calls.log"
 [ ! -f "$FM_FAKE_LIVE/spawn-fail" ] || { printf 'remote host-local secondmate launch failed\n' >&2; exit 1; }
+[ ! -f "$FM_FAKE_LIVE/spawn-unknown" ] || { printf 'error: remote secondmate is unavailable or launch completion is unknown\n' >&2; exit 255; }
 SH
 chmod +x "$LROOT/bin/fm-on.sh" "$LROOT/bin/fm-spawn.sh"
 printf 'kind=secondmate\nwindow=2ndmate-ios\nremote_host=remote-mac\nharness=claude\n' > "$LHOME/state/ios.meta"
@@ -516,6 +517,24 @@ for endpoint_state in alive missing ambiguous unreadable unverified; do
   assert_absent "$MARKER" "recovery kept its marker after a $endpoint_state probe"
 done
 pass "recovery relaunches only a dead or missing endpoint and never duplicates a live or uncertain one"
+
+: > "$LHOME/state/ios.status"
+printf 'dead\n' > "$LIVE/state"
+touch "$LIVE/spawn-unknown" "$MARKER"
+live_source
+rm -f "$LIVE/spawn-unknown"
+[ "$LIVE_RC" -eq 255 ] || fail "a relaunch whose completion is unknown resumed the poll: $LIVE_RC"
+[ "$(spawn_count)" -eq 1 ] || fail "a dead endpoint was not relaunched before its completion went unknown"
+assert_no_grep 'fm-remote-delta-read.sh' "$LIVE/calls.log" "the relay polled after a relaunch whose completion is unknown"
+assert_present "$MARKER" "a relaunch whose completion is unknown disarmed recovery"
+assert_no_grep 'remote-liveness-ios' "$LHOME/state/ios.status" "a relaunch whose completion is unknown was escalated as a failure"
+printf 'alive\n' > "$LIVE/state"
+live_source
+[ "$LIVE_RC" -eq 75 ] || fail "the poll did not resume once the landed launch was found alive: $LIVE_RC"
+[ "$(spawn_count)" -eq 0 ] || fail "recovery relaunched a launch that had landed"
+assert_absent "$MARKER" "recovery stayed armed after finding the landed launch alive"
+assert_no_grep 'remote-liveness-ios' "$LHOME/state/ios.status" "finding the landed launch alive raised a blocker"
+pass "a relaunch whose completion is unknown keeps recovery armed without a blocker, and a landed launch clears it silently"
 
 printf 'dead\n' > "$LIVE/state"
 touch "$LIVE/spawn-fail" "$MARKER"

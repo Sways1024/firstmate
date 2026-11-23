@@ -182,6 +182,7 @@ Backends that already refuse secondmate launch, currently Orca and cmux, remain 
 Startup liveness recovery relaunches a dead or missing remote second mate through this same command, so recovery passes the same readiness gate rather than a weaker one.
 The reply relay runs that same check mid-session: once its poll has failed with SSH exit 255, as a host reboot or dropped link makes it, the next poll first runs the readiness gate, the endpoint state probe, and the dead-or-missing relaunch, and the poll resumes once the host answers.
 A failed relaunch or readiness gap there is raised as `blocked [key=remote-liveness-<id>]` on the parent status stream, and not raised again while that blocker is still open, so a later outage after it was resolved raises a new one.
+A relaunch whose completion SSH left unknown is not a failure: recovery stays armed and the next pass re-probes the endpoint, which finds it alive if the launch landed.
 [`bin/fm-remote-liveness-lib.sh`](../bin/fm-remote-liveness-lib.sh) owns that decision for both callers, and a remote launch re-checks the endpoint before creating one, so neither path can start a duplicate.
 A Herdr crash that never interrupts SSH is still recovered only at the next session start.
 
