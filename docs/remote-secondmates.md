@@ -205,7 +205,7 @@ If the confined remote reader permanently refuses a referenced document, the mat
 An SSH exit status of 255 while fetching a referenced document leaves the delta uncommitted for the process-event runner's normal retry because remote completion is unknown.
 The process-event runner applies each captured delta through this adapter as soon as it is captured, so a mirrored reply reaches the primary status channel without depending on the wake handler running the adapter itself.
 A mirrored line that carries a correlation token settles its pending-reply record and closes that request's own open escalation decision, unless it is a `working` progress line, which never settles a request; an application that does not complete leaves the capture unacknowledged for the documented handler retry path.
-The host's observation of a remote mate reports `supervising` while the remote home holds a live worker record, so a mate waiting on its own delegated work is never nudged for a missing report.
+The host's observation of a remote mate reports `supervising` while the remote home holds a live worker record, so a mate waiting on its own delegated work is never nudged for a missing report; a host still on older code reports such a mate idle, which can still draw that nudge until `/updatefirstmate` updates its code root.
 The [process-to-event operating contract](configuration.md#process-to-event-sources-stateprocevent) owns that automatic application and its retry boundary.
 The source log is never truncated or consumed.
 A shortened or changed prefix stops the relay and surfaces a continuity failure instead of silently resetting the cursor.
