@@ -108,7 +108,7 @@ Portable shards, each portable serial shard, and the Herdr lane upload runner-ge
 | Job | timeout-minutes | Rationale |
 |---|---:|---|
 | portable parallel 1/2 | 10 | The measured shard sums are about three minutes and the timeout is a hang tripwire. |
-| portable serial 1-4 | 15 | Each balanced shard is about five minutes, leaving roughly 3x hang-tripwire margin. |
+| portable serial 1-4 | 30 | On the ubuntu-26.04 image the heaviest shard runs about 14 minutes and has passed 15 on a slower runner, so this leaves roughly 2x hang-tripwire margin. |
 | Herdr | 40 | The real-Herdr lane keeps its dedicated timeout. |
 
 Timeouts are hang tripwires rather than expected healthy durations.

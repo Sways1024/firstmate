@@ -66,6 +66,33 @@ ln -s "$SLEEP_BIN" "$LAB/bin/amuse"
 ln -s "$SLEEP_BIN" "$LAB/bin/muse-binary"
 ln -s "$SLEEP_BIN" "$LAB/bin/muse-bind"
 
+# The symlink target must keep sleeping under any invoked name. A standalone
+# sleep does, but a multicall coreutils does not: busybox picks its applet from
+# argv[0], and the uutils build Ubuntu 26.04 installs as coreutils refuses to
+# run at all when invoked through a symlink whose name differs from its own,
+# while still accepting a bare `exec -a` name. Those windows would exit at once
+# and read as missing, so each stand-in is probed exactly as the cases below
+# run it, and on failure they all point at a compiled sleeper instead.
+CC_BIN=$(command -v cc 2>/dev/null || command -v gcc 2>/dev/null || true)
+printf '%s\n' '#include <unistd.h>' 'int main(void){for(;;)sleep(60);return 0;}' > "$LAB/spin.c"
+standins_run() {
+  local standin
+  for standin in "$LAB"/bin/*; do
+    [ -L "$standin" ] || continue
+    "$standin" 0 >/dev/null 2>&1 || return 1
+  done
+  bash -c 'exec -a 2.1.220 "$1" 0' _ "$LAB/bin/notaharness" >/dev/null 2>&1
+}
+if ! standins_run; then
+  if [ -z "$CC_BIN" ] || ! "$CC_BIN" -o "$LAB/spin" "$LAB/spin.c" 2>/dev/null; then
+    echo "skip: sleep dispatches on its invoked name and no C compiler can build a stand-in"
+    exit 0
+  fi
+  for standin in "$LAB"/bin/*; do
+    [ -L "$standin" ] && ln -sf "$LAB/spin" "$standin"
+  done
+fi
+
 # A launcher whose own process identity is a bare shell, running the harness as
 # a child in the same foreground process group - the shape the real Pi Launcher
 # path takes, and the one where trusting a single name source can produce a
@@ -179,9 +206,7 @@ pass "tmux liveness: unrelated muse-containing command names stay ambiguous"
 # real executable file rather than a symlink, because macOS takes the title
 # from the resolved target's name, so it is skipped where no C compiler exists.
 
-CC_BIN=$(command -v cc 2>/dev/null || command -v gcc 2>/dev/null || true)
 if [ -n "$CC_BIN" ] &&
-  printf '%s\n' '#include <unistd.h>' 'int main(void){for(;;)sleep(60);return 0;}' > "$LAB/spin.c" &&
   "$CC_BIN" -o "$LAB/bin/claude/2.1.220" "$LAB/spin.c" 2>/dev/null &&
   "$CC_BIN" -o "$LAB/bin/decoy/2.1.220" "$LAB/spin.c" 2>/dev/null; then
   new_window titled "$LAB/bin/claude/2.1.220"
