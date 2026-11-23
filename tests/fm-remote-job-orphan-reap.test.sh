@@ -209,6 +209,17 @@ start_conditions_hold "$UNIT" || fail "the worker unit would skip starting a wor
 run_unit_worker "$UNIT" "$UNIT_CASE/remote-jobs"
 track "$UNIT_WORKER"
 wait_serving "$UNIT_WORKER" "$UNIT_CASE/remote-jobs" || fail "the unit-run worker never started serving"
+SERVING_WORKER=$UNIT_WORKER
+run_unit_worker "$UNIT" "$UNIT_CASE/remote-jobs"
+track "$UNIT_WORKER"
+wait_gone "$UNIT_WORKER" 30 || fail "a unit-run worker kept running while another live worker owned the lock"
+wait "$UNIT_WORKER"
+UNIT_RC=$?
+restart_prevented "$UNIT" "$UNIT_RC" ||
+  fail "a unit-run worker that found another live worker owning the lock exited $UNIT_RC, which Restart=always would repeat every RestartSec"
+alive "$SERVING_WORKER" || fail "a clashing unit start stopped the worker that owns the lock"
+UNIT_WORKER=$SERVING_WORKER
+pass "a unit-run worker that finds another live worker owning the lock exits a status its unit never restarts"
 kill -TERM "$UNIT_WORKER"
 wait_gone "$UNIT_WORKER" 20 || fail "the unit-run worker ignored the user manager's stop signal"
 wait "$UNIT_WORKER"

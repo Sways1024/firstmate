@@ -24,10 +24,13 @@
 # loop and the Linux restart supervisor stop instead of polling forever
 # reparented to init. Both exit FM_REMOTE_JOB_ABANDONED_EXIT rather than 0, the
 # status the systemd worker unit excludes from Restart=always, so a
-# unit-managed worker cannot outlive its checkout either; every other clean stop
-# still exits 0. FM_REMOTE_JOB_ORPHAN_GRACE_SECONDS is how long the root
-# must stay missing before that counts, so an ordinary transient never stops a
-# healthy worker. The supervisor additionally refuses to restart a child that
+# unit-managed worker cannot outlive its checkout either. A worker that finds
+# another live worker already owning the account's lock exits
+# FM_REMOTE_JOB_LOCK_HELD_EXIT, which the unit excludes the same way, so a clash
+# stops instead of repeating every RestartSec; every other clean stop still
+# exits 0. FM_REMOTE_JOB_ORPHAN_GRACE_SECONDS is how long the root
+# must stay missing before it counts as abandoned, so an ordinary transient
+# never stops a healthy worker. The supervisor additionally refuses to restart a child that
 # keeps failing immediately: it backs off up to
 # FM_REMOTE_JOB_SUPERVISOR_MAX_BACKOFF_SECONDS and gives up after
 # FM_REMOTE_JOB_SUPERVISOR_MAX_RESTARTS consecutive failures, since a restart
@@ -708,7 +711,7 @@ main() {
   lock_status=$?
   case "$lock_status" in
     0) ;;
-    2) exit 0 ;;
+    2) exit "$FM_REMOTE_JOB_LOCK_HELD_EXIT" ;;
     3) worker_error "worker ownership is quarantined after an unconfirmed shutdown"; exit 75 ;;
     *) worker_error "cannot acquire or safely reclaim worker ownership"; exit 1 ;;
   esac
@@ -783,7 +786,8 @@ worker_supervise_linux() {
       WORKER_SUPERVISED_PID=
       return 0
     fi
-    if [ "$child_status" -eq 75 ] || [ "$child_status" -eq "$FM_REMOTE_JOB_ABANDONED_EXIT" ]; then
+    if [ "$child_status" -eq 75 ] || [ "$child_status" -eq "$FM_REMOTE_JOB_ABANDONED_EXIT" ] ||
+      [ "$child_status" -eq "$FM_REMOTE_JOB_LOCK_HELD_EXIT" ]; then
       WORKER_SUPERVISED_PID=
       return "$child_status"
     fi

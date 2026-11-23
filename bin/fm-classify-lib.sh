@@ -302,6 +302,16 @@ status_open_decisions() {  # <status-file>
   printf '%s' "$open"
 }
 
+# 0 when <key> is a still-open decision in <status-file>, per the fold above.
+status_decision_open() {  # <status-file> <key>
+  local open
+  open=$(status_open_decisions "$1")
+  case "$open" in
+    "$2"$'\t'*|*$'\n'"$2"$'\t'*) return 0 ;;
+  esac
+  return 1
+}
+
 # Fleet-wide wrapper around status_open_decisions: scans every task's status
 # log under <state> and prefixes each still-open decision with its owning task
 # id, so a per-wake or per-session surface can print the consolidated open set

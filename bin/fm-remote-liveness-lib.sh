@@ -2,7 +2,7 @@
 # fm-remote-liveness-lib.sh - one remote second mate's liveness check and relaunch.
 #
 # Source this file and call:
-#   fm_remote_secondmate_liveness <bin-dir> <spawn-bin-dir> <secondmate-id> <remote-host>
+#   fm_remote_secondmate_liveness <bin-dir> <spawn-bin-dir> <secondmate-id> <remote-host> <parent-status-file>
 #
 # This is the single owner of the remote liveness decision. It runs the remote
 # readiness gate (bin/fm-remote-readiness-lib.sh), probes the endpoint with
@@ -17,7 +17,11 @@
 #
 # Callers: the session-start sweep in bin/fm-bootstrap.sh, and the mid-session
 # trigger in bin/fm-procevent-remote-reply.sh once the reply relay's transport
-# recovers after an SSH failure. It prints nothing. It sets:
+# recovers after an SSH failure. It prints nothing. Its one write: a check that
+# ends alive or relaunched while the relay's `blocked [key=remote-liveness-<id>]`
+# is still open in <parent-status-file>, per bin/fm-classify-lib.sh's fold,
+# appends the matching `resolved` line, so a recovered second mate's blocker
+# does not stay open; otherwise a successful check stays silent. It sets:
 #   FM_REMOTE_LIVENESS_OUTCOME  alive|relaunched|skipped|unavailable|failed
 #   FM_REMOTE_LIVENESS_MESSAGE  the one-line reason, without the
 #                               "SECONDMATE_LIVENESS: secondmate <id>: " prefix
@@ -32,6 +36,8 @@ FM_REMOTE_LIVENESS_OUTCOME=
 FM_REMOTE_LIVENESS_MESSAGE=
 # shellcheck disable=SC2034
 FM_REMOTE_LIVENESS_CAUSE=
+
+_FM_REMOTE_LIVENESS_LIB_DIR=${BASH_SOURCE[0]%/*}
 
 if ! declare -F fm_remote_readiness_ensure >/dev/null 2>&1; then
   # shellcheck source=bin/fm-remote-readiness-lib.sh
@@ -51,8 +57,19 @@ fm_remote_liveness_first_line() { # <text>; the first line with whitespace runs 
   printf '%s\n' "$1" | sed -n '1s/[[:space:]]\{1,\}/ /g;1p'
 }
 
-fm_remote_secondmate_liveness() { # <bin-dir> <spawn-bin-dir> <secondmate-id> <remote-host>
-  local bin_dir=$1 spawn_dir=$2 id=$3 remote_host=$4 rc out agent_state route_out remote_backend reason cause
+fm_remote_liveness_resolve_blocker() { # <parent-status-file> <secondmate-id>
+  local status_file=$1 key="remote-liveness-$2"
+  [ -n "$status_file" ] && [ -f "$status_file" ] && [ ! -L "$status_file" ] || return 0
+  if ! declare -F status_decision_open >/dev/null 2>&1; then
+    # shellcheck source=bin/fm-classify-lib.sh
+    . "$_FM_REMOTE_LIVENESS_LIB_DIR/fm-classify-lib.sh" || return 0
+  fi
+  status_decision_open "$status_file" "$key" || return 0
+  printf 'resolved [key=%s]: %s\n' "$key" "$FM_REMOTE_LIVENESS_MESSAGE" >> "$status_file" || true
+}
+
+fm_remote_secondmate_liveness() { # <bin-dir> <spawn-bin-dir> <secondmate-id> <remote-host> <parent-status-file>
+  local bin_dir=$1 spawn_dir=$2 id=$3 remote_host=$4 status_file=${5:-} rc out agent_state route_out remote_backend reason cause
   fm_remote_liveness_set '' ''
   rc=0
   fm_remote_readiness_ensure "$bin_dir" "$id" || rc=$?
@@ -122,6 +139,9 @@ fm_remote_secondmate_liveness() { # <bin-dir> <spawn-bin-dir> <secondmate-id> <r
       fm_remote_liveness_set skipped "skipped: remote endpoint state is $agent_state on $remote_host"
       ;;
     *) fm_remote_liveness_set skipped "skipped: remote endpoint returned an invalid state" ;;
+  esac
+  case "$FM_REMOTE_LIVENESS_OUTCOME" in
+    alive|relaunched) fm_remote_liveness_resolve_blocker "$status_file" "$id" ;;
   esac
   return 0
 }

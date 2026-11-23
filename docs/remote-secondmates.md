@@ -49,6 +49,8 @@ Where the account's systemd user manager serves it, the Linux worker is the `dev
 A worker stops itself once its configured code root stops being a Firstmate checkout, so a worker started from a worktree cannot outlive that worktree, and `bin/fm-remote-job-reap-orphans.sh` clears any worker already left behind that way without ever touching one whose checkout still exists.
 That stop exits with a dedicated status the worker unit names in `RestartPreventExitStatus`, so `Restart=always` does not relaunch a worker whose checkout is gone.
 The unit also requires the checkout's `AGENTS.md` and worker script to exist before every start, so after a reboot it skips starting rather than retrying a checkout that is gone.
+A worker that finds another live worker already owning the account's worker lock exits with a second dedicated status the unit names the same way, so a clash stops instead of repeating every five seconds.
+A code update that changes this checkout's own worker unit republishes it before the next start, which then goes through the unit, while a unit written for another checkout is left alone and that start stays detached.
 The remote account must provide the required toolchain, the selected worker runtime, the selected session backend, and credentials that work on that host.
 The origin URL named for each project must be reachable from the remote account because projects are cloned on that host rather than copied from the primary.
 
@@ -183,6 +185,7 @@ Startup liveness recovery relaunches a dead or missing remote second mate throug
 The reply relay runs that same check mid-session: once its poll has failed with SSH exit 255, as a host reboot or dropped link makes it, the next poll first runs the readiness gate, the endpoint state probe, and the dead-or-missing relaunch, and the poll resumes once the host answers.
 A failed relaunch or readiness gap there is raised as `blocked [key=remote-liveness-<id>]` on the parent status stream, and not raised again while that blocker is still open, so a later outage after it was resolved raises a new one.
 A relaunch whose completion SSH left unknown is not a failure: recovery stays armed and the next pass re-probes the endpoint, which finds it alive if the launch landed.
+While that blocker is still open, a later check from the relay or the session-start sweep that finds the second mate alive or relaunches it appends the matching `resolved` line; otherwise a successful check stays silent.
 [`bin/fm-remote-liveness-lib.sh`](../bin/fm-remote-liveness-lib.sh) owns that decision for both callers, and a remote launch re-checks the endpoint before creating one, so neither path can start a duplicate.
 A Herdr crash that never interrupts SSH is still recovered only at the next session start.
 

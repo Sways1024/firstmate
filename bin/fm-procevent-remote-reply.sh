@@ -264,7 +264,7 @@ recover_after_transport_loss() { # <id>
   window=$(fm_meta_get "$meta" window)
   # The session-start sweep's own scope: a launched remote secondmate record.
   if grep -q '^kind=secondmate$' "$meta" 2>/dev/null && [ -n "$remote_host" ] && [ -n "$window" ]; then
-    fm_remote_secondmate_liveness "$SCRIPT_DIR" "$FM_ROOT/bin" "$id" "$remote_host" >&2 || rc=$?
+    fm_remote_secondmate_liveness "$SCRIPT_DIR" "$FM_ROOT/bin" "$id" "$remote_host" "$STATE/$id.status" >&2 || rc=$?
     [ "$rc" -ne "$SSH_UNAVAILABLE" ] || return 1
     if [ "$FM_REMOTE_LIVENESS_OUTCOME" = failed ]; then
       line="blocked [key=remote-liveness-$id]: remote secondmate $id was not recovered after its host became reachable again ($FM_REMOTE_LIVENESS_MESSAGE)"
@@ -350,13 +350,10 @@ append_status_once() { # <status-file> <line>
 # resolved blocker is raised again by the next failure.
 # Returns 0 appended, 1 still open, 2 the write itself failed.
 append_status_unless_open() { # <status-file> <keyed-line>
-  local key open
+  local key
   key=$(_fm_decision_key "$2") || return 2
   [ ! -L "$1" ] || return 2
-  open=$(status_open_decisions "$1")
-  case "$open" in
-    "$key"$'\t'*|*$'\n'"$key"$'\t'*) return 1 ;;
-  esac
+  ! status_decision_open "$1" "$key" || return 1
   printf '%s\n' "$2" >> "$1" || return 2
 }
 

@@ -619,7 +619,7 @@ secondmate_liveness_one() {  # <meta> <id>
   harness=$(fm_meta_get "$meta" harness)
   remote_host=$(fm_meta_get "$meta" remote_host)
   if [ -n "$remote_host" ]; then
-    fm_remote_secondmate_liveness "$SCRIPT_DIR" "$FM_ROOT/bin" "$id" "$remote_host" || true
+    fm_remote_secondmate_liveness "$SCRIPT_DIR" "$FM_ROOT/bin" "$id" "$remote_host" "$STATE/$id.status" || true
     case "$FM_REMOTE_LIVENESS_OUTCOME" in
       alive)
         [ "${FM_BOOTSTRAP_VERBOSE_FACTS:-0}" != 1 ] || echo "BOOTSTRAP_INFO: $FM_REMOTE_LIVENESS_MESSAGE"

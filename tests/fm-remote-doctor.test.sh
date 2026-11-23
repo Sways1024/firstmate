@@ -683,6 +683,69 @@ kill -KILL "$DOCTOR_WORKER_PID" 2>/dev/null || true
 DOCTOR_WORKER_PID=
 pass "with an installed unit the linux worker is started through that unit"
 
+# --- a code update that changes this root's worker unit republishes it -------
+# The unit template and the worker identity share one library, so an update
+# that changes the template must not leave the unit relaunching every
+# RestartSec against a detached worker: the entrypoint's start republishes this
+# root's own stale unit and starts through it, and leaves another checkout's
+# unit alone.
+
+# lib_ensure_worker: the entrypoint's worker start for this case's account under
+# its stand-in user manager; sets LIB_ENSURE_OUT and LIB_ENSURE_RC.
+lib_ensure_worker() {
+  set +e
+  # shellcheck disable=SC2016 # The child shell expands its own arguments and error text.
+  LIB_ENSURE_OUT=$(env -i PATH="$CASE_HOME/.local/bin:$CASE_BIN:$BASE_PATH" HOME="$CASE_HOME" \
+    FM_FAKE_STATE="$CASE_STATE" FM_FAKE_SYSTEMD_HOME="$CASE_HOME" FM_FAKE_HERDR_RUNNING="$CASE_HERDR_RUNNING" \
+    FM_REMOTE_JOB_PLATFORM_OVERRIDE=Linux \
+    bash -c '. "$1/bin/fm-remote-job-lib.sh" && fm_remote_job_ensure_worker "$1" "$2" ||
+      { printf "%s\n" "$FM_REMOTE_JOB_ERROR"; exit 1; }' _ "$ROOT" "$CASE_HOME" 2>&1)
+  LIB_ENSURE_RC=$?
+  set -e
+}
+# render_worker_unit <remote-root>: the worker unit contract for this account.
+render_worker_unit() {
+  bash -c '. "$1/bin/fm-remote-job-lib.sh" && fm_remote_job_render_systemd_unit "$2" "$3" "$4"' _ \
+    "$ROOT" "$1" "$CASE_HOME" "$(id -u)"
+}
+stop_case_worker() {
+  local pid
+  pid=$(cat "$CASE_HOME/.firstmate/remote-job/worker.pid" 2>/dev/null || true)
+  [ -n "$pid" ] || return 0
+  kill -TERM "$pid" 2>/dev/null || true
+  for _ in $(seq 1 100); do
+    kill -0 "$pid" 2>/dev/null || [ -e "$CASE_HOME/.firstmate/remote-job/worker.lock" ] || break
+    sleep 0.05
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+}
+
+JOB_UNIT="$CASE_HOME/.config/systemd/user/dev.firstmate.remote-job.service"
+grep -v '^RestartPreventExitStatus=' "$JOB_UNIT" > "$CASE_STATE/older-unit"
+cp "$CASE_STATE/older-unit" "$JOB_UNIT"
+: > "$CASE_STATE/systemctl.log"
+lib_ensure_worker
+expect_code 0 "$LIB_ENSURE_RC" "the worker did not start from this root's stale unit"$'\n'"$LIB_ENSURE_OUT"
+render_worker_unit "$ROOT" > "$CASE_STATE/current-unit"
+cmp -s "$CASE_STATE/current-unit" "$JOB_UNIT" || fail "this root's stale worker unit was not republished before the start"
+[ -n "$(fm_test_unit_value "$JOB_UNIT" Service.RestartPreventExitStatus)" ] ||
+  fail "the republished worker unit still lets Restart=always relaunch a worker that must stop"
+assert_line '--user daemon-reload' "$CASE_STATE/systemctl.log" "the republished worker unit was not reloaded"
+assert_line '--user restart dev.firstmate.remote-job.service' "$CASE_STATE/systemctl.log" \
+  "the worker did not start through its republished unit"
+stop_case_worker
+
+render_worker_unit "$CASE_DIR/other-checkout" > "$JOB_UNIT"
+cp "$JOB_UNIT" "$CASE_STATE/other-unit"
+: > "$CASE_STATE/systemctl.log"
+lib_ensure_worker
+expect_code 0 "$LIB_ENSURE_RC" "the worker did not start beside another checkout's unit"$'\n'"$LIB_ENSURE_OUT"
+cmp -s "$CASE_STATE/other-unit" "$JOB_UNIT" || fail "the start rewrote a worker unit that belongs to another checkout"
+assert_no_regex '^--user \(daemon-reload\|enable\|restart\|start\)' "$CASE_STATE/systemctl.log" \
+  "the start reloaded or restarted a worker unit that belongs to another checkout"
+stop_case_worker
+pass "a stale worker unit for this root is republished and started through, and another checkout's unit is left alone"
+
 # --- a user manager without lingering is a human gap ------------------------
 
 new_case Linux with-herdr no-gui

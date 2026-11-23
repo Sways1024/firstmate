@@ -39,10 +39,12 @@
 # doctor installs the dev.firstmate.remote-job.service user unit rendered here
 # (Restart=always, the launchd KeepAlive counterpart, so the worker returns
 # after a reboot), and every later Linux start or restart goes through that
-# unit; bin/fm-remote-systemd-lib.sh owns reaching the user manager. Without an
-# installed unit Linux keeps starting the worker as a detached process. The
-# launch-agent and unit renderers and repair helpers here are shared by the
-# entrypoint and remote doctor so their ownership cannot drift.
+# unit; bin/fm-remote-systemd-lib.sh owns reaching the user manager. A code
+# update that changes this root's own unit republishes it before that start.
+# Without an installed unit for this root Linux keeps starting the worker as a
+# detached process. The launch-agent and unit renderers and repair helpers here
+# are shared by the entrypoint and remote doctor so their ownership cannot
+# drift.
 #
 # The Linux start path puts the worker tree in its own process group, so
 # stopping a worker signals its restart supervisor, its serving child, and any
@@ -63,10 +65,12 @@ FM_REMOTE_JOB_LIB_DIR=${BASH_SOURCE[0]%/*}
 
 FM_REMOTE_JOB_LABEL=dev.firstmate.remote-job
 FM_REMOTE_JOB_SYSTEMD_UNIT=$FM_REMOTE_JOB_LABEL.service
-# The worker's exit status once its configured code root is abandoned. The
-# worker unit names it in RestartPreventExitStatus, so Restart=always never
-# relaunches a worker whose checkout is gone.
+# The worker's exit status once its configured code root is abandoned, and when
+# another live worker already owns the account's worker lock. The worker unit
+# names both in RestartPreventExitStatus, so Restart=always never relaunches a
+# worker whose checkout is gone or that would only clash with the owner again.
 FM_REMOTE_JOB_ABANDONED_EXIT=78
+FM_REMOTE_JOB_LOCK_HELD_EXIT=79
 FM_REMOTE_JOB_MAX_BYTES=${FM_REMOTE_JOB_MAX_BYTES:-1048576}
 FM_REMOTE_JOB_QUEUE_TIMEOUT=${FM_REMOTE_JOB_QUEUE_TIMEOUT:-360}
 FM_REMOTE_JOB_TIMEOUT=${FM_REMOTE_JOB_TIMEOUT:-360}
@@ -943,9 +947,12 @@ fm_remote_job_reload_launchagent() { # <account-home> <uid>
 # KillMode=mixed sends the stop signal to the restart supervisor alone, which
 # stops its serving child once; signalling the whole group at once, systemd's
 # default, delivered a second SIGTERM inside the child's shutdown handler and
-# killed it mid-cleanup at every reboot. RestartPreventExitStatus is the one
-# exception to never giving up: a worker whose code root is abandoned exits
-# FM_REMOTE_JOB_ABANDONED_EXIT, so the unit cannot outlive its checkout. The
+# killed it mid-cleanup at every reboot. RestartPreventExitStatus holds the
+# only exceptions to never giving up: a worker whose code root is abandoned
+# exits FM_REMOTE_JOB_ABANDONED_EXIT, so the unit cannot outlive its checkout,
+# and one that finds another live worker owning the lock exits
+# FM_REMOTE_JOB_LOCK_HELD_EXIT, so the unit stops instead of clashing with that
+# owner every RestartSec. The
 # ConditionPathExists pair mirrors fm_remote_job_root_is_live for a start after
 # the checkout is already gone, such as the next boot: a failed condition skips
 # the start instead of entering Restart=always.
@@ -971,7 +978,7 @@ Environment="LANG=C.UTF-8"
 Environment="XDG_RUNTIME_DIR=/run/user/$uid"
 Restart=always
 RestartSec=5
-RestartPreventExitStatus=$FM_REMOTE_JOB_ABANDONED_EXIT
+RestartPreventExitStatus=$FM_REMOTE_JOB_ABANDONED_EXIT $FM_REMOTE_JOB_LOCK_HELD_EXIT
 KillMode=mixed
 
 [Install]
@@ -1024,10 +1031,37 @@ fm_remote_job_start_systemd_worker() { # <remote-root> <account-home>
   FM_REMOTE_JOB_REPAIRED=1
 }
 
+# True when the installed worker unit runs this code root's own worker, whether
+# or not it still matches the rendered contract.
+fm_remote_job_systemd_unit_runs_root() { # <remote-root> <account-home>
+  local path
+  path=$(fm_remote_systemd_unit_path "$2" "$FM_REMOTE_JOB_SYSTEMD_UNIT")
+  [ -f "$path" ] && [ ! -L "$path" ] || return 1
+  [ "$(sed -n 's/^ExecStart=//p' "$path")" = "$1/bin/fm-remote-job-worker.sh" ]
+}
+
+# Republishes this code root's own worker unit after a code update changed its
+# rendered contract, the way the macOS path rewrites a mismatched LaunchAgent,
+# so the start that follows goes through the unit instead of leaving it to
+# clash with a detached worker. A unit for another checkout is never touched.
+fm_remote_job_refresh_systemd_unit() { # <remote-root> <account-home>
+  local root=$1 account_home=$2 rendered rc=1
+  fm_remote_job_systemd_unit_runs_root "$root" "$account_home" || return 1
+  fm_remote_systemd_available "$account_home" || return 1
+  rendered=$(mktemp "${TMPDIR:-/tmp}/fm-remote-job-unit.XXXXXX") || return 1
+  if fm_remote_job_render_systemd_unit_to "$root" "$account_home" "$rendered" &&
+    fm_remote_systemd_publish "$account_home" "$FM_REMOTE_JOB_SYSTEMD_UNIT" "$rendered"; then
+    rc=0
+  fi
+  rm -f -- "$rendered"
+  return "$rc"
+}
+
 # The one Linux start entry: through the installed unit when it owns this
-# worker, otherwise as a detached process.
+# worker, republishing this root's own stale unit first, otherwise as a
+# detached process.
 fm_remote_job_start_linux() { # <remote-root> <account-home>
-  if fm_remote_job_systemd_worker_managed "$1" "$2"; then
+  if fm_remote_job_systemd_worker_managed "$1" "$2" || fm_remote_job_refresh_systemd_unit "$1" "$2"; then
     fm_remote_job_start_systemd_worker "$1" "$2"
   else
     fm_remote_job_start_linux_worker "$1" "$2"

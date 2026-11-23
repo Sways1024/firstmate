@@ -568,4 +568,32 @@ assert_grep 'remote readiness failed on remote-mac: check linger=human:' "$LHOME
 assert_absent "$MARKER" "an escalated recovery kept retrying on every poll"
 pass "a failed relaunch or readiness gap during recovery is escalated once instead of retried every poll"
 
+# liveness_blocker_open: the shared decision fold's own reading of the blocker.
+liveness_blocker_open() {
+  bash -c '. "$1" && status_decision_open "$2" "$3"' _ "$ROOT/bin/fm-classify-lib.sh" \
+    "$LHOME/state/ios.status" remote-liveness-ios
+}
+resolved_count() { grep -c '^resolved \[key=remote-liveness-ios\]' "$LHOME/state/ios.status" || true; }
+liveness_blocker_open || fail "the readiness-gap blocker this case starts from is not open"
+printf 'dead\n' > "$LIVE/state"
+touch "$MARKER"
+live_source
+[ "$(spawn_count)" -eq 1 ] || fail "a dead endpoint behind an open blocker was not relaunched"
+! liveness_blocker_open || fail "a relaunch that recovered the second mate left its liveness blocker open"
+[ "$(resolved_count)" -eq 1 ] || fail "the recovering relaunch did not resolve its blocker exactly once"
+touch "$LIVE/spawn-fail" "$MARKER"
+live_source
+rm -f "$LIVE/spawn-fail"
+liveness_blocker_open || fail "a later failed relaunch did not raise a new blocker"
+printf 'alive\n' > "$LIVE/state"
+touch "$MARKER"
+live_source
+[ "$(spawn_count)" -eq 0 ] || fail "recovery relaunched an alive endpoint"
+! liveness_blocker_open || fail "finding the second mate alive left its liveness blocker open"
+[ "$(resolved_count)" -eq 2 ] || fail "finding the second mate alive did not resolve its blocker exactly once"
+touch "$MARKER"
+live_source
+[ "$(resolved_count)" -eq 2 ] || fail "a successful check with no open blocker wrote a resolution"
+pass "a later check that relaunches the second mate or finds it alive resolves an open liveness blocker, and is silent otherwise"
+
 echo "ALL TESTS PASSED"
