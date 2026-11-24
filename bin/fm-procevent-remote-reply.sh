@@ -334,8 +334,17 @@ recover_after_transport_loss() { # <id>
 }
 
 liveness_blocker_open() { # <id>
-  grep -qF -- "[key=remote-liveness-$1]" "$STATE/$1.status" 2>/dev/null \
-    && status_decision_open "$STATE/$1.status" "remote-liveness-$1"
+  local status="$STATE/$1.status" key="remote-liveness-$1" tmp rc=1
+  [ -f "$status" ] && [ ! -L "$status" ] || return 1
+  tmp=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-liveness-fold.XXXXXX") || {
+    status_decision_open "$status" "$key"
+    return
+  }
+  if grep -aF -- "[key=$key]" "$status" > "$tmp" 2>/dev/null; then
+    status_decision_open "$tmp" "$key" && rc=0
+  fi
+  rm -f -- "$tmp"
+  return "$rc"
 }
 
 # The healthy-link trigger. It never fails the source: an unreadable or

@@ -795,6 +795,36 @@ LIVE_INTERVAL=0 live_source
 [ "$(died_again_count)" -eq 0 ] || fail "a hand-resolved blocker raised while a relaunch was counted was followed by a died-again blocker"
 pass "any open liveness blocker clears the relaunch counter, so its hand resolution allows one more relaunch"
 
+: > "$LHOME/state/ios.status"
+printf 'alive\n' > "$LIVE/state"
+LIVE_INTERVAL=0 live_source
+{
+  printf 'blocked [key=remote-liveness-ios]: an earlier outage\n'
+  printf 'working: progress that mentions [key=remote-liveness-ios] in passing\n'
+  printf 'resolved [key=remote-liveness-ios]: fixed by hand\n'
+  printf 'needs-decision [key=other-question]: an unrelated open decision\n'
+  printf 'working: unrelated progress\n'
+} >> "$LHOME/state/ios.status"
+LIVE_INTERVAL=0 live_source
+assert_no_grep 'fm-remote-doctor.sh' "$LIVE/calls.log" "an alive probe over a resolved earlier blocker ran the full check"
+printf 'dead\n' > "$LIVE/state"
+LIVE_INTERVAL=0 live_source
+[ "$(spawn_count)" -eq 1 ] || fail "a dead probe over a resolved earlier blocker was not relaunched"
+{
+  printf 'blocked [key=remote-liveness-ios]: raised again\n'
+  printf 'working: later unrelated progress\n'
+  printf 'resolved [key=other-question]: answered\n'
+} >> "$LHOME/state/ios.status"
+liveness_blocker_open || fail "the shared fold does not read the reopened blocker as open"
+LIVE_INTERVAL=0 live_source
+[ "$(spawn_count)" -eq 0 ] || fail "a dead probe relaunched behind a blocker reopened after resolved history"
+printf 'alive\n' > "$LIVE/state"
+LIVE_INTERVAL=0 live_source
+assert_grep 'on ios fm-remote-doctor.sh' "$LIVE/calls.log" "an alive probe behind a reopened blocker skipped the full check"
+! liveness_blocker_open || fail "an alive probe left a blocker reopened after resolved history open"
+[ "$(resolved_count)" -eq 2 ] || fail "an alive probe did not resolve a blocker reopened after resolved history exactly once"
+pass "a resolved earlier blocker and unrelated decisions in the history do not change the liveness outcome"
+
 mv "$LHOME/state/ios.meta" "$LHOME/state/ios.meta.saved"
 printf 'kind=secondmate\nremote_host=remote-mac\nharness=claude\n' > "$LHOME/state/ios.meta"
 printf 'dead\n' > "$LIVE/state"
