@@ -36,6 +36,10 @@
 # resolves the expectation. Set FM_PENDING_REPLY_EXISTING_CORR=<id> when
 # re-sending a recovery request for an already-open expectation so a second
 # record is not created. Direct unmarked captain input never creates one.
+# A remote text send whose completion is unknown (transport exit 255) exits 255,
+# never 1, so a caller can record "unknown" rather than "failed"; every other
+# failure exits 1. A remote failure's final error line carries the remote side's
+# last error line.
 #
 # Decision closure (answerer-closes): pass --resolve-key <key> (repeatable,
 # before the message) when this send answers an open keyed needs-decision: or
@@ -486,12 +490,21 @@ else
   # Type once, submit, verify. Only exact empty confirms delivery; every other
   # verdict preserves the loud refusal boundary.
   send_rc=0
+  remote_reason=
   if [ "$TARGET_BACKEND" = remote ]; then
-    if "$SCRIPT_DIR/fm-on.sh" "$TARGET_REMOTE_ID" fm-remote-secondmate-control.sh send "$TARGET_REMOTE_ID" "$MESSAGE" < /dev/null >/dev/null; then
+    # The remote side's own error is relayed unchanged, and its last line is
+    # carried into this script's final error line so a caller that keeps only
+    # that line still learns why the remote delivery failed.
+    if remote_err=$("$SCRIPT_DIR/fm-on.sh" "$TARGET_REMOTE_ID" fm-remote-secondmate-control.sh send "$TARGET_REMOTE_ID" "$MESSAGE" < /dev/null 2>&1 >/dev/null); then
       verdict=empty
     else
       send_rc=$?
       verdict=send-failed
+    fi
+    if [ -n "$remote_err" ]; then
+      printf '%s\n' "$remote_err" >&2
+      remote_reason=$(printf '%s\n' "$remote_err" | awk 'NF { last = $0 } END { print last }')
+      remote_reason=${remote_reason#error: }
     fi
   elif verdict=$(fm_backend_send_text_submit "$TARGET_BACKEND" "$T" "$MESSAGE" "$retries" "$sleep_s" "$settle" "$EXPECTED_LABEL"); then
     :
@@ -501,13 +514,13 @@ else
   if [ "$send_rc" -ne 0 ]; then
     if [ "$TARGET_BACKEND" = remote ] && [ "$send_rc" -eq 255 ] && [ -n "$PENDING_REPLY_CORR" ]; then
       fm_pending_reply_mark_delivery_unknown "$STATE" "$PENDING_REPLY_CORR" || true
-      echo "error: text delivery to remote secondmate $TARGET_REMOTE_ID is unknown; do not resend - same-host reconciliation is required" >&2
-      exit 1
+      echo "error: text delivery to remote secondmate $TARGET_REMOTE_ID is unknown${remote_reason:+ ($remote_reason)}; do not resend - same-host reconciliation is required" >&2
+      exit 255
     fi
     if [ "$PENDING_REPLY_CREATED" = 1 ] && [ -n "$PENDING_REPLY_CORR" ]; then
       fm_pending_reply_discard_undelivered "$STATE" "$PENDING_REPLY_CORR" || true
     fi
-    echo "error: text not sent to $T ($TARGET_BACKEND send failed; tried $RESOLUTION_TRIED)" >&2
+    echo "error: text not sent to $T ($TARGET_BACKEND send failed${remote_reason:+: $remote_reason}; tried $RESOLUTION_TRIED)" >&2
     exit 1
   fi
   case "$verdict" in

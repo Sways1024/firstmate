@@ -722,6 +722,11 @@ publish_healthy_watcher_identity "$PARENT/state" "$PARENT" "$ROOT/bin/fm-watch.s
 # without the rendered-output fallback a tmux endpoint needs.
 [ "$(remote_env "$ROOT/bin/fm-on.sh" ios fm-remote-secondmate-control.sh observe ios)" = idle ] \
   || fail "remote endpoint delivery observation did not execute on its own host"
+# A quiet mate that still supervises its own worker is on the request, not done.
+: > "$REMOTE_HOME/state/delegated-scout.meta"
+[ "$(remote_env "$ROOT/bin/fm-on.sh" ios fm-remote-secondmate-control.sh observe ios)" = supervising ] \
+  || fail "remote observation did not report the home's delegated work"
+rm -f "$REMOTE_HOME/state/delegated-scout.meta"
 pass "remote spawn launches on the remote-local backend and records a host-qualified route"
 
 remote_route_meta="$REMOTE_HOME/state/parent-route/ios.meta"
@@ -862,7 +867,7 @@ FM_FAKE_SSH_MODE=ambiguous remote_env "$ROOT/bin/fm-send.sh" fm-ios \
   'report the build result' > "$TMP_ROOT/send.out" 2> "$TMP_ROOT/send.err"
 send_rc=$?
 set -e
-[ "$send_rc" -ne 0 ] || fail "ambiguous remote send claimed definite delivery"
+[ "$send_rc" -eq 255 ] || fail "ambiguous remote send did not exit 255 (delivery unknown), got $send_rc"
 assert_grep 'do not resend' "$TMP_ROOT/send.err" "ambiguous remote send did not require same-host reconciliation"
 ssh_after_send=$(cat "$SSH_COUNT")
 [ "$ssh_after_send" -eq $((ssh_before_send + 1)) ] || fail "ambiguous remote send was retried"
@@ -882,6 +887,36 @@ phase=$(grep '^phase=' "$PARENT/state/pending-replies/$CORR" | cut -d= -f2-)
 [ "$phase" = resolved ] || fail "correlated remote reply did not resolve the parent expectation"
 pass "marked send and routed reply complete through the existing parent correlation owner"
 rm -f "$PARENT/state/.wake-queue"
+
+# The one recovery nudge travels the same remote route. An ambiguous delivery is
+# recorded unknown, a definite remote failure is recorded failed, and each keeps
+# the reason the remote side gave.
+recovery_probe() {  # <ssh-mode> -> pending record path
+  local probe_corr
+  # shellcheck disable=SC2016  # the -c script expands its own positional arguments
+  probe_corr=$(FM_PENDING_REPLY_GRACE_SECS=0 FM_PENDING_REPLY_NOW=1000 /bin/bash -c \
+    '. "$1/bin/fm-pending-reply-lib.sh"; c=$(fm_pending_reply_create "$2" "$2/state" ios "recovery probe") \
+      && fm_pending_reply_mark_delivered "$2/state" "$c" && fm_pending_reply_mark_turn_completed "$2/state" "$c" request \
+      && printf %s "$c"' _ "$ROOT" "$PARENT") || fail "recovery probe expectation was not created"
+  # shellcheck disable=SC2016  # the -c script expands its own positional arguments
+  FM_FAKE_SSH_MODE=$1 FM_PENDING_REPLY_NOW=1000 remote_env /bin/bash -c \
+    '. "$1/bin/fm-pending-reply-lib.sh"; fm_pending_reply_send_recovery "$2/state" "$3"' \
+    _ "$ROOT" "$PARENT" "$probe_corr" >/dev/null 2>&1 && fail "a refused remote recovery reported success"
+  printf '%s' "$PARENT/state/pending-replies/$probe_corr"
+}
+probe=$(recovery_probe ambiguous)
+assert_grep 'phase=recovery_unknown' "$probe" "ambiguous remote recovery delivery was not recorded unknown"
+assert_grep 'recovery_delivery_outcome=unknown' "$probe" "ambiguous remote recovery outcome was not unknown"
+assert_grep 'recovery_delivery_error=error: text delivery to remote secondmate ios is unknown' "$probe" "ambiguous remote recovery kept no delivery error"
+rm -f "$probe"
+touch "$TMP_ROOT/herdr-send-fail"
+probe=$(recovery_probe normal)
+rm -f "$TMP_ROOT/herdr-send-fail"
+assert_grep 'phase=recovery_failed' "$probe" "failed remote recovery delivery was not recorded failed"
+assert_grep 'remote send failed: text not sent to fm-remote:' "$probe" \
+  "failed remote recovery did not keep the remote side's reason"
+rm -f "$probe"
+pass "remote recovery delivery records unknown versus failed with the remote reason"
 
 printf '{"revision":2}\n' > "$PARENT/config/crew-dispatch.json"
 printf 'grok\n' > "$PARENT/config/crew-harness"

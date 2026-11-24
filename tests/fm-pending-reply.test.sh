@@ -805,6 +805,8 @@ test_unknown_backend_state_uses_capture_fallback() {
       state="$home/state"
       sm_home="$home/sm"
       mkdir -p "$sm_home/state"
+      # This fixture override is intentionally scoped to the isolated subshell.
+      # shellcheck disable=SC2030,SC2031
       export FM_PENDING_REPLY_GRACE_SECS=10
       # These fixture overrides are intentionally scoped to the isolated subshell.
       # shellcheck disable=SC2030,SC2031
@@ -830,13 +832,21 @@ test_unknown_backend_state_uses_capture_fallback() {
       # shellcheck disable=SC2030,SC2031
       export FM_PENDING_REPLY_NOW=10010
       fm_pending_reply_tick "$state"
+      [ "$(phase_of "$state" "$corr")" = awaiting_report ] \
+        || fail "$backend fallback idle must wait a full grace after the turn end"
+      export FM_PENDING_REPLY_NOW=10020
+      fm_pending_reply_tick "$state"
       [ "$(phase_of "$state" "$corr")" = recovery_sent ] \
         || fail "$backend fallback idle should trigger recovery after grace"
-      export FM_PENDING_REPLY_NOW=10011
+      export FM_PENDING_REPLY_NOW=10021
       export FM_PENDING_TEST_CAPTURE='Working...'
       fm_pending_reply_tick "$state"
-      export FM_PENDING_REPLY_NOW=10012
+      export FM_PENDING_REPLY_NOW=10022
       export FM_PENDING_TEST_CAPTURE='idle footer'
+      fm_pending_reply_tick "$state"
+      [ "$(phase_of "$state" "$corr")" = recovery_sent ] \
+        || fail "$backend recovery turn end must also wait a full grace"
+      export FM_PENDING_REPLY_NOW=10032
       fm_pending_reply_tick "$state"
       [ "$(phase_of "$state" "$corr")" = escalated ] \
         || fail "$backend capture busy-to-idle should complete recovery turn"
@@ -1039,6 +1049,258 @@ test_failed_send_discards_undelivered_expectation() {
   pass "failed transport discards undelivered expectation only"
 }
 
+# The T4 shape: a correlated start or progress line arrived and retired the
+# expectation before the delegated work produced its answer.
+test_correlated_progress_line_does_not_resolve() {
+  local home state corr status
+  home=$(setup_parent progress-line)
+  state="$home/state"
+  status="$state/hibit.status"
+  export FM_PENDING_REPLY_NOW=11000
+  corr=$(fm_pending_reply_create "$home" "$state" hibit "delegated check run")
+  fm_pending_reply_mark_delivered "$state" "$corr"
+  {
+    printf 'working [key=t4-checkrun]: corr=%s T4 in progress\n' "$corr"
+    printf '  working: corr=%s indented progress\n' "$corr"
+  } >> "$status"
+  if fm_pending_reply_try_resolve "$state" "$corr"; then
+    fail "a correlated progress line must not resolve the expectation"
+  fi
+  [ "$(phase_of "$state" "$corr")" = awaiting_report ] || fail "progress must leave the request open"
+  printf 'done [key=t4-checkrun]: corr=%s T4 complete\n' "$corr" >> "$status"
+  fm_pending_reply_try_resolve "$state" "$corr" || fail "the correlated final answer should resolve"
+  # A declared external wait still settles the request.
+  corr=$(fm_pending_reply_create "$home" "$state" hibit "waits on an external reply")
+  fm_pending_reply_mark_delivered "$state" "$corr"
+  printf 'paused [key=uaepass-reply]: corr=%s waiting for the reply\n' "$corr" >> "$status"
+  fm_pending_reply_try_resolve "$state" "$corr" || fail "a correlated declared wait should still settle"
+  pass "a correlated progress line never retires the expectation; the final answer does"
+}
+
+# The T3 and T4 shapes: the mate spawned a worker and ended its turn while it
+# waits; that is supervision, not a missed report.
+test_delegated_work_suppresses_recovery_until_it_drains() (
+  local home state corr sm_home rec hook_log
+  home=$(setup_parent delegated)
+  state="$home/state"
+  sm_home="$home/sm"
+  hook_log="$home/recovery.log"
+  mkdir -p "$sm_home/state/parent-route"
+  : > "$hook_log"
+  # Fixture overrides are intentionally scoped to this subshell.
+  # shellcheck disable=SC2030,SC2031
+  export FM_PENDING_REPLY_GRACE_SECS=120
+  # shellcheck disable=SC2329
+  recovery_hook() { printf 'sent\n' >> "$hook_log"; }
+  # shellcheck disable=SC2030,SC2031
+  export FM_PENDING_REPLY_SEND_HOOK=recovery_hook
+  # shellcheck disable=SC2329
+  fm_backend_busy_state() { printf '%s' "$FM_TEST_MATE"; }
+  # shellcheck disable=SC2329
+  fm_backend_capture() { fail "native observations should not capture"; }
+  # shellcheck disable=SC2030,SC2031
+  export FM_PENDING_REPLY_NOW=12000
+  corr=$(fm_pending_reply_create "$home" "$state" hibit "spawn one scout and report back")
+  fm_pending_reply_mark_delivered "$state" "$corr"
+  fm_write_secondmate_meta "$state/hibit.meta" "$sm_home" "sess:fm-hibit"
+  rec=$(fm_pending_reply_path "$state" "$corr")
+  # The mate's own endpoint record never counts as delegated work.
+  printf 'kind=secondmate\n' > "$sm_home/state/parent-route/hibit.meta"
+  [ "$(fm_pending_reply_fold_supervising idle "$sm_home")" = idle ] \
+    || fail "a parent-route record alone must not read as delegated work"
+  export FM_TEST_MATE=busy
+  fm_pending_reply_tick "$state"
+  : > "$sm_home/state/scout.meta"
+  export FM_TEST_MATE=idle
+  for FM_PENDING_REPLY_NOW in 12060 12200 12900 14000; do
+    export FM_PENDING_REPLY_NOW
+    fm_pending_reply_tick "$state"
+  done
+  [ "$(phase_of "$state" "$corr")" = awaiting_report ] \
+    || fail "a mate supervising delegated work must not be nudged, got $(phase_of "$state" "$corr")"
+  [ ! -s "$hook_log" ] || fail "no recovery may be sent while delegated work is in flight"
+  [ -z "$(fm_pending_reply_get "$rec" request_turn_completed_epoch)" ] \
+    || fail "delegated work must not count as a completed turn"
+  # The work drains and the mate goes quiet without a report: the original
+  # safety property still applies, one full grace after that quiet begins.
+  rm -f "$sm_home/state/scout.meta"
+  export FM_PENDING_REPLY_NOW=14100
+  fm_pending_reply_tick "$state"
+  export FM_PENDING_REPLY_NOW=14219
+  fm_pending_reply_tick "$state"
+  [ ! -s "$hook_log" ] || fail "recovery must wait a full grace after the quiet period begins"
+  export FM_PENDING_REPLY_NOW=14220
+  fm_pending_reply_tick "$state"
+  [ "$(phase_of "$state" "$corr")" = recovery_sent ] \
+    || fail "a quiet mate with nothing in flight and no report should get its one recovery"
+  [ "$(wc -l < "$hook_log" | tr -d ' ')" = 1 ] || fail "exactly one recovery expected"
+  pass "delegated work suppresses recovery until it drains, then the one recovery still fires"
+)
+
+# The T3 failure: the turn-end was latched, the mate resumed, and the nudge
+# landed on a busy pane, failed delivery, and escalated.
+test_resumed_turn_forgets_earlier_turn_end() (
+  local home state corr rec hook_log
+  home=$(setup_parent resumed)
+  state="$home/state"
+  hook_log="$home/recovery.log"
+  : > "$hook_log"
+  # shellcheck disable=SC2030,SC2031
+  export FM_PENDING_REPLY_GRACE_SECS=120
+  # shellcheck disable=SC2329
+  recovery_hook() { printf 'sent\n' >> "$hook_log"; return 1; }
+  # shellcheck disable=SC2030,SC2031
+  export FM_PENDING_REPLY_SEND_HOOK=recovery_hook
+  # shellcheck disable=SC2030,SC2031
+  export FM_PENDING_REPLY_NOW=13000
+  corr=$(fm_pending_reply_create "$home" "$state" hibit "resumes after a pause")
+  fm_pending_reply_mark_delivered "$state" "$corr"
+  rec=$(fm_pending_reply_path "$state" "$corr")
+  fm_pending_reply_tick_one "$state" "$corr" busy ""
+  export FM_PENDING_REPLY_NOW=13040
+  fm_pending_reply_tick_one "$state" "$corr" idle ""
+  [ "$(fm_pending_reply_get "$rec" request_turn_completed_epoch)" = 13040 ] \
+    || fail "an idle observation should record the turn end"
+  export FM_PENDING_REPLY_NOW=13060
+  fm_pending_reply_tick_one "$state" "$corr" busy ""
+  [ -z "$(fm_pending_reply_get "$rec" request_turn_completed_epoch)" ] \
+    || fail "a resumed turn must forget the earlier turn end"
+  export FM_PENDING_REPLY_NOW=13400
+  fm_pending_reply_tick_one "$state" "$corr" busy ""
+  [ ! -s "$hook_log" ] || fail "no recovery may be sent into a busy mate"
+  [ "$(phase_of "$state" "$corr")" = awaiting_report ] \
+    || fail "a busy mate must not escalate, got $(phase_of "$state" "$corr")"
+  pass "a resumed turn forgets its earlier turn end, so no nudge lands on a busy mate"
+)
+
+# A remote answer crosses the reply relay after the mate goes quiet, and the
+# recovery turn's report does the same before escalation.
+test_recovery_and_escalation_wait_grace_after_turn_end() (
+  local home state corr rec hook_log
+  home=$(setup_parent turn-end-grace)
+  state="$home/state"
+  hook_log="$home/recovery.log"
+  : > "$hook_log"
+  # shellcheck disable=SC2030,SC2031
+  export FM_PENDING_REPLY_GRACE_SECS=120
+  # shellcheck disable=SC2329
+  recovery_hook() { printf 'sent\n' >> "$hook_log"; }
+  # shellcheck disable=SC2030,SC2031
+  export FM_PENDING_REPLY_SEND_HOOK=recovery_hook
+  # shellcheck disable=SC2030,SC2031
+  export FM_PENDING_REPLY_NOW=15000
+  corr=$(fm_pending_reply_create "$home" "$state" hibit "long in-turn work")
+  fm_pending_reply_mark_delivered "$state" "$corr"
+  rec=$(fm_pending_reply_path "$state" "$corr")
+  fm_pending_reply_tick_one "$state" "$corr" busy ""
+  export FM_PENDING_REPLY_NOW=15200
+  fm_pending_reply_tick_one "$state" "$corr" idle ""
+  [ ! -s "$hook_log" ] || fail "recovery must not fire the moment a late turn ends"
+  export FM_PENDING_REPLY_NOW=15320
+  fm_pending_reply_tick_one "$state" "$corr" idle ""
+  [ "$(phase_of "$state" "$corr")" = recovery_sent ] || fail "recovery is due a full grace after the turn end"
+  export FM_PENDING_REPLY_NOW=15330
+  fm_pending_reply_tick_one "$state" "$corr" busy ""
+  export FM_PENDING_REPLY_NOW=15340
+  fm_pending_reply_tick_one "$state" "$corr" idle ""
+  [ "$(phase_of "$state" "$corr")" = recovery_sent ] || fail "escalation must wait a full grace after the recovery turn"
+  export FM_PENDING_REPLY_NOW=15460
+  fm_pending_reply_tick_one "$state" "$corr" idle ""
+  [ "$(phase_of "$state" "$corr")" = escalated ] || fail "a missed recovery turn still escalates once"
+  [ "$(wc -l < "$hook_log" | tr -d ' ')" = 1 ] || fail "exactly one recovery expected"
+  pass "recovery and escalation each wait a full grace after the relevant turn end"
+)
+
+# A failed recovery keeps the last line of its error output, and the
+# escalation names it, without that text ever settling the request itself.
+test_recovery_delivery_error_is_recorded_and_named() (
+  local home state corr rec status line error
+  home=$(setup_parent delivery-error)
+  state="$home/state"
+  status="$state/hibit.status"
+  # Fixture overrides are intentionally scoped to this subshell.
+  # shellcheck disable=SC2030,SC2031
+  export FM_PENDING_REPLY_NOW=16000
+  corr=$(fm_pending_reply_create "$home" "$state" hibit "nudge lands on a busy pane")
+  fm_pending_reply_mark_delivered "$state" "$corr"
+  fm_pending_reply_mark_turn_completed "$state" "$corr" request
+  rec=$(fm_pending_reply_path "$state" "$corr")
+  # shellcheck disable=SC2329
+  refusing_hook() {
+    printf 'warning: an earlier line that is not the reason\n' >&2
+    printf 'error: text not sent to remote:hibit (remote send failed: verdict=pending)\tcorr=%s\n' "$corr" >&2
+    return 1
+  }
+  # shellcheck disable=SC2030,SC2031
+  export FM_PENDING_REPLY_SEND_HOOK=refusing_hook
+  if fm_pending_reply_send_recovery "$state" "$corr" 2>/dev/null; then
+    fail "a refused recovery must report failure"
+  fi
+  [ "$(phase_of "$state" "$corr")" = recovery_failed ] || fail "a definite refusal is a failed delivery"
+  error=$(fm_pending_reply_get "$rec" recovery_delivery_error)
+  [ "$error" = "error: text not sent to remote:hibit (remote send failed: verdict=pending) corr:$corr" ] \
+    || fail "recovery should keep the sanitized last error line, got '$error'"
+  fm_pending_reply_maybe_escalate "$state" "$corr" || fail "a failed recovery should escalate"
+  line=$(grep -F "pending-reply-recovery-delivery-failed:" "$status")
+  case "$line" in
+    *" error=$error") : ;;
+    *) fail "the escalation should name the delivery error, got '$line'" ;;
+  esac
+  case "$line" in
+    *"corr=$corr"*) fail "the escalation must not carry the request's correlation token" ;;
+  esac
+  [ "$(phase_of "$state" "$corr")" = escalated ] || fail "naming the error must not settle the request"
+  printf 'done: corr=%s answered late\n' "$corr" >> "$status"
+  fm_pending_reply_try_resolve "$state" "$corr" || fail "the late correlated answer should resolve"
+  grep -Fq "resolved [key=pending-reply-$corr]: pending-reply-resolved:" "$status" \
+    || fail "the error-bearing escalation should still close"
+  error=$(fm_pending_reply_delivery_error "$(printf 'first\n%0400d\n\n' 0)")
+  [ "${#error}" = 160 ] && [ "${error%...}" != "$error" ] \
+    || fail "a long delivery error should be bounded to 160 characters"
+  pass "a failed recovery records and names its delivery error, and still closes"
+)
+
+# An ambiguous remote delivery (exit 255) may have landed, so it is unknown.
+test_unknown_recovery_delivery_is_recorded_unknown() (
+  local home state corr rec
+  home=$(setup_parent delivery-unknown)
+  state="$home/state"
+  # shellcheck disable=SC2030,SC2031
+  export FM_PENDING_REPLY_NOW=17000
+  # shellcheck disable=SC2329
+  ambiguous_hook() {
+    printf 'error: text delivery to remote secondmate hibit is unknown (Connection closed); do not resend\n' >&2
+    return 255
+  }
+  # shellcheck disable=SC2030,SC2031
+  export FM_PENDING_REPLY_SEND_HOOK=ambiguous_hook
+  corr=$(fm_pending_reply_create "$home" "$state" hibit "transport drops mid-send")
+  fm_pending_reply_mark_delivered "$state" "$corr"
+  fm_pending_reply_mark_turn_completed "$state" "$corr" request
+  rec=$(fm_pending_reply_path "$state" "$corr")
+  if fm_pending_reply_send_recovery "$state" "$corr" 2>/dev/null; then
+    fail "an ambiguous recovery must not report confirmed delivery"
+  fi
+  [ "$(phase_of "$state" "$corr")" = recovery_unknown ] \
+    || fail "exit 255 should record an unknown delivery, got $(phase_of "$state" "$corr")"
+  [ "$(fm_pending_reply_get "$rec" recovery_delivery_outcome)" = unknown ] || fail "outcome should be unknown"
+  [ -z "$(fm_pending_reply_get "$rec" recovery_sent_epoch)" ] || fail "an unknown delivery must not record a sent epoch"
+  fm_pending_reply_tick_one "$state" "$corr" idle "" || fail "tick should escalate the unknown delivery"
+  grep -Fq "pending-reply-recovery-delivery-unknown: task=hibit pending-reply-id=$corr request=transport drops mid-send error=error: text delivery to remote secondmate hibit is unknown (Connection closed); do not resend" \
+    "$state/hibit.status" || fail "the unknown escalation should name the transport error"
+  # A silent refusal still names something actionable.
+  # shellcheck disable=SC2329
+  silent_hook() { return 1; }
+  export FM_PENDING_REPLY_SEND_HOOK=silent_hook
+  corr=$(fm_pending_reply_create "$home" "$state" hibit "silent refusal")
+  fm_pending_reply_mark_delivered "$state" "$corr"
+  fm_pending_reply_mark_turn_completed "$state" "$corr" request
+  fm_pending_reply_send_recovery "$state" "$corr" 2>/dev/null && fail "a silent refusal must report failure"
+  [ "$(fm_pending_reply_get "$(fm_pending_reply_path "$state" "$corr")" recovery_delivery_error)" = "delivery command exited 1" ] \
+    || fail "a silent refusal should record its exit status"
+  pass "an ambiguous recovery delivery is recorded unknown with its transport error"
+)
+
 # --- run --------------------------------------------------------------------
 
 test_normal_correlated_reply_resolves_once
@@ -1069,5 +1331,12 @@ test_tick_skips_terminal_and_reuses_target_observation
 test_correlations_reuse_only_for_matching_open_task
 test_tick_end_to_end_missed_then_escalate
 test_failed_send_discards_undelivered_expectation
+test_correlated_progress_line_does_not_resolve
+# These run in subshells, where fail() exits only the subshell; stop the suite.
+test_delegated_work_suppresses_recovery_until_it_drains || exit 1
+test_resumed_turn_forgets_earlier_turn_end || exit 1
+test_recovery_and_escalation_wait_grace_after_turn_end || exit 1
+test_recovery_delivery_error_is_recorded_and_named || exit 1
+test_unknown_recovery_delivery_is_recorded_unknown || exit 1
 
 printf 'ok - all pending-reply tests passed\n'

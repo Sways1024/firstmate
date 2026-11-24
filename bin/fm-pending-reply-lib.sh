@@ -6,7 +6,8 @@
 # expectation BEFORE delivery, embeds a privacy-safe correlation id in the
 # outbound message, and later resolves that expectation only from a correlated
 # parent status line or status-pointed document - never from transport success,
-# chat content, or unrelated status activity.
+# chat content, unrelated status activity, or a correlated `working` progress
+# line, which reports that the request is under way rather than answering it.
 #
 # Safety property (captain direction 2026-07-22): a secondmate agent may ignore
 # the marker and answer only in its visible conversation. The parent must notice
@@ -16,6 +17,16 @@
 # report. Never loop, never repeatedly inject, never silently expire unresolved
 # records, and never treat wrong-home or structured-home heuristics as
 # acknowledgement.
+#
+# A turn is complete only when the secondmate has gone quiet with nothing in
+# flight: its pane reads idle and its own home holds no live direct-report meta
+# (it is not supervising delegated work), observed as `supervising` otherwise.
+# A later busy or supervising observation forgets an earlier turn end, and both
+# the recovery and the escalation after a recovery turn become due only one
+# grace after the latest turn end, so an answer still crossing the remote reply
+# relay lands first. A secondmate that delegates and waits is therefore never
+# nudged, while one that goes quiet with nothing in flight and no report still
+# gets its one recovery and its one escalation.
 #
 # Record location (parent FM_HOME):
 #   state/pending-replies/<corr_id>
@@ -39,7 +50,11 @@
 #   recovery_sender_pid=
 #   recovery_sender_identity=
 #   recovery_sent_epoch=
-#   recovery_delivery_outcome=
+#   recovery_delivery_outcome=  confirmed | failed | unknown (unknown when the
+#                           delivery may have landed, such as a remote exit 255)
+#   recovery_delivery_error=    last line of a failed or unknown delivery's error
+#                           output, single-line, bounded, correlation tokens
+#                           neutralized; named in that escalation's line
 #   recovery_turn_seen_busy=
 #   recovery_turn_completed_epoch=
 #   escalated_epoch=
@@ -52,7 +67,8 @@
 #   wrong_home_hits=        count of corr sightings under the secondmate home
 #   wrong_home_sightings=   comma-separated identities of counted sightings
 #   wrong_home_scan_signature=
-#   grace_secs=             bounded grace before recovery is eligible
+#   grace_secs=             quiet period after the latest turn end before
+#                           recovery, or escalation after a recovery turn, is due
 #
 # Escalation lifecycle: an escalation is not just a message, it OPENS a durable
 # keyed decision in the parent status log, and bin/fm-classify-lib.sh's fold is
@@ -66,14 +82,18 @@
 # or a remote mate's mirrored line - can take the key over or clear it; see the
 # reserved-key rule in bin/fm-classify-lib.sh.
 #
-# Sourced by bin/fm-send.sh, bin/fm-watch.sh, bin/fm-secondmate-report.sh, and
-# tests. No side effects on source. set -u / set -e safe.
+# Sourced by bin/fm-send.sh, bin/fm-watch.sh, bin/fm-secondmate-report.sh,
+# bin/fm-procevent-remote-reply.sh, bin/fm-remote-secondmate-control.sh (whose
+# remote observe applies the supervising fold on the host), and tests. No side
+# effects on source. set -u / set -e safe.
 #
 # Tunables (env):
-#   FM_PENDING_REPLY_GRACE_SECS   default 120
+#   FM_PENDING_REPLY_GRACE_SECS   default 120; read when a record is created
 #   FM_PENDING_REPLY_DIR_OVERRIDE override the pending-replies directory (tests)
 #   FM_PENDING_REPLY_SEND_HOOK    optional command template for recovery delivery
-#                                 (tests); receives task_id and full message as args
+#                                 (tests); receives task_id and full message as
+#                                 args; exit 255 means delivery unknown, like
+#                                 bin/fm-send.sh
 #   FM_PENDING_REPLY_NOW          optional fixed epoch for deterministic tests
 
 # shellcheck source=bin/fm-marker-lib.sh
@@ -422,9 +442,20 @@ fm_pending_reply_discard_undelivered() {  # <state-dir> <corr_id>
   rm -f "$rec"
 }
 
+# 0 if a status line is a working progress event: evidence the mate is still on
+# a request, never its answer. A declared wait still settles the request, since
+# it hands the request to the parent's own declared-wait supervision.
+fm_pending_reply_line_is_progress() {  # <line>
+  local verb=${1#"${1%%[![:space:]]*}"}
+  verb=${verb%%[[:space:]:[]*}
+  [ "$verb" = working ]
+}
+
 # 0 if a status line is a correlated acknowledgement for <corr_id>.
 # Accepts short status replies and status lines that point at a document.
 # Unrelated verbs without the token never match. Stale/wrong corr never match.
+# A correlated progress line never matches, so a start or progress report cannot
+# retire the expectation before the answer exists.
 # The parent's own pending-reply-missed escalation line must not self-resolve:
 # it names the request with pending-reply-id= rather than corr=.
 fm_pending_reply_line_resolves() {  # <line> <corr_id>
@@ -433,6 +464,7 @@ fm_pending_reply_line_resolves() {  # <line> <corr_id>
   case "$line" in
     *pending-reply-missed*) return 1 ;;
   esac
+  fm_pending_reply_line_is_progress "$line" && return 1
   fm_pending_reply_text_has_corr "$line" "$corr"
 }
 
@@ -585,6 +617,11 @@ fm_pending_reply_observe_busy() {  # <state-dir> <corr_id> <busy_state>
       if [ "$seen" != 1 ]; then
         fm_pending_reply_set "$rec" "$field_seen" 1 || return 1
       fi
+      # A turn that resumes after an observed end has not finished: forget that
+      # end so only the latest quiet period can make recovery or escalation due.
+      if [ -n "$completed" ]; then
+        fm_pending_reply_set "$rec" "$field_completed" "" || return 1
+      fi
       ;;
     idle)
       if [ -z "$completed" ]; then
@@ -661,10 +698,36 @@ fm_pending_reply_backend_observation() {  # <backend> <target> [expected-label] 
   fi
 }
 
+# 0 when <home> is supervising delegated work: a live direct report's meta in its
+# own state dir, the same in-flight rule bin/fm-teardown.sh refuses a secondmate
+# retirement on. A remote home's parent-route record lives in a subdirectory.
+fm_pending_reply_home_supervising() {  # <home>
+  local home=$1 meta
+  [ -n "$home" ] && [ -d "$home/state" ] || return 1
+  for meta in "$home"/state/*.meta; do
+    [ -f "$meta" ] && return 0
+  done
+  return 1
+}
+
+# A mate whose turn ended while it still supervises delegated work is still on
+# the request, so its observation becomes `supervising`, which counts as busy.
+# Runs wherever the home is readable: the tick for a local mate, and the remote
+# observe command for a remote one.
+fm_pending_reply_fold_supervising() {  # <observation> <home>
+  local observation=$1 home=$2
+  if [ "$observation" != busy ] && fm_pending_reply_home_supervising "$home"; then
+    printf 'supervising'
+    return 0
+  fi
+  printf '%s' "$observation"
+}
+
 fm_pending_reply_busy_state_from_observation() {  # <record-path> <observation>
   local rec=$1 observation=$2
   case "$observation" in
     busy|idle|unknown) printf '%s' "$observation" ;;
+    supervising) printf 'busy' ;;
     fallback-idle)
       if fm_pending_reply_fallback_idle_eligible "$rec"; then
         printf 'idle'
@@ -704,19 +767,34 @@ fm_pending_reply_recovery_message() {  # <record-path>
   corr=$(fm_pending_reply_get "$rec" corr_id)
   summary=$(fm_pending_reply_get "$rec" request_summary)
   token=$(fm_pending_reply_corr_token "$corr")
-  msg="REPOST REQUIRED: previous marked request had no correlated parent report. Reply on the parent status channel including ${token}. Original request: ${summary}"
+  msg="REPOST REQUIRED: previous marked request had no correlated parent report. Reply on the parent status channel including ${token}; a working line is not the answer. Original request: ${summary}"
   fm_pending_reply_embed_corr "$msg" "$corr" msg
   printf '%s' "$msg"
+}
+
+# One bounded, single-line delivery error from the last non-empty line of
+# <text>. Correlation tokens are neutralized, so an escalation that names the
+# error can never be mistaken for the request's own correlated report.
+fm_pending_reply_delivery_error() {  # <text>
+  local line
+  line=$(printf '%s\n' "$1" | tr '\r\t' '\n ' | awk 'NF { last = $0 } END { print last }')
+  line=$(printf '%s' "$line" | tr -cd '\40-\176' | sed -E 's/corr=/corr:/g; s/^[[:space:]]+//; s/[[:space:]]+$//')
+  if [ "${#line}" -gt 160 ]; then
+    line="${line:0:157}..."
+  fi
+  printf '%s' "$line"
 }
 
 # Deliver the recovery message once. Caller must hold phase awaiting_report with
 # turn completed and grace elapsed. Uses FM_PENDING_REPLY_SEND_HOOK when set
 # (tests), otherwise invokes fm-send with FM_PENDING_REPLY_EXISTING_CORR so a
-# second expectation is not created.
+# second expectation is not created. Exit 255 from either means the delivery is
+# unknown, and any other failure means it failed; a failed or unknown attempt
+# records the last line of its error output as recovery_delivery_error.
 fm_pending_reply_send_recovery() {  # <state-dir> <corr_id>
   local state=$1 corr=$2
-  local rec phase completed delivered attempted grace now age task_id msg parent_home send_status=0
-  local sender_pid sender_identity
+  local rec phase completed delivered attempted grace now age task_id msg parent_home send_rc=0
+  local sender_pid sender_identity err='' error outcome
   rec=$(fm_pending_reply_path "$state" "$corr")
   [ -f "$rec" ] || return 1
   phase=$(fm_pending_reply_get "$rec" phase)
@@ -733,7 +811,9 @@ fm_pending_reply_send_recovery() {  # <state-dir> <corr_id>
   grace=$(fm_pending_reply_get "$rec" grace_secs)
   case "$grace" in ''|*[!0-9]*) grace=$(fm_pending_reply_grace_secs) ;; esac
   now=$(fm_pending_reply_now)
-  age=$((now - delivered))
+  # Grace runs from the latest observed turn end, so a report still crossing a
+  # relay when the mate goes quiet lands before recovery becomes due.
+  age=$((now - completed))
   [ "$age" -ge "$grace" ] || return 1
   task_id=$(fm_pending_reply_get "$rec" task_id)
   parent_home=$(fm_pending_reply_get "$rec" parent_home)
@@ -744,25 +824,30 @@ fm_pending_reply_send_recovery() {  # <state-dir> <corr_id>
   fm_pending_reply_set "$rec" recovery_sender_identity "$sender_identity" || return 1
   fm_pending_reply_set "$rec" recovery_attempted_epoch "$now" || return 1
   fm_pending_reply_set "$rec" phase recovery_sending || return 1
+  # Error output is captured for the record and then relayed; stdout passes through.
   if [ -n "${FM_PENDING_REPLY_SEND_HOOK:-}" ]; then
     # Hook receives: task_id message
     # shellcheck disable=SC2086
-    if ! eval "$FM_PENDING_REPLY_SEND_HOOK" "$(printf '%q' "$task_id")" "$(printf '%q' "$msg")"; then
-      send_status=1
-    fi
+    { err=$(eval "$FM_PENDING_REPLY_SEND_HOOK" "$(printf '%q' "$task_id")" "$(printf '%q' "$msg")" 2>&1 >&3); } 3>&1 \
+      || send_rc=$?
+  elif [ -z "$parent_home" ] || [ ! -d "$parent_home" ]; then
+    err="parent home is unavailable: ${parent_home:-unset}"
+    send_rc=1
   else
-    if [ -z "$parent_home" ] || [ ! -d "$parent_home" ]; then
-      send_status=1
-    elif ! env FM_HOME="$parent_home" FM_PENDING_REPLY_EXISTING_CORR="$corr" \
-      "$_FM_PENDING_REPLY_LIB_DIR/fm-send.sh" "$task_id" "$msg"; then
-      send_status=1
-    fi
+    { err=$(env FM_HOME="$parent_home" FM_PENDING_REPLY_EXISTING_CORR="$corr" \
+      "$_FM_PENDING_REPLY_LIB_DIR/fm-send.sh" "$task_id" "$msg" 2>&1 >&3); } 3>&1 || send_rc=$?
   fi
-  if [ "$send_status" = 0 ]; then
+  [ -z "$err" ] || printf '%s\n' "$err" >&2
+  if [ "$send_rc" = 0 ]; then
     fm_pending_reply_finish_recovery "$state" "$corr" confirmed
     return $?
   fi
-  fm_pending_reply_finish_recovery "$state" "$corr" failed || return 1
+  error=$(fm_pending_reply_delivery_error "$err")
+  [ -n "$error" ] || error="delivery command exited $send_rc"
+  fm_pending_reply_set "$rec" recovery_delivery_error "$error" || return 1
+  outcome=failed
+  [ "$send_rc" != 255 ] || outcome=unknown
+  fm_pending_reply_finish_recovery "$state" "$corr" "$outcome" || return 1
   return 1
 }
 
@@ -783,7 +868,7 @@ fm_pending_reply_sender_alive() {  # <record-path>
   [ "$actual" = "$expected" ]
 }
 
-fm_pending_reply_finish_recovery() {  # <state-dir> <corr_id> <confirmed|failed>
+fm_pending_reply_finish_recovery() {  # <state-dir> <corr_id> <confirmed|failed|unknown>
   local state=$1 corr=$2 outcome=$3 rec phase now sent
   rec=$(fm_pending_reply_path "$state" "$corr")
   [ -f "$rec" ] || return 1
@@ -799,6 +884,8 @@ fm_pending_reply_finish_recovery() {  # <state-dir> <corr_id> <confirmed|failed>
     fm_pending_reply_set "$rec" recovery_turn_seen_busy 0 || return 1
     fm_pending_reply_set "$rec" recovery_turn_completed_epoch "" || return 1
     fm_pending_reply_set "$rec" phase recovery_sent || return 1
+  elif [ "$outcome" = unknown ]; then
+    fm_pending_reply_set "$rec" phase recovery_unknown || return 1
   else
     [ "$outcome" = failed ] || return 1
     fm_pending_reply_set "$rec" phase recovery_failed || return 1
@@ -835,8 +922,10 @@ fm_pending_reply_escalation_key() {  # <corr_id>
   printf 'pending-reply-%s' "$1"
 }
 
+# The payload is rebuilt from the record alone, so the close path can match the
+# exact line this library published, including the recorded delivery error.
 fm_pending_reply_escalation_payload() {  # <record-path> <kind>
-  local rec=$1 kind=$2 task_id corr summary outcome token
+  local rec=$1 kind=$2 task_id corr summary outcome token error=''
   task_id=$(fm_pending_reply_get "$rec" task_id)
   corr=$(fm_pending_reply_get "$rec" corr_id)
   summary=$(fm_pending_reply_get "$rec" request_summary)
@@ -852,10 +941,12 @@ fm_pending_reply_escalation_payload() {  # <record-path> <kind>
       outcome=$(fm_pending_reply_get "$rec" recovery_delivery_outcome)
       case "$outcome" in failed|unknown) ;; *) return 1 ;; esac
       token="pending-reply-recovery-delivery-$outcome"
+      error=$(fm_pending_reply_get "$rec" recovery_delivery_error)
       ;;
     *) return 1 ;;
   esac
   printf '%s: task=%s pending-reply-id=%s request=%s' "$token" "$task_id" "$corr" "$summary"
+  [ -z "$error" ] || printf ' error=%s' "$error"
 }
 
 # The escalation line this library published for <corr_id>, or empty. A legacy
@@ -963,7 +1054,7 @@ fm_pending_reply_maybe_escalate() {  # <state-dir> <corr_id>
 
 _fm_pending_reply_maybe_escalate_locked() {  # <state-dir> <corr_id>
   local state=$1 corr=$2
-  local rec phase completed now payload parent_status line kind
+  local rec phase completed grace now payload parent_status line kind
   rec=$(fm_pending_reply_path "$state" "$corr")
   [ -f "$rec" ] || return 1
   phase=$(fm_pending_reply_get "$rec" phase)
@@ -976,6 +1067,10 @@ _fm_pending_reply_maybe_escalate_locked() {  # <state-dir> <corr_id>
     recovery_sent)
       completed=$(fm_pending_reply_get "$rec" recovery_turn_completed_epoch)
       [ -n "$completed" ] || return 1
+      grace=$(fm_pending_reply_get "$rec" grace_secs)
+      case "$grace" in ''|*[!0-9]*) grace=$(fm_pending_reply_grace_secs) ;; esac
+      now=$(fm_pending_reply_now)
+      [ $((now - completed)) -ge "$grace" ] || return 1
       ;;
     delivery_unknown|recovery_failed|recovery_unknown) ;;
     *) return 1 ;;
@@ -1213,9 +1308,10 @@ fm_pending_reply_tick() {  # <state-dir>
           if [ -n "$remote_host" ]; then
             observation=$("$_FM_PENDING_REPLY_LIB_DIR/fm-on.sh" "$task_id" \
               fm-remote-secondmate-control.sh observe "$task_id" < /dev/null 2>/dev/null || printf 'unknown')
-            case "$observation" in busy|idle|fallback-idle|unknown) ;; *) observation=unknown ;; esac
+            case "$observation" in busy|idle|fallback-idle|supervising|unknown) ;; *) observation=unknown ;; esac
           else
-            observation=$(fm_pending_reply_backend_observation "$backend" "$target" "$label" "$harness")
+            observation=$(fm_pending_reply_fold_supervising \
+              "$(fm_pending_reply_backend_observation "$backend" "$target" "$label" "$harness")" "$sm_home")
           fi
           observation_tasks+=("$task_id")
           observation_values+=("$observation")
