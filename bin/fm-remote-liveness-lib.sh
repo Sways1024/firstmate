@@ -18,11 +18,12 @@
 # Callers: the session-start sweep in bin/fm-bootstrap.sh, and the mid-session
 # triggers in bin/fm-procevent-remote-reply.sh, once the reply relay's transport
 # recovers after an SSH failure or its periodic endpoint probe finds the second
-# mate dead or missing behind a healthy link. It prints nothing. Its one write: a check that
-# ends alive or relaunched while the relay's `blocked [key=remote-liveness-<id>]`
-# is still open in <parent-status-file>, per bin/fm-classify-lib.sh's fold,
-# appends the matching `resolved` line, so a recovered second mate's blocker
-# does not stay open; otherwise a successful check stays silent. It sets:
+# mate dead or missing behind a healthy link. It prints nothing. Its one write:
+# a check that ends alive or relaunched while the relay's
+# `blocked [key=remote-liveness-<id>]` is still open in <parent-status-file>,
+# per bin/fm-classify-lib.sh's fold, appends the matching `resolved` line, so a
+# recovered second mate's blocker does not stay open; otherwise a successful
+# check stays silent. It sets:
 #   FM_REMOTE_LIVENESS_OUTCOME  alive|relaunched|skipped|unavailable|failed
 #   FM_REMOTE_LIVENESS_MESSAGE  the one-line reason, without the
 #                               "SECONDMATE_LIVENESS: secondmate <id>: " prefix
