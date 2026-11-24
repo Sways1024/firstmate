@@ -218,8 +218,8 @@ On an idle or done native baseline, submit confirmation waits for `working` or `
 On an already active or unreadable baseline, it falls back to conservative composer clearance.
 An agent that is mid-turn, such as Claude Code or OpenCode, accepts Enter as a message to send when the turn ends but keeps the text in its composer until then.
 So when that fallback still reads pending after every Enter retry and native state reads `working` at that moment, the adapter reports `queued` instead of `pending`.
-`fm-send` treats `queued` as a confirmed delivery, says so in a `queued:` line, and for a recorded task also accepts the task's semantic busy state as that proof.
-A blocked, idle, or unreadable target with text left in the composer still fails.
+`fm-send` treats `queued` as a confirmed delivery, says so in a `queued:` line, and for a recorded task also accepts the task's semantic busy state as that proof unless native state reads `blocked`.
+A blocked target, or an idle or unreadable one with no semantic busy proof, still fails when text is left in the composer.
 A fully unreadable target stops retrying and reports unknown.
 The poll density bounds the residual possibility of an extremely fast complete turn; a missed transition can cause only a redundant Enter on an empty composer, never duplicate message text.
 

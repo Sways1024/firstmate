@@ -25,8 +25,8 @@
 # delivery - exit 0, pending-reply delivery and --resolve-key closes proceed -
 # and fm-send prints one stderr line starting `queued: ` so a caller can tell it
 # from an immediate submit. A remote send reports queued when the host's own
-# fm-send printed that line. An idle or unknown target with text left in the
-# composer is still a failure.
+# fm-send printed that line. A blocked, idle, or unknown target with text left
+# in the composer is still a failure.
 # Tune with FM_SEND_RETRIES (default 3) / FM_SEND_SLEEP (0.4).
 # Slash commands, and codex `$...` skill invocations resolved through harness
 # meta, get a longer pre-Enter settle so completion popups do not swallow Enter.
@@ -410,11 +410,15 @@ fi
 # (bin/fm-busy-lib.sh), because Herdr's native state can read idle while a
 # harness runs a long foreground tool. Both halves need positive proof: the
 # composer must still read pending now and the classification must be exactly
-# busy, so an idle, unknown, or unrecorded target stays a genuine failure.
+# busy, so an idle, unknown, or unrecorded target stays a genuine failure. A
+# raw native `blocked` read (a dialog the Enter may have answered) always
+# refuses, matching the adapter.
 fm_send_herdr_semantic_queued() {
   local verdict
   [ "$TARGET_BACKEND" = herdr ] && [ -n "$TARGET_META" ] || return 1
   [ "$(fm_backend_composer_state herdr "$T" 2>/dev/null)" = pending ] || return 1
+  fm_backend_source herdr && fm_backend_herdr_parse_target "$T" || return 1
+  [ "$(fm_backend_herdr_agent_status_raw "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE")" != blocked ] || return 1
   verdict=$(fm_busy_classify_meta "$TARGET_META" "$(fm_send_id_from_meta "$TARGET_META")" "$STATE" 2>/dev/null) || return 1
   [ "${verdict%% *}" = busy ]
 }

@@ -13,8 +13,9 @@
 #     state + text left -> pending; blocked (a dialog) + text left -> pending.
 #   - fm-send: a queued send exits 0, prints a `queued:` line, and closes a
 #     --resolve-key decision; the task's semantic busy source also proves a
-#     queue when native state reads idle; an idle target stays a failure that
-#     closes nothing; a remote host's queued outcome crosses the transport.
+#     queue when native state reads idle, but never when it reads blocked; an
+#     idle target stays a failure that closes nothing; a remote host's queued
+#     outcome crosses the transport.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -236,6 +237,22 @@ test_fm_send_idle_text_left_fails_and_keeps_decision() {
   pass "fm-send: an idle or unknown Herdr target with text left still fails and closes nothing"
 }
 
+test_fm_send_blocked_semantic_busy_fails_and_keeps_decision() {
+  local home rc
+  case_env send-blocked
+  home=$(setup_home send-blocked claude)
+  "$BUSY_EVENT" arm "$home/state" t1 --state busy --source claude-hook --event UserPromptSubmit >/dev/null \
+    || fail "could not arm the semantic busy record"
+  # A dialog is open throughout: native state reads blocked while the busy
+  # record stays armed and the dialog row still reads as composer text.
+  run_send "$home" blocked blocked 1 t1 --resolve-key api-shape "go with REST"; rc=$?
+  [ "$rc" -ne 0 ] || fail "a blocked target with a busy record and text left must fail"$'\n'"$(cat "$DIR/err")"
+  assert_no_grep 'queued:' "$DIR/err" "a blocked target must not be reported as queued"
+  assert_grep 'not submitted' "$DIR/err" "the blocked failure should be reported as not submitted"
+  decision_open "$home" || fail "a blocked-target failure must leave the decision open"
+  pass "fm-send: a blocked Herdr target is never queued by its semantic busy record and closes nothing"
+}
+
 test_fm_send_remote_queued_crosses_transport() {
   local home rc ssh_log
   case_env send-remote
@@ -268,4 +285,5 @@ test_fm_send_queued_closes_resolve_key
 test_fm_send_submitted_does_not_say_queued
 test_fm_send_semantic_busy_proves_queue
 test_fm_send_idle_text_left_fails_and_keeps_decision
+test_fm_send_blocked_semantic_busy_fails_and_keeps_decision
 test_fm_send_remote_queued_crosses_transport
