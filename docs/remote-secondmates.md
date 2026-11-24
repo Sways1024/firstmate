@@ -187,6 +187,9 @@ Once its poll has failed with SSH exit 255, as a host reboot or dropped link mak
 A Herdr server crash ends the second mate's pane without interrupting SSH, so the relay also probes the endpoint state before a poll at most once every two minutes, set by `FM_REMOTE_REPLY_LIVENESS_SECONDS`, and runs that same full check when the probe proves the endpoint dead or missing.
 A failed relaunch or readiness gap there is raised as `blocked [key=remote-liveness-<id>]` on the parent status stream, and not raised again while that blocker is still open, so a later outage after it was resolved raises a new one.
 While that blocker is still open, the periodic probe does not relaunch again, so a failing relaunch is attempted once per outage.
+A relaunch from the periodic probe that succeeds is bounded too: if a later probe finds the second mate dead or missing again before any probe or check has found it alive, it is not relaunched a second time, and the same blocker is raised saying it died again after its relaunch.
+A second mate whose harness exits soon after every launch, for example on an expired login or a broken config, therefore costs one relaunch and one blocker rather than a silent relaunch every few minutes.
+Resolving that blocker by hand allows one more relaunch, and a probe that finds the second mate alive resolves it and resets the bound.
 A relaunch whose completion SSH left unknown is not a failure: recovery stays armed and the next pass re-probes the endpoint, which finds it alive if the launch landed.
 While that blocker is still open, a later check from the relay or the session-start sweep that finds the second mate alive or relaunches it appends the matching `resolved` line; otherwise a successful check stays silent.
 [`bin/fm-remote-liveness-lib.sh`](../bin/fm-remote-liveness-lib.sh) owns that decision for both callers, and a remote launch re-checks the endpoint before creating one, so neither path can start a duplicate.
