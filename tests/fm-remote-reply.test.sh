@@ -418,10 +418,13 @@ assert_absent "$PARENT/state/procevent/$SID.source" \
   "refused retirement left the reply source running past its pending-result check"
 remote_env "$ADAPTER" handle ios 11 "$RESULT_ELEVEN" >/dev/null 2>&1 || [ "$?" -eq 3 ] \
   || fail "pending continuity result could not be acknowledged after retirement refusal"
-touch "$PARENT/state/remote-replies/ios.transport-lost"
+touch "$PARENT/state/remote-replies/ios.transport-lost" "$PARENT/state/remote-replies/ios.liveness-checked" \
+  "$PARENT/state/remote-replies/ios.liveness-relaunched"
 remote_env "$ADAPTER" retire ios >/dev/null
 assert_absent "$PARENT/state/remote-replies/ios.cursor" "adapter retirement left its cursor"
 assert_absent "$PARENT/state/remote-replies/ios.transport-lost" "adapter retirement left its transport-lost marker"
+assert_absent "$PARENT/state/remote-replies/ios.liveness-checked" "adapter retirement left its liveness clock"
+assert_absent "$PARENT/state/remote-replies/ios.liveness-relaunched" "adapter retirement left its relaunch counter"
 pass "remote reply retirement quiesces and refuses unhandled captured results"
 
 # --- mid-session liveness: the relay's recovery after SSH failure ----------
@@ -448,7 +451,10 @@ case "$2" in
     ;;
   fm-remote-secondmate-control.sh)
     case "$3" in
-      state) cat "$FM_FAKE_LIVE/state" ;;
+      state)
+        [ ! -f "$FM_FAKE_LIVE/probe-rc" ] || exit "$(cat "$FM_FAKE_LIVE/probe-rc")"
+        cat "$FM_FAKE_LIVE/state"
+        ;;
       route) printf 'backend=herdr\n' ;;
     esac
     ;;
@@ -460,6 +466,7 @@ cat > "$LROOT/bin/fm-spawn.sh" <<'SH'
 printf 'spawn %s\n' "$*" >> "$FM_FAKE_LIVE/calls.log"
 [ ! -f "$FM_FAKE_LIVE/spawn-fail" ] || { printf 'remote host-local secondmate launch failed\n' >&2; exit 1; }
 [ ! -f "$FM_FAKE_LIVE/spawn-unknown" ] || { printf 'error: remote secondmate is unavailable or launch completion is unknown\n' >&2; exit 255; }
+[ ! -f "$FM_FAKE_LIVE/spawn-revives" ] || printf 'alive\n' > "$FM_FAKE_LIVE/state"
 SH
 chmod +x "$LROOT/bin/fm-on.sh" "$LROOT/bin/fm-spawn.sh"
 printf 'kind=secondmate\nwindow=2ndmate-ios\nremote_host=remote-mac\nharness=claude\n' > "$LHOME/state/ios.meta"
@@ -469,6 +476,7 @@ live_source() { # runs one relay source pass; sets LIVE_RC
   : > "$LIVE/calls.log"
   set +e
   FM_HOME="$LHOME" FM_ROOT_OVERRIDE="$LROOT" FM_FAKE_LIVE="$LIVE" \
+    FM_REMOTE_REPLY_LIVENESS_SECONDS="${LIVE_INTERVAL:-86400}" \
     "$LROOT/bin/fm-procevent-remote-reply.sh" source ios > "$LIVE/source.out" 2>&1
   LIVE_RC=$?
   set -e
@@ -595,5 +603,234 @@ touch "$MARKER"
 live_source
 [ "$(resolved_count)" -eq 2 ] || fail "a successful check with no open blocker wrote a resolution"
 pass "a later check that relaunches the second mate or finds it alive resolves an open liveness blocker, and is silent otherwise"
+
+# --- mid-session liveness: a Herdr crash behind a healthy SSH link ---------
+# No poll fails here, so the relay's own periodic endpoint probe is the only
+# trigger. LIVE_INTERVAL=0 makes every source pass due once the clock started.
+STAMP="$LHOME/state/remote-replies/ios.liveness-checked"
+state_probes() { grep -c 'fm-remote-secondmate-control.sh state ios' "$LIVE/calls.log" || true; }
+: > "$LHOME/state/ios.status"
+rm -f "$MARKER" "$STAMP" "$LIVE/probe-rc"
+printf '75\n' > "$LIVE/poll-rc"
+printf 'dead\n' > "$LIVE/state"
+LIVE_INTERVAL=0 live_source
+[ "$LIVE_RC" -eq 75 ] || fail "the first healthy pass did not poll: $LIVE_RC"
+assert_present "$STAMP" "the first healthy pass did not start the liveness clock"
+[ "$(state_probes)" -eq 0 ] || fail "the first healthy pass probed a second mate that was just launched or checked"
+pass "the first healthy relay pass only starts the liveness clock"
+
+LIVE_INTERVAL=0 live_source
+[ "$LIVE_RC" -eq 75 ] || fail "the poll did not run after a healthy-link relaunch: $LIVE_RC"
+[ "$(spawn_count)" -eq 1 ] || fail "a dead endpoint behind a healthy link was not relaunched once"$'\n'"$(cat "$LIVE/calls.log")"
+assert_grep 'on ios fm-remote-doctor.sh' "$LIVE/calls.log" "the healthy-link relaunch skipped the readiness gate"
+[ "$(grep -n '^spawn ' "$LIVE/calls.log" | cut -d: -f1)" -lt "$(grep -n 'fm-remote-delta-read.sh' "$LIVE/calls.log" | cut -d: -f1)" ] \
+  || fail "the poll ran before the healthy-link relaunch decision"
+assert_absent "$MARKER" "a healthy-link relaunch armed the lost-transport path"
+assert_no_grep 'remote-liveness-ios' "$LHOME/state/ios.status" "a successful healthy-link relaunch wrote to the status stream"
+printf 'alive\n' > "$LIVE/state"
+LIVE_INTERVAL=0 live_source
+printf 'missing\n' > "$LIVE/state"
+LIVE_INTERVAL=0 live_source
+[ "$(spawn_count)" -eq 1 ] || fail "a missing endpoint behind a healthy link was not relaunched"
+pass "a dead or missing endpoint behind a healthy SSH link is relaunched through the shared check before the poll"
+
+printf 'dead\n' > "$LIVE/state"
+live_source
+[ "$(state_probes)" -eq 0 ] || fail "the relay probed again inside its liveness interval"
+[ "$(spawn_count)" -eq 0 ] || fail "the relay relaunched inside its liveness interval"
+pass "the healthy-link probe runs at most once per liveness interval"
+
+for endpoint_state in alive ambiguous unreadable unverified bogus; do
+  printf '%s\n' "$endpoint_state" > "$LIVE/state"
+  LIVE_INTERVAL=0 live_source
+  [ "$(state_probes)" -eq 1 ] || fail "the healthy-link check did not probe exactly once for $endpoint_state"
+  [ "$(spawn_count)" -eq 0 ] || fail "the healthy-link check relaunched an endpoint whose state was $endpoint_state"
+  assert_no_grep 'fm-remote-doctor.sh' "$LIVE/calls.log" "a $endpoint_state probe with no open blocker ran the full check"
+  [ "$LIVE_RC" -eq 75 ] || fail "a $endpoint_state probe kept the poll from running: $LIVE_RC"
+done
+printf 'dead\n' > "$LIVE/state"
+printf '1\n' > "$LIVE/probe-rc"
+LIVE_INTERVAL=0 live_source
+rm -f "$LIVE/probe-rc"
+[ "$(spawn_count)" -eq 0 ] || fail "the healthy-link check relaunched past an unreadable probe"
+[ "$LIVE_RC" -eq 75 ] || fail "an unreadable probe kept the poll from running: $LIVE_RC"
+pass "the healthy-link check leaves alive, ambiguous, unreadable, and unknown states alone"
+
+touch "$LIVE/host-down"
+LIVE_INTERVAL=0 live_source
+[ "$LIVE_RC" -eq 255 ] || fail "an unreachable host did not keep the poll's SSH status: $LIVE_RC"
+[ "$(spawn_count)" -eq 0 ] || fail "the healthy-link check relaunched while the host was unreachable"
+assert_present "$MARKER" "an unreachable host did not arm the lost-transport path"
+rm -f "$LIVE/host-down"
+LIVE_INTERVAL=0 live_source
+[ "$(spawn_count)" -eq 1 ] || fail "the lost-transport path did not take over once the host answered"
+assert_absent "$MARKER" "the lost-transport path kept its marker after recovering"
+[ "$(state_probes)" -eq 1 ] || fail "the healthy-link probe ran on top of the lost-transport check"
+pass "an unreachable host keeps the lost-transport path, which runs the check alone"
+
+: > "$LHOME/state/ios.status"
+total_spawns=0
+touch "$LIVE/spawn-fail"
+for _ in 1 2 3; do
+  LIVE_INTERVAL=0 live_source
+  total_spawns=$((total_spawns + $(spawn_count)))
+done
+rm -f "$LIVE/spawn-fail"
+[ "$total_spawns" -eq 1 ] || fail "a failing healthy-link relaunch was attempted $total_spawns times in one outage"
+[ "$(grep -cF 'blocked [key=remote-liveness-ios]: remote secondmate ios was not recovered after its endpoint was found dead while its host stayed reachable' "$LHOME/state/ios.status")" -eq 1 ] \
+  || fail "a failed healthy-link relaunch was not escalated exactly once"$'\n'"$(cat "$LHOME/state/ios.status")"
+liveness_blocker_open || fail "the healthy-link escalation is not open in the decision fold"
+pass "a failed healthy-link relaunch is attempted once per outage and escalated once"
+
+printf 'alive\n' > "$LIVE/state"
+LIVE_INTERVAL=0 live_source
+[ "$(spawn_count)" -eq 0 ] || fail "finding the second mate alive behind an open blocker relaunched it"
+! liveness_blocker_open || fail "finding the second mate alive left the healthy-link blocker open"
+[ "$(resolved_count)" -eq 1 ] || fail "finding the second mate alive did not resolve its blocker exactly once"
+LIVE_INTERVAL=0 live_source
+[ "$(resolved_count)" -eq 1 ] || fail "a later alive probe with no open blocker wrote a resolution"
+assert_no_grep 'fm-remote-doctor.sh' "$LIVE/calls.log" "a later alive probe with no open blocker ran the full check"
+pass "an alive probe resolves a still-open liveness blocker and is silent otherwise"
+
+printf 'dead\n' > "$LIVE/state"
+touch "$LIVE/spawn-fail"
+LIVE_INTERVAL=0 live_source
+rm -f "$LIVE/spawn-fail"
+liveness_blocker_open || fail "a new outage's failed relaunch did not raise a new blocker"
+printf 'resolved [key=remote-liveness-ios]: fixed the host by hand\n' >> "$LHOME/state/ios.status"
+touch "$LIVE/spawn-revives"
+total_spawns=0
+for _ in 1 2 3; do
+  LIVE_INTERVAL=0 live_source
+  total_spawns=$((total_spawns + $(spawn_count)))
+done
+rm -f "$LIVE/spawn-revives"
+[ "$total_spawns" -eq 1 ] || fail "repeated healthy-link triggers relaunched $total_spawns times instead of once"
+[ "$(grep -c '^blocked \[key=remote-liveness-ios\]' "$LHOME/state/ios.status")" -eq 2 ] \
+  || fail "a relaunch after the captain resolved the blocker raised another blocker"
+pass "a resolved blocker allows one more relaunch, and repeated triggers never duplicate a revived second mate"
+
+RELAUNCHED="$LHOME/state/remote-replies/ios.liveness-relaunched"
+died_again_count() { grep -cF 'blocked [key=remote-liveness-ios]: remote secondmate ios died again after its relaunch' "$LHOME/state/ios.status" || true; }
+: > "$LHOME/state/ios.status"
+printf 'dead\n' > "$LIVE/state"
+total_spawns=0
+for pass_number in 1 2 3 4; do
+  LIVE_INTERVAL=0 live_source
+  total_spawns=$((total_spawns + $(spawn_count)))
+  [ "$LIVE_RC" -eq 75 ] || fail "pass $pass_number on a second mate that died again kept the poll from running: $LIVE_RC"
+  if [ "$pass_number" -gt 1 ]; then
+    assert_no_grep 'fm-remote-doctor.sh' "$LIVE/calls.log" "pass $pass_number on a second mate that died again ran the full check"
+  fi
+done
+[ "$total_spawns" -eq 1 ] || fail "a second mate dead again after its healthy-link relaunch was relaunched $total_spawns times"
+[ "$(died_again_count)" -eq 1 ] || fail "a second mate dead again after its relaunch was not escalated exactly once"$'\n'"$(cat "$LHOME/state/ios.status")"
+[ "$(grep -c '^blocked \[key=remote-liveness-ios\]' "$LHOME/state/ios.status")" -eq 1 ] \
+  || fail "further dead probes raised another liveness blocker"
+assert_grep 'died again after its relaunch (endpoint dead while its host stayed reachable)' "$LHOME/state/ios.status" \
+  "the died-again escalation did not name the endpoint state"
+liveness_blocker_open || fail "the died-again escalation is not open in the decision fold"
+pass "a second mate dead again after a healthy-link relaunch is relaunched once and escalated once"
+
+printf 'resolved [key=remote-liveness-ios]: fixed the login by hand\n' >> "$LHOME/state/ios.status"
+total_spawns=0
+for _ in 1 2 3; do
+  LIVE_INTERVAL=0 live_source
+  total_spawns=$((total_spawns + $(spawn_count)))
+done
+[ "$total_spawns" -eq 1 ] || fail "a resolved died-again blocker allowed $total_spawns relaunches instead of one"
+[ "$(died_again_count)" -eq 2 ] || fail "a second mate dead again after the resolved blocker's relaunch was not escalated once more"
+liveness_blocker_open || fail "the second died-again escalation is not open in the decision fold"
+pass "resolving a died-again blocker by hand allows exactly one more relaunch"
+
+printf 'alive\n' > "$LIVE/state"
+LIVE_INTERVAL=0 live_source
+[ "$(spawn_count)" -eq 0 ] || fail "finding the second mate alive behind a died-again blocker relaunched it"
+! liveness_blocker_open || fail "finding the second mate alive left the died-again blocker open"
+[ "$(resolved_count)" -eq 2 ] || fail "finding the second mate alive did not resolve the died-again blocker exactly once"
+assert_absent "$RELAUNCHED" "finding the second mate alive left the relaunch counter set"
+printf 'dead\n' > "$LIVE/state"
+LIVE_INTERVAL=0 live_source
+[ "$(spawn_count)" -eq 1 ] || fail "a new outage after an alive probe was not relaunched once"
+assert_present "$RELAUNCHED" "a successful healthy-link relaunch was not counted"
+printf 'alive\n' > "$LIVE/state"
+LIVE_INTERVAL=0 live_source
+assert_absent "$RELAUNCHED" "an alive probe with no open blocker left the relaunch counter set"
+printf 'dead\n' > "$LIVE/state"
+LIVE_INTERVAL=0 live_source
+[ "$(spawn_count)" -eq 1 ] || fail "a second mate found alive after its relaunch was not relaunched on its next outage"
+[ "$(died_again_count)" -eq 2 ] || fail "a second mate found alive after its relaunch was escalated as dying again"
+! liveness_blocker_open || fail "a relaunch after an alive probe left a liveness blocker open"
+pass "an alive probe resolves the died-again blocker and resets the bound, so a new outage relaunches once again"
+
+: > "$LHOME/state/ios.status"
+printf 'alive\n' > "$LIVE/state"
+LIVE_INTERVAL=0 live_source
+printf 'dead\n' > "$LIVE/state"
+LIVE_INTERVAL=0 live_source
+[ "$(spawn_count)" -eq 1 ] || fail "the healthy-link relaunch this case starts from did not run"
+assert_present "$RELAUNCHED" "the healthy-link relaunch this case starts from was not counted"
+touch "$LIVE/spawn-fail" "$MARKER"
+LIVE_INTERVAL=0 live_source
+rm -f "$LIVE/spawn-fail"
+assert_grep 'blocked [key=remote-liveness-ios]: remote secondmate ios was not recovered after its host became reachable again' \
+  "$LHOME/state/ios.status" "the lost-transport path did not raise its liveness blocker"
+liveness_blocker_open || fail "the lost-transport blocker is not open in the decision fold"
+printf 'resolved [key=remote-liveness-ios]: fixed the host by hand\n' >> "$LHOME/state/ios.status"
+LIVE_INTERVAL=0 live_source
+[ "$(spawn_count)" -eq 1 ] || fail "a hand-resolved lost-transport blocker did not allow exactly one more relaunch"$'\n'"$(cat "$LHOME/state/ios.status")"
+[ "$(died_again_count)" -eq 0 ] || fail "a relaunch counted before a lost-transport blocker was escalated as dying again"
+! liveness_blocker_open || fail "the relaunch after a hand-resolved lost-transport blocker left a blocker open"
+pass "a lost-transport blocker carries the bound alone, so resolving it by hand allows exactly one more relaunch"
+
+: > "$LHOME/state/ios.status"
+touch "$RELAUNCHED"
+printf 'blocked [key=remote-liveness-ios]: raised by another liveness check\n' >> "$LHOME/state/ios.status"
+LIVE_INTERVAL=0 live_source
+[ "$(spawn_count)" -eq 0 ] || fail "a dead probe behind an open liveness blocker relaunched"
+assert_absent "$RELAUNCHED" "a dead probe behind an open liveness blocker kept the relaunch counter"
+printf 'resolved [key=remote-liveness-ios]: fixed by hand\n' >> "$LHOME/state/ios.status"
+LIVE_INTERVAL=0 live_source
+[ "$(spawn_count)" -eq 1 ] || fail "a hand-resolved blocker raised while a relaunch was counted did not allow one more relaunch"
+[ "$(died_again_count)" -eq 0 ] || fail "a hand-resolved blocker raised while a relaunch was counted was followed by a died-again blocker"
+pass "any open liveness blocker clears the relaunch counter, so its hand resolution allows one more relaunch"
+
+: > "$LHOME/state/ios.status"
+printf 'alive\n' > "$LIVE/state"
+LIVE_INTERVAL=0 live_source
+{
+  printf 'blocked [key=remote-liveness-ios]: an earlier outage\n'
+  printf 'working: progress that mentions [key=remote-liveness-ios] in passing\n'
+  printf 'resolved [key=remote-liveness-ios]: fixed by hand\n'
+  printf 'needs-decision [key=other-question]: an unrelated open decision\n'
+  printf 'working: unrelated progress\n'
+} >> "$LHOME/state/ios.status"
+LIVE_INTERVAL=0 live_source
+assert_no_grep 'fm-remote-doctor.sh' "$LIVE/calls.log" "an alive probe over a resolved earlier blocker ran the full check"
+printf 'dead\n' > "$LIVE/state"
+LIVE_INTERVAL=0 live_source
+[ "$(spawn_count)" -eq 1 ] || fail "a dead probe over a resolved earlier blocker was not relaunched"
+{
+  printf 'blocked [key=remote-liveness-ios]: raised again\n'
+  printf 'working: later unrelated progress\n'
+  printf 'resolved [key=other-question]: answered\n'
+} >> "$LHOME/state/ios.status"
+liveness_blocker_open || fail "the shared fold does not read the reopened blocker as open"
+LIVE_INTERVAL=0 live_source
+[ "$(spawn_count)" -eq 0 ] || fail "a dead probe relaunched behind a blocker reopened after resolved history"
+printf 'alive\n' > "$LIVE/state"
+LIVE_INTERVAL=0 live_source
+assert_grep 'on ios fm-remote-doctor.sh' "$LIVE/calls.log" "an alive probe behind a reopened blocker skipped the full check"
+! liveness_blocker_open || fail "an alive probe left a blocker reopened after resolved history open"
+[ "$(resolved_count)" -eq 2 ] || fail "an alive probe did not resolve a blocker reopened after resolved history exactly once"
+pass "a resolved earlier blocker and unrelated decisions in the history do not change the liveness outcome"
+
+mv "$LHOME/state/ios.meta" "$LHOME/state/ios.meta.saved"
+printf 'kind=secondmate\nremote_host=remote-mac\nharness=claude\n' > "$LHOME/state/ios.meta"
+printf 'dead\n' > "$LIVE/state"
+LIVE_INTERVAL=0 live_source
+[ "$(state_probes)" -eq 0 ] || fail "the healthy-link check probed a second mate with no launched endpoint record"
+mv "$LHOME/state/ios.meta.saved" "$LHOME/state/ios.meta"
+pass "the healthy-link check keeps the session-start sweep's launched-record scope"
 
 echo "ALL TESTS PASSED"

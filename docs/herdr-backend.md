@@ -260,7 +260,7 @@ Unlike tmux process-name inspection, native registration can classify Pi without
 
 The session-start sweep uses this probe.
 Mid-session liveness for a local secondmate is not implemented because idle secondmates are deliberately exempt from stale-pane escalation and need a separate periodic identity signal.
-A remote second mate is rechecked mid-session only after its reply relay loses SSH, as [Remote second mates](remote-secondmates.md#normal-operation) describes.
+A remote second mate is rechecked mid-session by its reply relay, after a lost SSH link or a periodic endpoint probe, as [Remote second mates](remote-secondmates.md#normal-operation) describes.
 
 ## Push events and polling fallback
 
@@ -311,7 +311,7 @@ Tests use thin compatibility wrappers in `tests/herdr-test-safety.sh` and never 
 - Mutable labels can collide; they are never placement or destructive authority.
 - A Firstmate outside Herdr cannot resolve a launcher workspace, so a colliding home label refuses new spawns until the collision is cleared.
 - Ghost and placeholder recognition depends on ANSI de-emphasis and fails safely to pending when unavailable.
-- Mid-session secondmate liveness is not implemented beyond a remote second mate's recheck after an SSH outage.
+- Mid-session secondmate liveness is not implemented beyond a remote second mate's reply-relay recheck.
 - OpenCode 1.18.4 can accept Enter while busy without clearing the composer.
   The tmux backend has a busy-queue fallback, but Herdr still reports this case as submit pending and needs a separate adapter fix.
 - Only tmux and Herdr can host the away-mode supervisor terminal.

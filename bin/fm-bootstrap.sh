@@ -585,8 +585,9 @@ secondmate_liveness_sweep() {
   # Secondmate homes never contain kind=secondmate meta, so this is naturally a
   # primary-only no-op there. A remote route's check is owned by
   # bin/fm-remote-liveness-lib.sh, which the reply relay also runs mid-session
-  # once its transport recovers after an SSH failure; local mid-session
-  # liveness remains out of scope.
+  # once its transport recovers after an SSH failure or its periodic endpoint
+  # probe finds the second mate dead; local mid-session liveness remains out of
+  # scope.
   [ -d "$STATE" ] || return 0
   local meta id remote_host label __fm_timing_stamp
   SECONDMATE_RESPAWNED_IDS=""
