@@ -16,8 +16,9 @@
 # failed: the launch may have landed, so the next check re-probes instead.
 #
 # Callers: the session-start sweep in bin/fm-bootstrap.sh, and the mid-session
-# trigger in bin/fm-procevent-remote-reply.sh once the reply relay's transport
-# recovers after an SSH failure. It prints nothing. Its one write: a check that
+# triggers in bin/fm-procevent-remote-reply.sh, once the reply relay's transport
+# recovers after an SSH failure or its periodic endpoint probe finds the second
+# mate dead or missing behind a healthy link. It prints nothing. Its one write: a check that
 # ends alive or relaunched while the relay's `blocked [key=remote-liveness-<id>]`
 # is still open in <parent-status-file>, per bin/fm-classify-lib.sh's fold,
 # appends the matching `resolved` line, so a recovered second mate's blocker

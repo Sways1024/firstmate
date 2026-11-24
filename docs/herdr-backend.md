@@ -260,7 +260,7 @@ Unlike tmux process-name inspection, native registration can classify Pi without
 
 The session-start sweep uses this probe.
 Mid-session liveness for a local secondmate is not implemented because idle secondmates are deliberately exempt from stale-pane escalation and need a separate periodic identity signal.
-A remote second mate is rechecked mid-session only after its reply relay loses SSH, as [Remote second mates](remote-secondmates.md#normal-operation) describes.
+A remote second mate is rechecked mid-session by its reply relay, after a lost SSH link or a periodic endpoint probe, as [Remote second mates](remote-secondmates.md#normal-operation) describes.
 
 ## Push events and polling fallback
 

@@ -49,18 +49,30 @@
 # delivers only whole lines and breaks continuity on an over-long one.
 #
 # The source is also the mid-session liveness trigger for the remote second
-# mate itself. Its long poll is in flight almost continuously, so a host reboot
-# or a dropped link ends it with SSH exit 255, which leaves a transport-lost
-# marker beside the cursor. While that marker exists, every restart of the
-# source first runs bin/fm-remote-liveness-lib.sh - the same readiness gate,
-# state probe, and dead-or-missing relaunch the session-start sweep runs - and
-# exits 255 again without polling while the host is still unreachable. Once the
-# host answers, the marker is cleared and the poll resumes, so recovery runs
-# once per outage instead of on every poll. A relaunch that fails, or a
-# readiness gap, is escalated as a keyed blocker on the parent status stream,
-# and not again while that blocker is still open, so a later outage after the
-# captain resolved it raises a new one. A Herdr crash that never interrupts SSH
-# is not a trigger; the session-start sweep still covers it.
+# mate itself, through bin/fm-remote-liveness-lib.sh - the same readiness gate,
+# state probe, and dead-or-missing relaunch the session-start sweep runs. It
+# has two triggers, and both escalate a failed relaunch or readiness gap as a
+# keyed blocker on the parent status stream, and not again while that blocker
+# is still open, so a later outage after it was resolved raises a new one.
+#
+# Lost transport: the long poll is in flight almost continuously, so a host
+# reboot or a dropped link ends it with SSH exit 255, which leaves a
+# transport-lost marker beside the cursor. While that marker exists, every
+# restart of the source first runs the full check and exits 255 again without
+# polling while the host is still unreachable. Once the host answers, the
+# marker is cleared and the poll resumes, so recovery runs once per outage
+# instead of on every poll.
+#
+# Healthy link: a Herdr server crash ends the second mate's pane without
+# interrupting SSH, so no poll ever fails. At most once every
+# FM_REMOTE_REPLY_LIVENESS_SECONDS (default 120), a restart of the source first
+# runs one cheap endpoint state probe; the first restart only starts that
+# clock, because the second mate was just launched or checked. A proven dead
+# or missing endpoint gets the full check, unless its liveness blocker is still
+# open, so a failed relaunch is attempted once per outage rather than on every
+# probe; an alive endpoint gets the full check only to resolve a still-open
+# blocker. Every other probe result is left alone, and a probe SSH could not
+# complete is left to the poll that follows, which arms the lost-transport path.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -72,6 +84,7 @@ CURSOR_DIR="$STATE/remote-replies"
 REMOTE_LOG='state/parent-replies.status'
 WAIT_SECONDS=${FM_REMOTE_REPLY_WAIT_SECONDS:-55}
 MAX_DOC_BYTES=${FM_REMOTE_REPLY_MAX_DOC_BYTES:-262144}
+LIVENESS_SECONDS=${FM_REMOTE_REPLY_LIVENESS_SECONDS:-120}
 # fm-on.sh returns ssh's status unchanged, so 255 alone means unavailable
 # transport or unknown remote completion. Any other nonzero status is the remote
 # reader's own refusal and will not change on a retry.
@@ -86,7 +99,7 @@ DOCUMENT_LOCAL_FAILURE=2
 . "$SCRIPT_DIR/fm-pending-reply-lib.sh"
 
 die() { printf 'error: %s\n' "$1" >&2; exit 1; }
-usage() { sed -n '2,63p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,75p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
 sha256_file() {
   if command -v shasum >/dev/null 2>&1; then
@@ -117,6 +130,7 @@ source_id() {
 
 cursor_path() { printf '%s/%s.cursor\n' "$CURSOR_DIR" "$1"; }
 transport_lost_path() { printf '%s/%s.transport-lost\n' "$CURSOR_DIR" "$1"; }
+liveness_stamp_path() { printf '%s/%s.liveness-checked\n' "$CURSOR_DIR" "$1"; }
 ingest_receipt_path() { printf '%s/%s.%s.ingested\n' "$CURSOR_DIR" "$1" "$2"; }
 
 read_cursor() { # <id>; sets CURSOR_OFFSET and CURSOR_HASH
@@ -248,30 +262,79 @@ mark_transport_lost() { # <id>
   (umask 077; : > "$path")
 }
 
-# Runs the shared remote liveness check after the transport was lost. Returns
-# non-zero only while the host is still unreachable, keeping the marker so the
-# next restart tries again; every other outcome clears it.
-recover_after_transport_loss() { # <id>
-  local id=$1 meta remote_host window rc=0 line
-  meta="$STATE/$id.meta"
+# Sets LIVENESS_REMOTE_HOST and succeeds only for the session-start sweep's own
+# scope: a launched remote secondmate record.
+liveness_in_scope() { # <id>
+  local meta="$STATE/$1.meta" window
   if ! declare -F fm_meta_get >/dev/null 2>&1; then
     # shellcheck source=bin/fm-backend.sh
     . "$SCRIPT_DIR/fm-backend.sh" || return 1
   fi
   # shellcheck source=bin/fm-remote-liveness-lib.sh
   declare -F fm_remote_secondmate_liveness >/dev/null 2>&1 || . "$SCRIPT_DIR/fm-remote-liveness-lib.sh" || return 1
-  remote_host=$(fm_meta_get "$meta" remote_host)
+  LIVENESS_REMOTE_HOST=$(fm_meta_get "$meta" remote_host)
   window=$(fm_meta_get "$meta" window)
-  # The session-start sweep's own scope: a launched remote secondmate record.
-  if grep -q '^kind=secondmate$' "$meta" 2>/dev/null && [ -n "$remote_host" ] && [ -n "$window" ]; then
-    fm_remote_secondmate_liveness "$SCRIPT_DIR" "$FM_ROOT/bin" "$id" "$remote_host" "$STATE/$id.status" >&2 || rc=$?
+  grep -q '^kind=secondmate$' "$meta" 2>/dev/null && [ -n "$LIVENESS_REMOTE_HOST" ] && [ -n "$window" ]
+}
+
+write_liveness_stamp() { # <id>
+  local path tmp
+  mkdir -p "$CURSOR_DIR" || return 1
+  chmod 700 "$CURSOR_DIR" 2>/dev/null || true
+  path=$(liveness_stamp_path "$1")
+  [ ! -L "$path" ] || return 1
+  tmp=$(umask 077; mktemp "$CURSOR_DIR/.liveness.XXXXXX") || return 1
+  date +%s > "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f -- "$tmp" "$path" || { rm -f -- "$tmp"; return 1; }
+}
+
+# Runs the shared check for an in-scope id and escalates a failure while no
+# liveness blocker is open. Returns the check's own status.
+run_liveness_check() { # <id> <when-clause>
+  local id=$1 when=$2 rc=0 line
+  fm_remote_secondmate_liveness "$SCRIPT_DIR" "$FM_ROOT/bin" "$id" "$LIVENESS_REMOTE_HOST" "$STATE/$id.status" >&2 || rc=$?
+  write_liveness_stamp "$id" || true
+  if [ "$FM_REMOTE_LIVENESS_OUTCOME" = failed ]; then
+    line="blocked [key=remote-liveness-$id]: remote secondmate $id was not recovered $when ($FM_REMOTE_LIVENESS_MESSAGE)"
+    append_status_unless_open "$STATE/$id.status" "$line" || true
+  fi
+  return "$rc"
+}
+
+# The lost-transport trigger. Returns non-zero only while the host is still
+# unreachable, keeping the marker so the next restart tries again; every other
+# outcome clears it.
+recover_after_transport_loss() { # <id>
+  local id=$1 rc=0
+  if liveness_in_scope "$id"; then
+    run_liveness_check "$id" "after its host became reachable again" || rc=$?
     [ "$rc" -ne "$SSH_UNAVAILABLE" ] || return 1
-    if [ "$FM_REMOTE_LIVENESS_OUTCOME" = failed ]; then
-      line="blocked [key=remote-liveness-$id]: remote secondmate $id was not recovered after its host became reachable again ($FM_REMOTE_LIVENESS_MESSAGE)"
-      append_status_unless_open "$STATE/$id.status" "$line" || true
-    fi
   fi
   rm -f -- "$(transport_lost_path "$id")"
+}
+
+# The healthy-link trigger. It never fails the source: an unreadable or
+# unreachable probe is left to the poll that follows.
+check_liveness_when_due() { # <id>
+  local id=$1 stamp last out agent_state
+  liveness_in_scope "$id" || return 0
+  stamp=$(liveness_stamp_path "$id")
+  if [ ! -e "$stamp" ] && [ ! -L "$stamp" ]; then
+    write_liveness_stamp "$id" || true
+    return 0
+  fi
+  last=$(cat "$stamp" 2>/dev/null || true)
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  [ $(( $(date +%s) - last )) -ge "$LIVENESS_SECONDS" ] || return 0
+  write_liveness_stamp "$id" || true
+  out=$("$SCRIPT_DIR/fm-on.sh" "$id" fm-remote-secondmate-control.sh state "$id" < /dev/null 2>/dev/null) || return 0
+  agent_state=$(printf '%s\n' "$out" | tail -1)
+  case "$agent_state" in
+    dead|missing) ! status_decision_open "$STATE/$id.status" "remote-liveness-$id" || return 0 ;;
+    alive) status_decision_open "$STATE/$id.status" "remote-liveness-$id" || return 0 ;;
+    *) return 0 ;;
+  esac
+  run_liveness_check "$id" "after its endpoint was found $agent_state while its host stayed reachable" || true
 }
 
 cmd_source() {
@@ -279,6 +342,8 @@ cmd_source() {
   validate_id "$id"
   if [ -e "$(transport_lost_path "$id")" ]; then
     recover_after_transport_loss "$id" || exit "$SSH_UNAVAILABLE"
+  else
+    check_liveness_when_due "$id"
   fi
   read_cursor "$id"
   "$SCRIPT_DIR/fm-on.sh" "$id" fm-remote-delta-read.sh \
@@ -567,7 +632,7 @@ cmd_retire_finalize_locked() {
       done
     fi
   fi
-  rm -f -- "$(cursor_path "$id")" "$(transport_lost_path "$id")"
+  rm -f -- "$(cursor_path "$id")" "$(transport_lost_path "$id")" "$(liveness_stamp_path "$id")"
   rm -f -- "$CURSOR_DIR/$id".*.ingested
 }
 
