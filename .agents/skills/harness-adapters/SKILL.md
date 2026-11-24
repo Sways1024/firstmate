@@ -255,7 +255,7 @@ Opencode can auto-upgrade itself in the background and the running TUI can exit 
 If a pane shows the exit banner, relaunch with `OPENCODE_CONFIG_CONTENT='{"permission":{"*":"allow"}}' opencode --continue` to resume the session - the permission env is a per-launch prefix, so a bare `opencode --continue` returns with approvals re-enabled and stalls unattended.
 `--prompt` does not auto-submit alongside `--continue`, so send the next instruction via `fm-send` once the TUI is up.
 
-**Busy-queued Enter (opencode 1.18.4, tmux backend fix, herdr known gap).**
+**Busy-queued Enter (opencode 1.18.4; tmux and herdr fallbacks).**
 While opencode is mid-turn, the composer accepts Enter as a "send when the turn
 ends" keystroke but does not clear the typed text from the composer until the
 turn actually finishes.
@@ -265,10 +265,8 @@ primary is mid-turn is treated as wedged.
 The shared `fm_tmux_submit_enter_core` (`bin/fm-tmux-lib.sh`) now falls back
 to `fm_pane_is_busy` once the Enter-retry budget is spent: a busy pane means
 the Enter was accepted and queued (reported as `empty` so the caller does not
-re-send), while an idle pane keeps `pending` as a genuine swallow. The herdr
-adapter observes the same opencode behavior but needs a separate fix; it is
-recorded as a known gap in `docs/herdr-backend.md` rather than patched here,
-so the tmux adapter does not paper over a herdr-specific shape.
+re-send), while an idle pane keeps `pending` as a genuine swallow.
+The herdr adapter has its own fallback for the same behavior, which Claude Code shares, reported as `queued` from native `working` state; `docs/herdr-backend.md` ("Current transport behavior") owns it.
 Regression coverage: `tests/fm-tmux-submit-busy.test.sh` covers the four
 scenarios (busy + pending -> `empty`, idle + pending -> `pending`, busy +
 cleared -> `empty`, idle + cleared -> `empty`).

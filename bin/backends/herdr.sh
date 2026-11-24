@@ -3358,10 +3358,14 @@ EOF
 #     re-invokes this function from scratch with the same text after seeing
 #     an error, which is a human/escalation decision, not an automatic
 #     retry).
-# Echoes empty|pending|unknown|send-failed, a subset of the proof-carrying
-# submit vocabulary. Empty means confirmed submitted for every backend; how
-# each backend confirms it is an internal decision, and herdr's is no longer
-# literally "the composer read empty".
+# Echoes empty|queued|pending|unknown|send-failed, a subset of the
+# proof-carrying submit vocabulary. Empty means confirmed submitted for every
+# backend; how each backend confirms it is an internal decision, and herdr's is
+# no longer literally "the composer read empty". Queued means the text is still
+# in the composer of an agent proven mid-turn, which submits it when that turn
+# ends (see the busy-queued Enter note at the end of the function); it is
+# delivered but not yet submitted, so callers that need exact empty keep
+# treating it as unconfirmed.
 fm_backend_herdr_send_text_submit() {  # <target> <text> <retries> <enter-sleep> <settle>
   local target=$1 text=$2 retries=$3 sleep_s=$4 settle=$5 i=0 verdict baseline confirm_sleep
   fm_backend_herdr_parse_target "$target" || { printf 'unknown'; return 0; }
@@ -3385,8 +3389,22 @@ fm_backend_herdr_send_text_submit() {  # <target> <text> <retries> <enter-sleep>
       unknown) printf 'unknown'; return 0 ;;
     esac
     i=$((i + 1))
-    [ "$i" -lt "$retries" ] || { printf 'pending'; return 0; }
+    [ "$i" -lt "$retries" ] || break
   done
+  # Busy-queued Enter: a harness that is mid-turn (Claude Code, OpenCode)
+  # accepts Enter as "send when this turn ends" but keeps the typed text in its
+  # composer until then, so a composer still reading pending after every Enter
+  # retry is not by itself a swallow. Only a composer-proven pending (the
+  # non-idle-baseline path) qualifies, and only a native `working` read taken
+  # now converts it: blocked (a dialog the Enter may have answered), idle, and
+  # unreadable all keep the genuine-failure `pending`. fm-send adds the task's
+  # semantic busy source on top for a native state that reads idle mid-turn.
+  if [ "$verdict" = pending ] \
+    && [ "$(fm_backend_herdr_agent_status_raw "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE")" = working ]; then
+    printf 'queued'
+  else
+    printf 'pending'
+  fi
 }
 
 # fm_backend_herdr_kill: remove the task's pane, best-effort (mirrors

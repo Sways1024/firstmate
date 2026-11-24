@@ -31,7 +31,7 @@
 # benefits, and the herdr adapter routes through the same owner (task
 # afk-herdr-false-pending), so the two backends cannot drift.
 #
-# Busy-queued Enter (opencode 1.18.4, on the tmux backend only for now): when
+# Busy-queued Enter (opencode 1.18.4, tmux backend): when
 # the agent is mid-turn, opencode accepts Enter as a "send when the turn ends"
 # keystroke but does NOT clear the composer until then, so the composer keeps
 # showing the typed text the whole time. The plain "empty iff composer cleared"
@@ -40,10 +40,9 @@
 # captain instruction. The submit core now falls back to `fm_pane_is_busy` once
 # the Enter-retry budget is spent: a busy pane means the harness accepted and
 # queued the Enter (report `empty` so the caller does not re-send), while an
-# idle pane keeps the `pending` verdict (a genuine swallow). The herdr backend
-# observes the same opencode behavior but needs a separate fix; it is recorded
-# as a known gap in `docs/herdr-backend.md` rather than patched here, so the
-# tmux adapter does not paper over a herdr-specific shape.
+# idle pane keeps the `pending` verdict (a genuine swallow). The herdr adapter
+# has its own fallback from native agent state (fm_backend_herdr_send_text_submit
+# in bin/backends/herdr.sh), so this rendered-footer check stays tmux-only.
 #
 # Overrides: FM_COMPOSER_IDLE_RE matches an empty composer after ghost and
 # structural border stripping. FM_BUSY_REGEX overrides the rendered busy-footer
