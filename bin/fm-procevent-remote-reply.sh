@@ -74,11 +74,12 @@
 # until a probe or the full check finds the second mate alive; a dead or
 # missing probe while that marker exists means the second mate died again
 # after its relaunch, so the liveness blocker is raised in place of a second
-# relaunch and the marker is cleared, and resolving that blocker by hand allows
-# one more relaunch. An alive endpoint gets the full check only to resolve a
-# still-open blocker. Every other probe result is left alone, and a probe SSH
-# could not complete is left to the poll that follows, which arms the
-# lost-transport path.
+# relaunch. A failed check or an open blocker from either trigger also clears
+# the marker, so an open blocker alone carries the bound and resolving it by
+# hand allows exactly one more relaunch. An alive endpoint gets the full check
+# only to resolve a still-open blocker. Every other probe result is left alone,
+# and a probe SSH could not complete is left to the poll that follows, which
+# arms the lost-transport path.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -105,7 +106,7 @@ DOCUMENT_LOCAL_FAILURE=2
 . "$SCRIPT_DIR/fm-pending-reply-lib.sh"
 
 die() { printf 'error: %s\n' "$1" >&2; exit 1; }
-usage() { sed -n '2,81p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,82p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
 sha256_file() {
   if command -v shasum >/dev/null 2>&1; then
@@ -310,7 +311,9 @@ run_liveness_check() { # <id> <when-clause>
   local id=$1 when=$2 rc=0 line
   fm_remote_secondmate_liveness "$SCRIPT_DIR" "$FM_ROOT/bin" "$id" "$LIVENESS_REMOTE_HOST" "$STATE/$id.status" >&2 || rc=$?
   write_liveness_stamp "$id" || true
-  [ "$FM_REMOTE_LIVENESS_OUTCOME" != alive ] || rm -f -- "$(liveness_relaunched_path "$id")"
+  case "$FM_REMOTE_LIVENESS_OUTCOME" in
+    alive|failed) rm -f -- "$(liveness_relaunched_path "$id")" ;;
+  esac
   if [ "$FM_REMOTE_LIVENESS_OUTCOME" = failed ]; then
     line="blocked [key=remote-liveness-$id]: remote secondmate $id was not recovered $when ($FM_REMOTE_LIVENESS_MESSAGE)"
     append_status_unless_open "$STATE/$id.status" "$line" || true
@@ -328,6 +331,11 @@ recover_after_transport_loss() { # <id>
     [ "$rc" -ne "$SSH_UNAVAILABLE" ] || return 1
   fi
   rm -f -- "$(transport_lost_path "$id")"
+}
+
+liveness_blocker_open() { # <id>
+  grep -qF -- "[key=remote-liveness-$1]" "$STATE/$1.status" 2>/dev/null \
+    && status_decision_open "$STATE/$1.status" "remote-liveness-$1"
 }
 
 # The healthy-link trigger. It never fails the source: an unreadable or
@@ -349,7 +357,10 @@ check_liveness_when_due() { # <id>
   relaunched=$(liveness_relaunched_path "$id")
   case "$agent_state" in
     dead|missing)
-      ! status_decision_open "$STATE/$id.status" "remote-liveness-$id" || return 0
+      if liveness_blocker_open "$id"; then
+        rm -f -- "$relaunched"
+        return 0
+      fi
       if [ -e "$relaunched" ]; then
         line="blocked [key=remote-liveness-$id]: remote secondmate $id died again after its relaunch (endpoint $agent_state while its host stayed reachable); it is not relaunched again until a probe finds it alive or this is resolved"
         if append_status_unless_open "$STATE/$id.status" "$line"; then
@@ -360,7 +371,7 @@ check_liveness_when_due() { # <id>
       ;;
     alive)
       rm -f -- "$relaunched"
-      status_decision_open "$STATE/$id.status" "remote-liveness-$id" || return 0
+      liveness_blocker_open "$id" || return 0
       ;;
     *) return 0 ;;
   esac

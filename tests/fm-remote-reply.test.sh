@@ -763,6 +763,38 @@ LIVE_INTERVAL=0 live_source
 ! liveness_blocker_open || fail "a relaunch after an alive probe left a liveness blocker open"
 pass "an alive probe resolves the died-again blocker and resets the bound, so a new outage relaunches once again"
 
+: > "$LHOME/state/ios.status"
+printf 'alive\n' > "$LIVE/state"
+LIVE_INTERVAL=0 live_source
+printf 'dead\n' > "$LIVE/state"
+LIVE_INTERVAL=0 live_source
+[ "$(spawn_count)" -eq 1 ] || fail "the healthy-link relaunch this case starts from did not run"
+assert_present "$RELAUNCHED" "the healthy-link relaunch this case starts from was not counted"
+touch "$LIVE/spawn-fail" "$MARKER"
+LIVE_INTERVAL=0 live_source
+rm -f "$LIVE/spawn-fail"
+assert_grep 'blocked [key=remote-liveness-ios]: remote secondmate ios was not recovered after its host became reachable again' \
+  "$LHOME/state/ios.status" "the lost-transport path did not raise its liveness blocker"
+liveness_blocker_open || fail "the lost-transport blocker is not open in the decision fold"
+printf 'resolved [key=remote-liveness-ios]: fixed the host by hand\n' >> "$LHOME/state/ios.status"
+LIVE_INTERVAL=0 live_source
+[ "$(spawn_count)" -eq 1 ] || fail "a hand-resolved lost-transport blocker did not allow exactly one more relaunch"$'\n'"$(cat "$LHOME/state/ios.status")"
+[ "$(died_again_count)" -eq 0 ] || fail "a relaunch counted before a lost-transport blocker was escalated as dying again"
+! liveness_blocker_open || fail "the relaunch after a hand-resolved lost-transport blocker left a blocker open"
+pass "a lost-transport blocker carries the bound alone, so resolving it by hand allows exactly one more relaunch"
+
+: > "$LHOME/state/ios.status"
+touch "$RELAUNCHED"
+printf 'blocked [key=remote-liveness-ios]: raised by another liveness check\n' >> "$LHOME/state/ios.status"
+LIVE_INTERVAL=0 live_source
+[ "$(spawn_count)" -eq 0 ] || fail "a dead probe behind an open liveness blocker relaunched"
+assert_absent "$RELAUNCHED" "a dead probe behind an open liveness blocker kept the relaunch counter"
+printf 'resolved [key=remote-liveness-ios]: fixed by hand\n' >> "$LHOME/state/ios.status"
+LIVE_INTERVAL=0 live_source
+[ "$(spawn_count)" -eq 1 ] || fail "a hand-resolved blocker raised while a relaunch was counted did not allow one more relaunch"
+[ "$(died_again_count)" -eq 0 ] || fail "a hand-resolved blocker raised while a relaunch was counted was followed by a died-again blocker"
+pass "any open liveness blocker clears the relaunch counter, so its hand resolution allows one more relaunch"
+
 mv "$LHOME/state/ios.meta" "$LHOME/state/ios.meta.saved"
 printf 'kind=secondmate\nremote_host=remote-mac\nharness=claude\n' > "$LHOME/state/ios.meta"
 printf 'dead\n' > "$LIVE/state"
