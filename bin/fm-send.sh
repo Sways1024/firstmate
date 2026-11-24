@@ -17,6 +17,16 @@
 # instead of silently leaving an unsubmitted instruction.
 # Submission dispatches through the target's recorded backend; the tmux adapter
 # shares its composer/submit core with the away-mode daemon via bin/fm-tmux-lib.sh.
+# Queued delivery (Herdr): an agent that is mid-turn accepts Enter as "send
+# when this turn ends" but keeps the text in its composer, so the Herdr adapter
+# reports `queued` when the text is still there and the agent is natively
+# `working`; for a recorded task target fm-send also accepts the task's semantic
+# busy source (fm_send_herdr_semantic_queued). A queued send is a confirmed
+# delivery - exit 0, pending-reply delivery and --resolve-key closes proceed -
+# and fm-send prints one stderr line starting `queued: ` so a caller can tell it
+# from an immediate submit. A remote send reports queued when the host's own
+# fm-send printed that line. A blocked, idle, or unknown target with text left
+# in the composer is still a failure.
 # Tune with FM_SEND_RETRIES (default 3) / FM_SEND_SLEEP (0.4).
 # Slash commands, and codex `$...` skill invocations resolved through harness
 # meta, get a longer pre-Enter settle so completion popups do not swallow Enter.
@@ -112,6 +122,8 @@ fi
 . "$SCRIPT_DIR/fm-classify-lib.sh"
 # shellcheck source=bin/fm-line-cap-lib.sh
 . "$SCRIPT_DIR/fm-line-cap-lib.sh"
+# shellcheck source=bin/fm-busy-lib.sh
+. "$SCRIPT_DIR/fm-busy-lib.sh"
 
 FM_GUARD_CONTINUE_LINE='This is a supervision warning only; the requested message WILL still be sent.' "$SCRIPT_DIR/fm-guard.sh" || true
 
@@ -392,6 +404,25 @@ if [ -n "$RESOLVE_KEYS" ]; then
   done
 fi
 
+# fm_send_herdr_semantic_queued: 0 when a Herdr submit that ended pending was in
+# fact queued behind a running turn. The adapter already converts a native
+# `working` read itself; this adds the recorded task's semantic busy source
+# (bin/fm-busy-lib.sh), because Herdr's native state can read idle while a
+# harness runs a long foreground tool. Both halves need positive proof: the
+# composer must still read pending now and the classification must be exactly
+# busy, so an idle, unknown, or unrecorded target stays a genuine failure. A
+# raw native `blocked` read (a dialog the Enter may have answered) always
+# refuses, matching the adapter.
+fm_send_herdr_semantic_queued() {
+  local verdict
+  [ "$TARGET_BACKEND" = herdr ] && [ -n "$TARGET_META" ] || return 1
+  [ "$(fm_backend_composer_state herdr "$T" 2>/dev/null)" = pending ] || return 1
+  fm_backend_source herdr && fm_backend_herdr_parse_target "$T" || return 1
+  [ "$(fm_backend_herdr_agent_status_raw "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE")" != blocked ] || return 1
+  verdict=$(fm_busy_classify_meta "$TARGET_META" "$(fm_send_id_from_meta "$TARGET_META")" "$STATE" 2>/dev/null) || return 1
+  [ "${verdict%% *}" = busy ]
+}
+
 # Close each answered decision in this home's ledger, only after delivery is
 # fully confirmed. An append failure exits nonzero with the manual close
 # command; the decision then stays open and re-surfaces, never silently lost.
@@ -487,8 +518,8 @@ else
   esac
   retries=${FM_SEND_RETRIES:-3}
   sleep_s=${FM_SEND_SLEEP:-0.4}
-  # Type once, submit, verify. Only exact empty confirms delivery; every other
-  # verdict preserves the loud refusal boundary.
+  # Type once, submit, verify. Only exact empty or queued confirms delivery;
+  # every other verdict preserves the loud refusal boundary.
   send_rc=0
   remote_reason=
   if [ "$TARGET_BACKEND" = remote ]; then
@@ -511,6 +542,15 @@ else
   else
     send_rc=$?
   fi
+  # A remote host's own fm-send names a queued delivery on stderr (below); carry
+  # that outcome across so this side reports it for the remote target too.
+  if [ "$TARGET_BACKEND" = remote ] && [ "$send_rc" -eq 0 ] \
+    && printf '%s\n' "$remote_err" | grep -q '^queued: '; then
+    verdict=queued
+  fi
+  if [ "$send_rc" -eq 0 ] && [ "$verdict" = pending ] && fm_send_herdr_semantic_queued; then
+    verdict=queued
+  fi
   if [ "$send_rc" -ne 0 ]; then
     if [ "$TARGET_BACKEND" = remote ] && [ "$send_rc" -eq 255 ] && [ -n "$PENDING_REPLY_CORR" ]; then
       fm_pending_reply_mark_delivery_unknown "$STATE" "$PENDING_REPLY_CORR" || true
@@ -525,6 +565,9 @@ else
   fi
   case "$verdict" in
     empty)
+      ;;
+    queued)
+      echo "queued: text reached $T while its agent was mid-turn and is waiting in its composer; it submits when that turn ends. Delivered - do not resend." >&2
       ;;
     send-failed)
       if [ "$PENDING_REPLY_CREATED" = 1 ] && [ -n "$PENDING_REPLY_CORR" ]; then
@@ -561,7 +604,7 @@ else
   if [ -n "$RESOLVE_KEYS" ]; then
     fm_send_close_resolved_keys "$RESOLVE_ANSWER_TEXT" || exit 1
   fi
-  # Submit landed with exact empty. Confirmation only proves the text was
+  # Submit landed (empty or queued). Confirmation only proves the text was
   # accepted; the harness still needs a beat to spin up the
   # turn before its busy footer shows. Pause so an immediate peek catches the
   # crewmate actually working instead of the stale idle pane. FM_SEND_SETTLE=0

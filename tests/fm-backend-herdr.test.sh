@@ -4012,15 +4012,16 @@ test_send_text_submit_preexisting_working_does_not_false_confirm_swallowed_enter
   printf '{"result":{"agent":{"agent_status":"working"}}}\n' > "$resp/3.out"
   printf '  \xe2\x9d\xaf hello captain\n' > "$resp/4.out"
   printf '  \xe2\x9d\xaf hello captain\n' > "$resp/6.out"
+  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/7.out"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_send_text_submit default:w1:p2 "hello captain" 2 0.01 0.01' "$ROOT" )
-  [ "$out" = pending ] || fail "send_text_submit must not accept preexisting working as proof that this Enter landed, got '$out'"
+  [ "$out" = pending ] || fail "send_text_submit must not accept preexisting working as proof that this Enter landed once the agent reads idle with the message still in the composer, got '$out'"
   enter_count=$(grep -c $'\x1f''pane'$'\x1f''send-keys'$'\x1f''w1:p2'$'\x1f''enter' "$log")
   [ "$enter_count" -eq 2 ] || fail "preexisting-working swallowed Enter should retry Enter up to the configured count, sent $enter_count Enter(s)"
   read_count=$(grep -c $'\x1f''pane'$'\x1f''read' "$log")
   [ "$read_count" -eq 2 ] || fail "preexisting-working confirmation should fall back to composer reads, made $read_count read(s)"
-  pass "fm_backend_herdr_send_text_submit: preexisting working is not accepted as submit proof when the composer still holds the message"
+  pass "fm_backend_herdr_send_text_submit: preexisting working is not accepted as submit proof when the agent then reads idle and the composer still holds the message"
 }
 
 # Regression for the submit-confirmation side of the 2026-07-07 incident:

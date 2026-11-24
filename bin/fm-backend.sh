@@ -824,6 +824,9 @@ fm_backend_send_key() {  # <backend> <target> <key> [expected-label]
 # fm_backend_send_text_submit: type text once, then submit and verify,
 # retrying only the submission (never retyping). Echoes the backend's
 # proof-carrying verdict; callers require exact empty for confirmed delivery.
+# Herdr may also report queued (delivered behind a running turn, not yet
+# submitted); only bin/fm-send.sh accepts it, so every other caller keeps
+# treating it as unconfirmed.
 fm_backend_send_text_submit() {  # <backend> <target> <text> <retries> <enter-sleep> <settle> [expected-label]
   local backend=$1
   shift

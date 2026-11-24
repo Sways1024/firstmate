@@ -216,6 +216,10 @@ Text is typed once; only Enter is retried.
 
 On an idle or done native baseline, submit confirmation waits for `working` or `blocked` across a bounded polling window.
 On an already active or unreadable baseline, it falls back to conservative composer clearance.
+An agent that is mid-turn, such as Claude Code or OpenCode, accepts Enter as a message to send when the turn ends but keeps the text in its composer until then.
+So when that fallback still reads pending after every Enter retry and native state reads `working` at that moment, the adapter reports `queued` instead of `pending`.
+`fm-send` treats `queued` as a confirmed delivery, says so in a `queued:` line, and for a recorded task also accepts the task's semantic busy state as that proof unless native state reads `blocked`.
+A blocked target, or an idle or unreadable one with no semantic busy proof, still fails when text is left in the composer.
 A fully unreadable target stops retrying and reports unknown.
 The poll density bounds the residual possibility of an extremely fast complete turn; a missed transition can cause only a redundant Enter on an empty composer, never duplicate message text.
 
@@ -312,14 +316,15 @@ Tests use thin compatibility wrappers in `tests/herdr-test-safety.sh` and never 
 - A Firstmate outside Herdr cannot resolve a launcher workspace, so a colliding home label refuses new spawns until the collision is cleared.
 - Ghost and placeholder recognition depends on ANSI de-emphasis and fails safely to pending when unavailable.
 - Mid-session secondmate liveness is not implemented beyond a remote second mate's reply-relay recheck.
-- OpenCode 1.18.4 can accept Enter while busy without clearing the composer.
-  The tmux backend has a busy-queue fallback, but Herdr still reports this case as submit pending and needs a separate adapter fix.
+- Only `fm-send` accepts a busy-queued Enter; the away-mode supervisor still treats `queued` as unconfirmed.
+  A remote second mate's host proves the queue from native `working` state alone, because the host-side send has no task record to read semantic busy state from.
 - Only tmux and Herdr can host the away-mode supervisor terminal.
 
 ## Regression entry points
 
 ```sh
 tests/fm-backend-herdr.test.sh
+tests/fm-herdr-submit-busy.test.sh
 tests/fm-backend-herdr-smoke.test.sh
 tests/fm-backend-herdr-prune-safety-e2e.test.sh
 tests/fm-backend-herdr-respawn-idem-e2e.test.sh
