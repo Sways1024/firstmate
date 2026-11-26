@@ -50,7 +50,7 @@ Two rules the commands cannot enforce for you:
   ```
   Here `<secondmate-id>` is the `<source-id>` with its `remote-reply-` prefix removed.
   The runner normally applies the result on capture, and a clean apply usually arrives with no `remote-reply` wake at all: it reaches you once, as the second mate's own status wake, so read that status log exactly as you would a local second mate's.
-  When a `remote-reply` wake does arrive - an apply that did not complete cleanly, away mode, or a capture surfaced while it was still being applied - this call is the required idempotent confirmation.
+  When a `remote-reply` wake does arrive - for example after an apply that did not complete cleanly, in away mode, or for a capture surfaced while it was still being applied - this call is the required idempotent confirmation.
   Never acknowledge a `remote-reply` wake through the generic command, because only the adapter ingests the delta, acknowledges it, and re-arms its source.
   Use the generic path below only after fully handling a result whose adapter has no applying command.
   [`docs/configuration.md`](../../../docs/configuration.md#process-to-event-sources-stateprocevent) owns the automatic-application contract and its failure boundary.
