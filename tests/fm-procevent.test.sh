@@ -317,6 +317,64 @@ private_mode=$(PATH="${FM_TEST_BASE_PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" bash -
 assert_contains "$private_mode" 600 "the handled marker is private under a permissive caller umask"
 pass "handled acknowledgement creation is private and fails safely"
 
+# --- announced via a status log: a record read only with the acknowledgement -
+# An adapter that applies a result as new lines in one of this home's status
+# logs records that through `via-status` before `handled`. The record is
+# validated, private, and inert on its own: re-announcement still stops only on
+# the handled acknowledgement, whose handled/already-handled report is unchanged.
+via_status_of() {  # <home> <source-id> <sequence>
+  FM_HOME="$1" PATH="${FM_TEST_BASE_PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" bash -c \
+    '. "$1/bin/fm-pr-lib.sh"; . "$1/bin/fm-wake-lib.sh"; . "$1/bin/fm-procevent-lib.sh"; fm_procevent_via_status "$2/state" "$3" "$4"' \
+    _ "$ROOT" "$1" "$2" "$3"
+}
+HVIA="$TMP_ROOT/hvia"; new_home "$HVIA"
+via_status=0
+via_out=$(pe "$HVIA" via-status via-src 1 mate.status 2>&1) || via_status=$?
+[ "$via_status" -ne 0 ] || fail "via-status accepted a generation that has not been captured"
+assert_absent "$HVIA/state/procevent-inbox/via-src.1.via-status" "a premature status-log record was written"
+mkdir -p "$HVIA/state/procevent-inbox"
+printf 'applied result\n' > "$HVIA/state/procevent-inbox/via-src.1.result"
+printf 'lavish\n' > "$HVIA/state/procevent-inbox/via-src.1.adapter"
+chmod 0600 "$HVIA/state/procevent-inbox/via-src.1.result" "$HVIA/state/procevent-inbox/via-src.1.adapter"
+via_status=0
+via_out=$(pe "$HVIA" via-status via-src 1 mate.status 2>&1) || via_status=$?
+[ "$via_status" -ne 0 ] || fail "via-status named a status log that does not exist"
+printf 'done: applied\n' > "$HVIA/state/mate.status"
+for bad in ../mate.status mate .mate.status a/b.status 'mate status.status'; do
+  via_status=0
+  pe "$HVIA" via-status via-src 1 "$bad" >/dev/null 2>&1 || via_status=$?
+  [ "$via_status" -ne 0 ] || fail "via-status accepted an unsafe status log name: $bad"
+done
+printf 'decoy\n' > "$TMP_ROOT/via-decoy.status"
+ln -s "$TMP_ROOT/via-decoy.status" "$HVIA/state/linked.status"
+via_status=0
+pe "$HVIA" via-status via-src 1 linked.status >/dev/null 2>&1 || via_status=$?
+[ "$via_status" -ne 0 ] || fail "via-status accepted a symlinked status log"
+assert_absent "$HVIA/state/procevent-inbox/via-src.1.via-status" "a refused status-log record was written"
+via_out=$(umask 000; pe "$HVIA" via-status via-src 1 mate.status)
+assert_contains "$via_out" "via-status: via-src 1 mate.status" "a valid status-log record was not recorded"
+[ "$(cat "$HVIA/state/procevent-inbox/via-src.1.via-status")" = mate.status ] \
+  || fail "the status-log record does not name exactly the status log"
+via_mode=$(PATH="${FM_TEST_BASE_PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" bash -c \
+  '. "$1/bin/fm-pr-lib.sh"; fm_pr_file_mode "$2"' _ "$ROOT" "$HVIA/state/procevent-inbox/via-src.1.via-status")
+assert_contains "$via_mode" 600 "the status-log record is private under a permissive caller umask"
+[ -z "$(via_status_of "$HVIA" via-src 1)" ] \
+  || fail "a status-log record was readable before the result was acknowledged"
+out=$(pe "$HVIA" reconcile)
+assert_contains "$out" "published=1" "a status-log record stopped re-announcement of an unacknowledged result"
+ack_out=$(pe "$HVIA" handled via-src 1)
+assert_contains "$ack_out" "handled: via-src 1" "a status-log record changed the first acknowledgement"
+repeat_out=$(pe "$HVIA" handled via-src 1)
+assert_contains "$repeat_out" "already-handled: via-src 1" "a status-log record changed the repeat acknowledgement"
+[ "$(via_status_of "$HVIA" via-src 1)" = mate.status ] \
+  || fail "an acknowledged result's status-log record was not readable"
+out=$(pe "$HVIA" reconcile)
+assert_contains "$out" "published=0" "an acknowledged result with a status-log record was announced again"
+rm -f "$HVIA/state/mate.status"
+[ -z "$(via_status_of "$HVIA" via-src 1)" ] \
+  || fail "a status-log record naming a vanished status log was trusted"
+pass "the status-log record is validated, private, read only with the acknowledgement, and leaves handled unchanged"
+
 # --- a terminal result retires its source, on the adapter's verdict alone ----
 # The runner must carry no notion of its own about what "done" means for a
 # source. It asks that source's adapter whether the captured result ends the

@@ -21,8 +21,18 @@
 # canonical source id instead of the secondmate id and is called by the runner
 # right after capture, so applying a reply never depends on a handler
 # remembering to run it. Ingesting a delta carries no judgement, so it belongs
-# in code. The published wake still reaches firstmate, and running `handle`
-# again on that wake is idempotent.
+# in code. Running `handle` again on a published wake is idempotent.
+#
+# A clean automatic apply - a delta that ingested whole, added at least one new
+# line to the parent's state/<id>.status, and fetched every referenced
+# document - is recorded as announced via that status log through
+# `fm-procevent.sh via-status`, just before the handled acknowledgement. That
+# status log is what a local second mate writes and what the watcher already
+# reports, so the watcher folds this result's process-event wake into the
+# status wake and firstmate is woken once per update (bin/fm-watch.sh). Every
+# other outcome - a continuity break, an undelivered document, a failed apply,
+# a delta that added no new line, or an apply by `handle` rather than by the
+# runner - records nothing and is announced exactly as before.
 #
 # This channel is a status-stream MIRROR, not a correlated-reply channel. A local
 # secondmate appends its whole status stream straight into the parent's
@@ -106,7 +116,7 @@ DOCUMENT_LOCAL_FAILURE=2
 . "$SCRIPT_DIR/fm-pending-reply-lib.sh"
 
 die() { printf 'error: %s\n' "$1" >&2; exit 1; }
-usage() { sed -n '2,82p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,92p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
 sha256_file() {
   if command -v shasum >/dev/null 2>&1; then
@@ -477,6 +487,8 @@ cmd_ingest() {
   local id=${1:-} result=${2:-} seq=${3:-} class blank payload normalized_payload schema status path from to from_hash to_hash payload_hash payload_bytes reason
   local actual_bytes actual_hash line doc local_doc rewritten appended=0 cursor_already=0 lock status_file tmp
   local fetch_rc append_rc undelivered=''
+  INGEST_APPENDED=0
+  INGEST_UNDELIVERED=
   validate_id "$id"
   [ -f "$result" ] && [ ! -L "$result" ] || die "result file is unavailable or unsafe: $result"
   class=$(classify_result "$result")
@@ -576,11 +588,13 @@ cmd_ingest() {
   fm_lock_release "$lock"
   trap - EXIT
   rm -rf -- "$tmp"
+  INGEST_APPENDED=$appended
+  INGEST_UNDELIVERED=$undelivered
   printf 'ingested: %s appended=%s offset=%s\n' "$id" "$appended" "$to"
 }
 
 cmd_handle_locked() {
-  local id=${1:-} seq=${2:-} result=${3:-} sid class rc=0 to
+  local id=${1:-} seq=${2:-} result=${3:-} sid class rc=0 to announced=0
   validate_id "$id"
   case "$seq" in ''|*[!0-9]*) die "sequence must be a nonnegative integer" ;; esac
   sid=$(source_id "$id")
@@ -591,12 +605,23 @@ cmd_handle_locked() {
     printf 'ingested: %s appended=0 offset=%s\n' "$id" "$to"
   else
     cmd_ingest "$id" "$result" "$seq" || rc=$?
+    # Only a clean delta that put at least one new line into the parent status
+    # log is announced by that log alone; see the header.
+    if [ "$rc" -eq 0 ] && [ "$class" = delta ] && [ "${INGEST_APPENDED:-0}" -gt 0 ] \
+      && [ -z "${INGEST_UNDELIVERED:-}" ]; then
+      announced=1
+    fi
   fi
   if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
     return "$rc"
   fi
   if [ "$class" = delta ]; then
     cmd_arm_locked "$id" || return 1
+  fi
+  # Strictly before the acknowledgement, and best-effort: without the record
+  # the result is simply announced as before.
+  if [ "${REMOTE_REPLY_AUTOHANDLE:-0}" = 1 ] && [ "$announced" -eq 1 ]; then
+    "$SCRIPT_DIR/fm-procevent.sh" via-status "$sid" "$seq" "$id.status" >/dev/null || true
   fi
   "$SCRIPT_DIR/fm-procevent.sh" handled "$sid" "$seq" || return 1
   return "$rc"
@@ -613,7 +638,7 @@ cmd_autohandle() {
   esac
   validate_id "$id"
   [ "$(source_id "$id")" = "$sid" ] || die "source id does not identify one secondmate: $sid"
-  cmd_handle "$id" "$seq" "$result" || rc=$?
+  REMOTE_REPLY_AUTOHANDLE=1 cmd_handle "$id" "$seq" "$result" || rc=$?
   [ "$rc" -eq 3 ] && rc=0
   return "$rc"
 }
@@ -635,7 +660,7 @@ retirement_capture_scan() {
   inbox="$STATE/procevent-inbox"
   [ -e "$inbox" ] || return 1
   [ -d "$inbox" ] && [ ! -L "$inbox" ] || die "remote reply inbox is unsafe"
-  for path in "$inbox/$sid".*.result "$inbox/$sid".*.adapter "$inbox/$sid".*.handled; do
+  for path in "$inbox/$sid".*.result "$inbox/$sid".*.adapter "$inbox/$sid".*.handled "$inbox/$sid".*.via-status; do
     [ -e "$path" ] || [ -L "$path" ] || continue
     [ -f "$path" ] && [ ! -L "$path" ] || die "remote reply capture is unsafe: $path"
   done
@@ -677,7 +702,7 @@ cmd_retire_finalize_locked() {
       die "remote reply retirement refused with $RETIREMENT_PENDING unhandled captured result(s)"
     fi
     if [ "$force" = --force ]; then
-      for path in "$RETIREMENT_INBOX/$sid".*.result "$RETIREMENT_INBOX/$sid".*.adapter "$RETIREMENT_INBOX/$sid".*.handled; do
+      for path in "$RETIREMENT_INBOX/$sid".*.result "$RETIREMENT_INBOX/$sid".*.adapter "$RETIREMENT_INBOX/$sid".*.handled "$RETIREMENT_INBOX/$sid".*.via-status; do
         [ -e "$path" ] || continue
         rm -f -- "$path" || die "cannot discard remote reply capture: $path"
       done

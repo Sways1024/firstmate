@@ -568,6 +568,32 @@ fm_wake_queued_keys_locked() {
     "$FM_WAKE_QUEUE" 2>/dev/null || true
 }
 
+# fm_wake_withdraw_locked <kind> <key>
+# Remove every queued record for exactly <kind> and <key>, keeping all other
+# records byte-for-byte and in order. The caller holds FM_WAKE_QUEUE_LOCK and
+# calls this only after another delivered wake has already carried what those
+# records announced, so no drain can see a half-written queue and nothing the
+# records said is lost. 0 on success or nothing to remove, 1 on failure, which
+# leaves the queue unchanged.
+fm_wake_withdraw_locked() {
+  local kind=$1 key=$2 tmp
+  case "$kind" in
+    signal|stale|check|heartbeat) ;;
+    *) printf 'fm_wake_withdraw_locked: invalid wake kind: %s\n' "$kind" >&2; return 1 ;;
+  esac
+  [ -s "$FM_WAKE_QUEUE" ] || return 0
+  tmp="$FM_WAKE_QUEUE.withdraw.$(fm_current_pid)"
+  if ! awk -F '\t' -v kind="$kind" -v key="$key" '!(NF >= 5 && $3 == kind && $4 == key)' \
+    "$FM_WAKE_QUEUE" > "$tmp"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  if ! mv -f -- "$tmp" "$FM_WAKE_QUEUE"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+
 fm_wake_restore_queue() {
   local drained=$1 restore
   restore="$STATE/.wake-queue.restore.$(fm_current_pid)"

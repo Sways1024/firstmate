@@ -23,6 +23,10 @@ cleanup() {
   local worker_pid=''
   FM_HOME="$PARENT" FM_PROCEVENT_CLAIM_ROOT="$CLAIMS" \
     "$ROOT/bin/fm-procevent.sh" sweep-home >/dev/null 2>&1 || true
+  if [ -d "$TMP_ROOT/e2e/parent" ]; then
+    FM_HOME="$TMP_ROOT/e2e/parent" FM_PROCEVENT_CLAIM_ROOT="$TMP_ROOT/e2e/claims" \
+      "$ROOT/bin/fm-procevent.sh" sweep-home >/dev/null 2>&1 || true
+  fi
   if [ -f "$TMP_ROOT/remote-jobs/worker.pid" ]; then
     worker_pid=$(cat "$TMP_ROOT/remote-jobs/worker.pid")
     fm_remote_job_stop_worker_tree "$worker_pid" || true
@@ -121,7 +125,9 @@ assert_present "$PARENT/state/procevent-inbox/$SID.1.handled" \
   "the applied capture was left unacknowledged"
 assert_present "$PARENT/state/procevent/$SID.source" \
   "applying the capture left the relay unarmed for the next delta"
-pass "a captured delta is applied, acknowledged, and re-armed without a handler"
+[ "$(cat "$PARENT/state/procevent-inbox/$SID.1.via-status" 2>/dev/null)" = ios.status ] \
+  || fail "a clean automatic apply was not recorded as announced via the parent status log"
+pass "a captured delta is applied, acknowledged, re-armed, and recorded as announced via its status log"
 
 # Now the handler's own retry path, from the state a crash between applying and
 # acknowledging leaves behind: the acknowledgement is gone and re-arming fails.
@@ -304,6 +310,8 @@ remote_env "$ROOT/bin/fm-procevent.sh" start "$SID" >/dev/null 2>&1 \
 RESULT_EIGHT="$PARENT/state/procevent-inbox/$SID.8.result"
 assert_absent "$PARENT/state/procevent-inbox/$SID.8.handled" \
   "a capture whose automatic application failed was acknowledged anyway"
+assert_absent "$PARENT/state/procevent-inbox/$SID.8.via-status" \
+  "a capture whose automatic application failed was recorded as announced via the status log"
 retry_cursor_before=$(cat "$PARENT/state/remote-replies/ios.cursor")
 set +e
 remote_env "$ADAPTER" handle ios 8 "$RESULT_EIGHT" > "$TMP_ROOT/handle-local-document-failure.out" 2>&1
@@ -323,6 +331,8 @@ remote_env "$ADAPTER" handle ios 8 "$RESULT_EIGHT" >/dev/null \
   || fail "the document delta did not succeed after local storage recovered"
 assert_grep 'data/remote-secondmates/ios/data/reply/retry.md' "$PARENT/state/ios.status" \
   "the retried document pointer was not rewritten locally"
+assert_absent "$PARENT/state/procevent-inbox/$SID.8.via-status" \
+  "the handler's own apply recorded the result as announced via the status log"
 cmp -s "$REMOTE/data/reply/retry.md" "$retry_destination" \
   || fail "the retried remote document was not copied byte-identically"
 retry_offset=$(LC_ALL=C wc -c < "$REMOTE/state/parent-replies.status" | tr -d ' ')
@@ -403,6 +413,8 @@ set -e
 [ "$handle_rc" -eq 3 ] || fail "continuity handling returned an unexpected status: $handle_rc"
 assert_grep 'blocked [key=remote-reply-continuity-ios]' "$PARENT/state/ios.status" "continuity break did not escalate"
 assert_absent "$PARENT/state/procevent/$SID.source" "continuity break was re-armed without an operator rebase"
+assert_absent "$PARENT/state/procevent-inbox/$SID.11.via-status" \
+  "a continuity break was recorded as announced via the status log"
 remote_env "$ADAPTER" ingest ios "$RESULT_ELEVEN" >/dev/null 2>&1 || true
 [ "$(grep -cF 'blocked [key=remote-reply-continuity-ios]' "$PARENT/state/ios.status")" -eq 1 ] \
   || fail "continuity replay duplicated the escalation"
@@ -832,5 +844,160 @@ LIVE_INTERVAL=0 live_source
 [ "$(state_probes)" -eq 0 ] || fail "the healthy-link check probed a second mate with no launched endpoint record"
 mv "$LHOME/state/ios.meta.saved" "$LHOME/state/ios.meta"
 pass "the healthy-link check keeps the session-start sweep's launched-record scope"
+
+# --- one wake per update ----------------------------------------------------
+# End to end through the real runner, adapter, fake SSH, and watcher: a clean
+# delta reaches firstmate as exactly one wake - the second mate's own status
+# wake, as a local second mate's would - while a continuity break, a remote
+# document that could not be fetched, and a delta that added no new line still
+# arrive as their own process-event wake carrying the result's identity.
+E2E="$TMP_ROOT/e2e"
+EP="$E2E/parent"
+ER="$E2E/remote"
+ECLAIMS="$E2E/claims"
+mkdir -p "$EP/data" "$EP/state" "$ER/state" "$ER/data/reply" "$ECLAIMS"
+cat > "$EP/data/secondmates.md" <<EOF
+- mac - Mac delivery (host: remote-mac; root: $ROOT; home: $ER; scope: Mac work; projects: alpha; added 2026-11-26)
+EOF
+: > "$ER/state/parent-replies.status"
+e2e_env() {
+  FM_HOME="$EP" \
+  FM_ROOT_OVERRIDE="$ROOT" \
+  FM_PROCEVENT_CLAIM_ROOT="$ECLAIMS" \
+  FM_SSH_BIN="$FAKEBIN/fake-ssh" \
+  FM_FAKE_REMOTE_ENTRYPOINT="$ROOT/bin/fm-remote-entrypoint.sh" \
+  FM_REMOTE_JOB_PLATFORM_OVERRIDE=Linux \
+  FM_REMOTE_JOB_STATE_ROOT="$TMP_ROOT/remote-jobs" \
+  FM_REMOTE_REPLY_WAIT_SECONDS=10 \
+  "$@"
+}
+ESID=$(e2e_env "$ADAPTER" source-id mac)
+# Start the watcher itself as the background job, never a wrapper around it, so
+# its pid is the one these helpers wait on and stop.
+e2e_watch_start() {  # <out>; sets E2E_WATCH_PID
+  FM_HOME="$EP" FM_ROOT_OVERRIDE="$ROOT" FM_PROCEVENT_CLAIM_ROOT="$ECLAIMS" \
+    FM_SSH_BIN="$FAKEBIN/fake-ssh" FM_FAKE_REMOTE_ENTRYPOINT="$ROOT/bin/fm-remote-entrypoint.sh" \
+    FM_REMOTE_JOB_PLATFORM_OVERRIDE=Linux FM_REMOTE_JOB_STATE_ROOT="$TMP_ROOT/remote-jobs" \
+    FM_REMOTE_REPLY_WAIT_SECONDS=10 \
+    FM_POLL=0.2 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
+    "$ROOT/bin/fm-watch.sh" > "$1" 2>/dev/null &
+  E2E_WATCH_PID=$!
+}
+e2e_watch_stop() {
+  kill "$E2E_WATCH_PID" 2>/dev/null || true
+  wait "$E2E_WATCH_PID" 2>/dev/null || true
+}
+# One watcher cycle; it must exit on its own with one wake.
+e2e_watch_once() {  # <out>
+  local i=0
+  e2e_watch_start "$1"
+  while kill -0 "$E2E_WATCH_PID" 2>/dev/null && [ "$i" -lt 200 ]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if kill -0 "$E2E_WATCH_PID" 2>/dev/null; then
+    e2e_watch_stop
+    return 1
+  fi
+  wait "$E2E_WATCH_PID"
+}
+# A watcher that must stay quiet for <ticks> tenths of a second.
+e2e_watch_quiet() {  # <out> <ticks>
+  local i=0
+  e2e_watch_start "$1"
+  while [ "$i" -lt "$2" ]; do
+    kill -0 "$E2E_WATCH_PID" 2>/dev/null || { wait "$E2E_WATCH_PID" 2>/dev/null; return 1; }
+    sleep 0.1
+    i=$((i + 1))
+  done
+  e2e_watch_stop
+  kill -0 "$E2E_WATCH_PID" 2>/dev/null && fail "the quiet watcher outlived its stop"
+  return 0
+}
+# Stop any runner a watcher's reconcile started, so the next remote append is
+# captured exactly once, by e2e_capture.
+e2e_quiesce() { e2e_env "$ROOT/bin/fm-procevent.sh" retire "$ESID" >/dev/null 2>&1 || true; }
+e2e_capture() {
+  e2e_env "$ADAPTER" arm mac >/dev/null || return 1
+  e2e_env "$ROOT/bin/fm-procevent.sh" start "$ESID" >/dev/null 2>&1
+}
+e2e_drain() { e2e_env "$ROOT/bin/fm-wake-drain.sh" 2>/dev/null; }
+
+{
+  printf 'needs-decision [key=mac-signing]: approve the signing identity\n'
+  printf 'working: notarizing the build\n'
+} >> "$ER/state/parent-replies.status"
+e2e_capture || fail "the clean delta was not captured"
+assert_present "$EP/state/procevent-inbox/$ESID.1.handled" "the clean delta was not applied at capture"
+assert_grep "procevent remote-reply $ESID 1" "$EP/state/.wake-queue" \
+  "the runner no longer published the clean delta's own wake at capture"
+e2e_watch_once "$E2E/watch-clean.out" || fail "the clean delta never woke firstmate: $(cat "$E2E/watch-clean.out")"
+[ "$(cat "$E2E/watch-clean.out")" = "signal: $EP/state/mac.status" ] \
+  || fail "a clean remote update did not arrive as exactly one status wake: $(cat "$E2E/watch-clean.out")"
+e2e_drain > "$E2E/drain-clean.out"
+assert_no_grep "procevent:$ESID:1" "$E2E/drain-clean.out" "the clean delta's process-event wake still reached firstmate"
+assert_grep 'OPEN DECISIONS' "$E2E/drain-clean.out" "the buried remote decision was not listed by the wake that carried it"
+assert_grep '[key=mac-signing] needs-decision: approve the signing identity' "$E2E/drain-clean.out" \
+  "the remote decision above a later progress line was not readable from the wake"
+assert_grep 'working: notarizing the build' "$EP/state/mac.status" "the mirrored lines are not in the status log the wake names"
+e2e_watch_quiet "$E2E/watch-clean-again.out" 30 \
+  || fail "the clean delta woke firstmate a second time: $(cat "$E2E/watch-clean-again.out")"
+pass "a clean remote update wakes firstmate once, as the second mate's status wake, with every line readable"
+
+e2e_quiesce
+printf 'done [key=missing-doc]: see data/reply/missing.md\n' >> "$ER/state/parent-replies.status"
+e2e_capture || fail "the delta with an unfetchable document was not captured"
+assert_grep 'blocked [key=remote-reply-document-mac]' "$EP/state/mac.status" \
+  "the unfetchable document was not escalated"
+assert_absent "$EP/state/procevent-inbox/$ESID.2.via-status" \
+  "a delta with an unfetchable document was recorded as announced via the status log"
+e2e_watch_once "$E2E/watch-doc.out" || fail "the unfetchable document never woke firstmate"
+[ "$(cat "$E2E/watch-doc.out")" = "check: process-event result captured: procevent:$ESID:2" ] \
+  || fail "an unfetchable document did not wake firstmate with the result's identity: $(cat "$E2E/watch-doc.out")"
+e2e_drain >/dev/null
+pass "a remote document that could not be fetched still wakes firstmate with the result's identity"
+
+# The status wake for that escalation follows, as before; settle it so the
+# next case starts from a quiet watcher.
+e2e_watch_once "$E2E/watch-doc-status.out" || fail "the document escalation never woke firstmate"
+e2e_drain >/dev/null
+
+e2e_quiesce
+printf 'needs-decision [key=mac-signing]: approve the signing identity\n' >> "$ER/state/parent-replies.status"
+e2e_capture || fail "the delta that repeats an existing line was not captured"
+assert_present "$EP/state/procevent-inbox/$ESID.3.handled" "the repeating delta was not applied at capture"
+assert_absent "$EP/state/procevent-inbox/$ESID.3.via-status" \
+  "a delta that added no new line was recorded as announced via the status log"
+e2e_watch_once "$E2E/watch-dup.out" || fail "a delta that added no new line never woke firstmate"
+[ "$(cat "$E2E/watch-dup.out")" = "check: process-event result captured: procevent:$ESID:3" ] \
+  || fail "a delta that added no new line did not keep its own wake: $(cat "$E2E/watch-dup.out")"
+e2e_drain >/dev/null
+pass "a delta that added no new status line keeps its own process-event wake"
+
+# Output the runner bounds is truncated before capture, so its committed payload
+# digest no longer matches and the adapter refuses to apply it.
+e2e_quiesce
+printf 'done [key=oversized]: %s\n' "$(printf 'x%.0s' $(seq 1 400))" >> "$ER/state/parent-replies.status"
+FM_PROCEVENT_MAX_OUTPUT_BYTES=420 e2e_capture || fail "the oversized delta was not captured"
+assert_absent "$EP/state/procevent-inbox/$ESID.4.handled" "a bounded, truncated capture was acknowledged"
+assert_absent "$EP/state/procevent-inbox/$ESID.4.via-status" \
+  "a bounded, truncated capture was recorded as announced via the status log"
+assert_no_grep 'done [key=oversized]' "$EP/state/mac.status" "a truncated capture was mirrored into the status log"
+e2e_watch_once "$E2E/watch-oversized.out" || fail "the bounded oversized output never woke firstmate"
+[ "$(cat "$E2E/watch-oversized.out")" = "check: process-event result captured: procevent:$ESID:4" ] \
+  || fail "bounded oversized output did not wake firstmate with the result's identity: $(cat "$E2E/watch-oversized.out")"
+e2e_drain >/dev/null
+pass "bounded oversized output still wakes firstmate with the result's identity"
+
+e2e_quiesce
+printf 'failed: the remote log was replaced\n' > "$ER/state/parent-replies.status"
+e2e_capture || fail "the continuity break was not captured"
+assert_grep 'blocked [key=remote-reply-continuity-mac]' "$EP/state/mac.status" "the continuity break was not escalated"
+assert_absent "$EP/state/procevent-inbox/$ESID.5.via-status" \
+  "a continuity break was recorded as announced via the status log"
+e2e_watch_once "$E2E/watch-continuity.out" || fail "the continuity break never woke firstmate"
+[ "$(cat "$E2E/watch-continuity.out")" = "check: process-event result captured: procevent:$ESID:5" ] \
+  || fail "a continuity break did not wake firstmate with the result's identity: $(cat "$E2E/watch-continuity.out")"
+pass "a continuity break still wakes firstmate with the result's identity"
 
 echo "ALL TESTS PASSED"

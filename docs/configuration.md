@@ -443,6 +443,11 @@ Registration writes one private record under `state/procevent/`, and a completed
 Results are published as ordinary `check` wakes carrying the source id and committed result sequence through the existing durable wake queue, so the runner adds no second notification control plane.
 The watcher delivers a queued result on its ordinary cycle by reporting it as an actionable `check` wake, so a captured result reaches firstmate through the same rewake path every other wake uses and never waits for a manual drain.
 Delivery is reported at most once per captured source and sequence while any records for that key remain queued.
+A result its adapter already applied as new lines in one of this home's status logs, recorded with `bin/fm-procevent.sh via-status`, and then acknowledged is instead folded into that status log's own wake, so firstmate is woken once rather than twice for one update.
+The watcher folds such a result only while away mode is off and no away-mode daemon lock exists, and only when that status log has a change the watcher has not reported yet, so the status wake it delivers covers the applied lines.
+That status wake is always actionable, as the `check` wake it replaces was, and only after its output succeeds are the folded records marked surfaced and withdrawn from the durable queue.
+A result that is unacknowledged, carries no such record, or misses any other condition above is surfaced as its own `check` wake exactly as before, together with any other result queued beside it; in away mode the daemon keeps receiving every `check` wake because its status triage reads only a log's last line.
+The runner still publishes each capture's own wake before applying it, so a watcher cycle that reaches the queue during that short apply surfaces the wake as before and the status wake follows separately.
 A durable handled acknowledgement stops future re-announcement, while a record already queued remains under the durable queue's authority until the ordinary drain consumes it.
 
 Discovery is never a timer.
@@ -459,7 +464,9 @@ Applying a captured result is adapter knowledge too, and some results carry no j
 Leaving that to a handler means it can silently not happen, so immediately after the terminal check above the runner calls `bin/fm-procevent-<adapter>.sh autohandle <source-id> <sequence> <result-file>` only when this capture's own wake was successfully appended to the durable queue, then lets the adapter apply and acknowledge its own result.
 That call runs strictly after terminal retirement, because a handling adapter re-arms its own next source and retiring afterwards would drop that fresh registration and leave the source silently dead.
 Failed publication skips the call, and exit 0 means the adapter fully applied and acknowledged the result; failed publication, a missing command, an error, or any other exit is not a capture failure but leaves the result unacknowledged and therefore still eligible for re-announcement, so a handler receives it exactly as before and an adapter with no such command needs no change.
-The remote-secondmate reply adapter implements it, so a captured reply reaches its local status mirror and settles its correlated pending-reply expectation without any handler step; the published wake still reaches firstmate, and handling that wake through the adapter again is idempotent.
+The remote-secondmate reply adapter implements it, so a captured reply reaches its local status mirror and settles its correlated pending-reply expectation without any handler step.
+Only for a clean apply - a delta that added at least one new line to the second mate's `state/<id>.status` and fetched every referenced document - does it record the result as announced via that status log, so the reply reaches firstmate once, as the second mate's own status wake, exactly as a local second mate's would.
+A continuity break, a document that could not be fetched, a failed apply, a delta that added no new line, and an apply by `handle` rather than by the runner record nothing, so they keep their published wake, and handling that wake through the adapter again is idempotent.
 
 Ownership is machine-wide per canonical source, because separate homes can share one underlying source store.
 Claims live under `$XDG_STATE_HOME/firstmate/procevent-claims` (override with `FM_PROCEVENT_CLAIM_ROOT`).
@@ -483,6 +490,7 @@ To recover, restore that home's tracked `bin/fm-procevent.sh`, run `FM_HOME=<hom
 
 The runner proves exactly one durability boundary: output that reached the runner is stored at mode `0600` before any event referencing it is published, and a captured result with no durable handled acknowledgement remains eligible for bounded re-announcement across any number of drains and restarts, not only the crash window right after capture.
 `bin/fm-procevent.sh handled <source-id> <sequence>` is the only thing that stops re-announcement: a generation-keyed, private, path-safe, durable, and idempotent acknowledgement that atomically checks and deduplicates by the exact source and sequence, so a paired effect gated on its first-time-vs-repeat report is never authorized twice.
+The `via-status` record is read only together with that acknowledgement, so it never stops re-announcement on its own.
 Wake publication itself is still best-effort, so the same source and sequence can repeat even before any restart; handlers deduplicate that identity rather than assuming a wake is unique.
 The runner proves nothing about the source side, and the handled acknowledgement proves nothing about a paired external effect performed before it: a crash between that effect and the acknowledgement call can still repeat the effect on replay, so this is never a generic exactly-once guarantee.
 The published `lavish-axi poll` clears feedback destructively before returning it, so a result lost between that clearing and the runner reading process output is unrecoverable.

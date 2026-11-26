@@ -49,7 +49,8 @@ Two rules the commands cannot enforce for you:
   bin/fm-procevent-remote-reply.sh handle <secondmate-id> <sequence> <result-file>
   ```
   Here `<secondmate-id>` is the `<source-id>` with its `remote-reply-` prefix removed.
-  The runner normally applies the result on capture, but this call is the required idempotent confirmation when the wake remains unacknowledged.
+  The runner normally applies the result on capture, and a clean apply usually arrives with no `remote-reply` wake at all: it reaches you once, as the second mate's own status wake, so read that status log exactly as you would a local second mate's.
+  When a `remote-reply` wake does arrive - an apply that did not complete cleanly, away mode, or a capture surfaced while it was still being applied - this call is the required idempotent confirmation.
   Never acknowledge a `remote-reply` wake through the generic command, because only the adapter ingests the delta, acknowledges it, and re-arms its source.
   Use the generic path below only after fully handling a result whose adapter has no applying command.
   [`docs/configuration.md`](../../../docs/configuration.md#process-to-event-sources-stateprocevent) owns the automatic-application contract and its failure boundary.
@@ -69,7 +70,7 @@ Supported by tests:
 
 - output that reached the runner is stored atomically at mode `0600` **before** any event referencing it is published;
 - the remote-reply adapter reads its append-only source non-destructively from an offset plus prefix hash, so a pre-capture retry can derive the same bytes again, while source truncation or replacement is detected rather than silently rebased;
-- proactive delivery, adapter-owned terminal retirement, and adapter-owned automatic application follow the operating contract in [`docs/configuration.md`](../../../docs/configuration.md);
+- proactive delivery, its fold of a cleanly applied result into that result's status wake, adapter-owned terminal retirement, and adapter-owned automatic application follow the operating contract in [`docs/configuration.md`](../../../docs/configuration.md);
 - a durably captured result with no handled acknowledgement remains eligible for bounded re-announcement across any number of drains and restarts, and repeat wakes retain the same source and sequence for deduplication;
 - the handled acknowledgement is generation-keyed to the exact source and sequence, private, path-safe, durable, and idempotent, and is the only thing that stops re-announcement;
 - one identity-matched owner per canonical source, across homes that share one underlying source store;

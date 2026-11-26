@@ -386,6 +386,82 @@ fm_procevent_mark_handled() {
   return 2
 }
 
+# --- announced via a status log ---------------------------------------------
+# Some adapters apply a captured result by appending lines to one of this
+# home's own status logs, which the watcher's ordinary status scan already
+# reports to firstmate. For such a result the published process-event wake
+# says nothing the status wake does not, so the adapter may record that the
+# generation was announced via that status log: "this generation's whole
+# effect is new lines in state/<name>.status". The watcher alone decides
+# whether to fold the process-event wake into that status wake (bin/fm-watch.sh,
+# procevent_fold_status); this library only stores and validates the record.
+# The record never stops re-announcement and never stands in for the handled
+# acknowledgement: it is read only together with that acknowledgement, so a
+# result that is not acknowledged is always announced as before.
+
+# fm_procevent_via_status_path <state> <source-id> <sequence>
+fm_procevent_via_status_path() {
+  printf '%s/%s.%s.via-status\n' "$(fm_procevent_inbox_dir "$1")" "$2" "$3"
+}
+
+# The record names a status log by its bare file name inside the home's state
+# directory, held to the same shape as a status wake key.
+fm_procevent_status_name_valid() {
+  local name=${1-} id
+  case "$name" in *.status) ;; *) return 1 ;; esac
+  id=${name%.status}
+  fm_task_id_path_safe "$id" || return 1
+  [ "${#id}" -le 64 ]
+}
+
+# fm_procevent_record_via_status <state> <source-id> <sequence> <status-name>
+# Atomically record the status log one captured generation was announced via,
+# private at mode 0600. The result, its adapter record, and the named status
+# log must already exist. 0 = recorded, 2 = error.
+fm_procevent_record_via_status() {
+  local state=$1 id=$2 seq=$3 name=$4 inbox result adapter_file status dest tmp
+  fm_procevent_source_id_valid "$id" || return 2
+  case "$seq" in ''|*[!0-9]*) return 2 ;; esac
+  fm_procevent_status_name_valid "$name" || return 2
+  inbox=$(fm_procevent_inbox_dir "$state")
+  result="$inbox/$id.$seq.result"
+  adapter_file="$inbox/$id.$seq.adapter"
+  [ -f "$result" ] && [ ! -L "$result" ] || return 2
+  [ -f "$adapter_file" ] && [ ! -L "$adapter_file" ] || return 2
+  status="$state/$name"
+  [ -f "$status" ] && [ ! -L "$status" ] || return 2
+  dest=$(fm_procevent_via_status_path "$state" "$id" "$seq")
+  [ ! -L "$dest" ] || return 2
+  tmp=$(umask 077; mktemp "$inbox/.via-status.XXXXXX") || return 2
+  if printf '%s\n' "$name" > "$tmp" && chmod 0600 "$tmp" && mv -f -- "$tmp" "$dest"; then
+    return 0
+  fi
+  rm -f -- "$tmp"
+  return 2
+}
+
+# fm_procevent_via_status <state> <source-id> <sequence>
+# Print the status log name a generation was announced via, only when that
+# generation is durably acknowledged, its record is safe and well formed, and
+# the named status log is a regular file. Any other case returns 1 and prints
+# nothing, which always means "announce it as before".
+fm_procevent_via_status() {
+  local state=$1 id=$2 seq=$3 record name extra status
+  fm_procevent_source_id_valid "$id" || return 1
+  case "$seq" in ''|*[!0-9]*) return 1 ;; esac
+  fm_procevent_is_handled "$state" "$id" "$seq" || return 1
+  record=$(fm_procevent_via_status_path "$state" "$id" "$seq")
+  [ -f "$record" ] && [ ! -L "$record" ] || return 1
+  {
+    IFS= read -r name \
+      && ! IFS= read -r extra
+  } < "$record" || return 1
+  fm_procevent_status_name_valid "$name" || return 1
+  status="$state/$name"
+  [ -f "$status" ] && [ ! -L "$status" ] || return 1
+  printf '%s\n' "$name"
+}
+
 # fm_procevent_result_source_id <result-path>
 fm_procevent_result_source_id() {
   local base=${1##*/}

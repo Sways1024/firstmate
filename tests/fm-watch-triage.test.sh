@@ -1892,6 +1892,252 @@ test_procevent_marker_failure_exits_and_replays() {
   pass "marker failure exits through the shared wake owner, releases its lock, and replays later"
 }
 
+# --- process-event fold into the status wake --------------------------------
+# A result its adapter already applied as new lines in one of this home's status
+# logs, acknowledged, and recorded as announced via that log is carried by the
+# log's own status wake instead of a second process-event wake. Every other
+# shape - unacknowledged, unrecorded, already reported, away mode, or mixed with
+# a result that cannot fold - must surface exactly as before.
+
+# Seed one captured result for <source-id> plus the status append its adapter
+# made. <ack> is handled|unhandled; <via> is via|none (the announced-via-status
+# record). The registry directory exists, as it does in a home with sources, so
+# the watcher's per-cycle reconcile runs against this home.
+seed_applied_procevent_result() {  # <dir> <source-id> <status-name> <ack> <via> [status-line]
+  local dir=$1 sid=$2 name=$3 ack=$4 via=$5 line=${6:-done: applied remote reply} inbox
+  inbox="$dir/state/procevent-inbox"
+  (umask 077; mkdir -p "$inbox" "$dir/state/procevent") || return 1
+  printf 'fixture payload\n' > "$inbox/$sid.1.result" || return 1
+  printf 'fixture\n' > "$inbox/$sid.1.adapter" || return 1
+  chmod 0600 "$inbox/$sid.1.result" "$inbox/$sid.1.adapter" || return 1
+  append_wake "$dir/state" check "procevent:$sid:1" "check: procevent fixture $sid 1" || return 1
+  printf '%s\n' "$line" >> "$dir/state/$name" || return 1
+  if [ "$via" = via ]; then
+    pe_case "$dir" via-status "$sid" 1 "$name" >/dev/null || return 1
+  fi
+  if [ "$ack" = handled ]; then
+    pe_case "$dir" handled "$sid" 1 >/dev/null || return 1
+  fi
+}
+
+# Run one watcher cycle that must exit; fail with <label> otherwise.
+fold_watch_once() {  # <dir> <out> <label>
+  local pid
+  procevent_watch_bg "$1" "$2"
+  pid=$!
+  wait_for_exit "$pid" 100 || fail "$3: $(cat "$2")"
+}
+
+test_procevent_applied_result_folds_into_status_wake() {
+  local dir state out drain_out pid
+  dir=$(make_case procevent-fold); state="$dir/state"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"
+  seed_applied_procevent_result "$dir" remote-reply-mate mate.status handled via \
+    || fail "could not seed an applied process-event result"
+
+  fold_watch_once "$dir" "$out" "an applied result and its status append never woke the watcher"
+  [ "$(cat "$out")" = "signal: $state/mate.status" ] \
+    || fail "an applied result did not arrive as exactly one status wake: $(cat "$out")"
+  assert_no_grep 'procevent:remote-reply-mate:1' "$state/.wake-queue" \
+    "the folded process-event record stayed on the durable queue"
+  assert_grep 'folded process-event result(s) procevent:remote-reply-mate:1' "$state/.watch-triage.log" \
+    "the fold left no triage evidence"
+
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the folded wake failed"
+  grep "$(printf '\tsignal\tmate.status\t')" "$drain_out" >/dev/null \
+    || fail "the folded status wake was not queued for its drain"
+  assert_no_grep 'procevent:remote-reply-mate:1' "$drain_out" \
+    "the drain still carried the folded process-event record"
+  assert_grep 'mate.status: done: applied remote reply' "$drain_out" \
+    "the drain did not show the applied line from the status log the wake names"
+
+  : > "$out"
+  procevent_watch_bg "$dir" "$out"
+  pid=$!
+  if ! wait_live "$pid" 40; then
+    fail "a folded result woke the watcher a second time: $(cat "$out")"
+  fi
+  reap "$pid"
+  pass "an applied, acknowledged result announced via its status log wakes once, as that status wake"
+}
+
+test_procevent_fold_wake_is_never_absorbed() {
+  local dir state out pid line n=0
+  # Every kind of line a second mate reports, as the last line of the update,
+  # with the crew reading provably working: the case where ordinary triage would
+  # absorb a benign status signal. A folded update must still wake every time.
+  for line in 'done: build verified' 'needs-decision [key=pick]: choose A or B' \
+    'blocked: waiting on credentials' 'failed: tests red' 'resolved [key=pick]: chose A' \
+    'working: report at data/remote-secondmates/mate/data/reply/report.md' \
+    'working: mirrored a progress line'; do
+    n=$((n + 1))
+    dir=$(make_case "procevent-fold-forced-$n"); state="$dir/state"; out="$dir/watch.out"
+    seed_applied_procevent_result "$dir" remote-reply-mate mate.status handled via "$line" \
+      || fail "could not seed an applied line: $line"
+    FM_FAKE_CREW_STATE='state: working · source: pane · harness busy' \
+      fold_watch_once "$dir" "$out" "a folded wake was absorbed for the line: $line"
+    [ "$(cat "$out")" = "signal: $state/mate.status" ] \
+      || fail "a folded update ending in '$line' did not wake as its status wake: $(cat "$out")"
+  done
+
+  # Control: the same benign line from the same provably working crew with no
+  # process-event result behind it is still absorbed, so triage is unchanged.
+  dir=$(make_case procevent-fold-forced-control); state="$dir/state"; out="$dir/watch.out"
+  printf 'working: mirrored a progress line\n' > "$state/mate.status"
+  FM_FAKE_CREW_STATE='state: working · source: pane · harness busy' procevent_watch_bg "$dir" "$out"
+  pid=$!
+  if ! wait_live "$pid" 40; then
+    fail "an ordinary benign status signal from a provably working crew was not absorbed: $(cat "$out")"
+  fi
+  reap "$pid"
+  assert_grep 'absorbed benign signal:' "$state/.watch-triage.log" \
+    "the control signal was not absorbed through ordinary triage"
+  pass "a folded update wakes for every kind of last line, while ordinary triage is unchanged"
+}
+
+test_procevent_unacknowledged_result_never_folds() {
+  local dir state out reconcile_out
+  dir=$(make_case procevent-fold-unacked); state="$dir/state"; out="$dir/watch.out"
+  seed_applied_procevent_result "$dir" remote-reply-mate mate.status unhandled via \
+    || fail "could not seed an unacknowledged result"
+  fold_watch_once "$dir" "$out" "an unacknowledged result never woke the watcher"
+  [ "$(cat "$out")" = "check: process-event result captured: procevent:remote-reply-mate:1" ] \
+    || fail "an unacknowledged result did not surface as its own process-event wake: $(cat "$out")"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" >/dev/null 2>&1 || fail "drain after the unacknowledged wake failed"
+  reconcile_out=$(pe_case "$dir" reconcile)
+  assert_contains "$reconcile_out" 'published=1' \
+    "an unacknowledged result stopped being re-announced after its drain"
+  assert_grep 'procevent fixture remote-reply-mate 1' "$state/.wake-queue" \
+    "the re-announcement did not reach the durable queue"
+  pass "a result with no handled acknowledgement surfaces as before and keeps its re-announcement"
+}
+
+test_procevent_unrecorded_or_reported_result_surfaces_as_before() {
+  local dir state out f
+  dir=$(make_case procevent-fold-unrecorded); state="$dir/state"; out="$dir/watch.out"
+  seed_applied_procevent_result "$dir" remote-reply-mate mate.status handled none \
+    || fail "could not seed an acknowledged result with no status-log record"
+  fold_watch_once "$dir" "$out" "an unrecorded acknowledged result never woke the watcher"
+  [ "$(cat "$out")" = "check: process-event result captured: procevent:remote-reply-mate:1" ] \
+    || fail "a result its adapter did not record as announced was folded: $(cat "$out")"
+
+  dir=$(make_case procevent-fold-reported); state="$dir/state"; out="$dir/watch.out"
+  seed_applied_procevent_result "$dir" remote-reply-mate mate.status handled via \
+    || fail "could not seed a result whose status change was already reported"
+  f="$state/mate.status"
+  printf '%s' "$(seen_sig "$f")" > "$state/.seen-mate_status"
+  fold_watch_once "$dir" "$out" "a result whose status change was already reported never woke"
+  [ "$(cat "$out")" = "check: process-event result captured: procevent:remote-reply-mate:1" ] \
+    || fail "a result was folded into a status change the watcher had already reported: $(cat "$out")"
+  pass "a result with no status-log record, or one already reported, surfaces as before"
+}
+
+test_procevent_unsafe_record_surfaces_as_before() {
+  local dir state out record
+  dir=$(make_case procevent-fold-symlink); state="$dir/state"; out="$dir/watch.out"
+  seed_applied_procevent_result "$dir" remote-reply-mate mate.status handled via \
+    || fail "could not seed a result to make unsafe"
+  record="$state/procevent-inbox/remote-reply-mate.1.via-status"
+  printf 'mate.status\n' > "$dir/elsewhere"
+  rm -f "$record" && ln -s "$dir/elsewhere" "$record"
+  fold_watch_once "$dir" "$out" "a result with a symlinked status-log record never woke"
+  [ "$(cat "$out")" = "check: process-event result captured: procevent:remote-reply-mate:1" ] \
+    || fail "a symlinked status-log record was trusted: $(cat "$out")"
+
+  dir=$(make_case procevent-fold-malformed); state="$dir/state"; out="$dir/watch.out"
+  seed_applied_procevent_result "$dir" remote-reply-mate mate.status handled via \
+    || fail "could not seed a result to make malformed"
+  printf 'mate.status\nother.status\n' > "$state/procevent-inbox/remote-reply-mate.1.via-status"
+  fold_watch_once "$dir" "$out" "a result with a malformed status-log record never woke"
+  [ "$(cat "$out")" = "check: process-event result captured: procevent:remote-reply-mate:1" ] \
+    || fail "a malformed status-log record was trusted: $(cat "$out")"
+  pass "an unsafe or malformed status-log record surfaces the result as before"
+}
+
+test_procevent_fold_off_under_away_supervision() {
+  local dir state out
+  dir=$(make_case procevent-fold-afk); state="$dir/state"; out="$dir/watch.out"
+  seed_applied_procevent_result "$dir" remote-reply-mate mate.status handled via \
+    || fail "could not seed a result for away mode"
+  : > "$state/.afk"
+  fold_watch_once "$dir" "$out" "away mode lost the process-event wake"
+  [ "$(cat "$out")" = "check: process-event result captured: procevent:remote-reply-mate:1" ] \
+    || fail "away mode folded a result away from the daemon's always-escalated check: $(cat "$out")"
+
+  dir=$(make_case procevent-fold-daemon); state="$dir/state"; out="$dir/watch.out"
+  seed_applied_procevent_result "$dir" remote-reply-mate mate.status handled via \
+    || fail "could not seed a result under a daemon lock"
+  mkdir "$state/.supervise-daemon.lock"
+  fold_watch_once "$dir" "$out" "a daemon-owned home lost the process-event wake"
+  [ "$(cat "$out")" = "check: process-event result captured: procevent:remote-reply-mate:1" ] \
+    || fail "a result was folded while an away-mode daemon could own this watcher: $(cat "$out")"
+  pass "the fold is off under away-mode supervision, which keeps its always-escalated check"
+}
+
+test_procevent_mixed_results_surface_together() {
+  local dir state out
+  dir=$(make_case procevent-fold-mixed); state="$dir/state"; out="$dir/watch.out"
+  seed_applied_procevent_result "$dir" remote-reply-mate mate.status handled via \
+    || fail "could not seed the foldable result"
+  seed_applied_procevent_result "$dir" lavish-src other.status handled none \
+    || fail "could not seed the result that cannot fold"
+  fold_watch_once "$dir" "$out" "mixed results never woke the watcher"
+  [ "$(cat "$out")" = "check: process-event result captured: procevent:remote-reply-mate:1 procevent:lavish-src:1" ] \
+    || fail "a result that cannot fold did not carry every queued result as before: $(cat "$out")"
+  pass "a result that cannot fold surfaces every queued result together, exactly as before"
+}
+
+test_procevent_fold_output_failure_replays() {
+  local dir state out fifo pid reader exit_status marker
+  dir=$(make_case procevent-fold-output-fail); state="$dir/state"
+  out="$dir/watch.out"; fifo="$dir/output.fifo"
+  seed_applied_procevent_result "$dir" remote-reply-mate mate.status handled via \
+    || fail "could not seed a result for the output failure"
+  mkfifo "$fifo"
+  sh -c ': < "$1"' _ "$fifo" & reader=$!
+  PATH="$dir/fakebin:$PATH" FM_HOME="$dir" FM_PROCEVENT_CLAIM_ROOT="$dir/claims" \
+    FM_CREW_STATE_BIN="$dir/fakebin/fm-crew-state.sh" FM_POLL=0.2 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$fifo" &
+  pid=$!
+  wait "$reader" || true
+  wait_for_exit "$pid" 100
+  exit_status=$?
+  [ "$exit_status" -ne 124 ] || fail "the watcher survived a failed folded-wake output write"
+  marker=$(find "$state" -maxdepth 1 -name '.seen-procevent-*' -type f | head -1)
+  [ -z "$marker" ] || fail "a failed folded-wake output marked the result surfaced"
+  assert_grep 'procevent:remote-reply-mate:1' "$state/.wake-queue" \
+    "a failed folded-wake output withdrew the process-event record"
+  fold_watch_once "$dir" "$out" "a result whose folded wake was never delivered did not replay"
+  [ "$(cat "$out")" = "check: process-event result captured: procevent:remote-reply-mate:1" ] \
+    || fail "an undelivered fold did not replay as the result's own wake: $(cat "$out")"
+  pass "a folded wake that never reached firstmate leaves its result queued and replayable"
+}
+
+test_procevent_deferred_result_not_carried_surfaces_same_cycle() {
+  local dir state out pid i=0
+  dir=$(make_case procevent-fold-not-carried); state="$dir/state"; out="$dir/watch.out"
+  seed_applied_procevent_result "$dir" remote-reply-mate mate.status handled via \
+    'working: mirrored a progress line' || fail "could not seed a result to strand"
+  PATH="$dir/fakebin:$PATH" FM_HOME="$dir" FM_PROCEVENT_CLAIM_ROOT="$dir/claims" \
+    FM_CREW_STATE_BIN="$dir/fakebin/fm-crew-state.sh" \
+    FM_FAKE_CREW_STATE='state: working · source: pane · harness busy' \
+    FM_POLL=0.2 FM_SIGNAL_GRACE=3 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  while [ "$i" -lt 100 ]; do
+    grep -F 'deferred process-event result(s)' "$state/.watch-triage.log" >/dev/null 2>&1 && break
+    sleep 0.05
+    i=$((i + 1))
+  done
+  [ "$i" -lt 100 ] || { reap "$pid"; fail "the watcher never deferred the foldable result"; }
+  # The status log the result was announced via disappears during the grace,
+  # so the status wake cannot carry it; triage then absorbs that wake.
+  rm -f "$state/mate.status"
+  wait_for_exit "$pid" 100 || fail "a deferred result its status wake did not carry was lost: $(cat "$out")"
+  [ "$(cat "$out")" = "check: process-event result captured: procevent:remote-reply-mate:1" ] \
+    || fail "a deferred result was not surfaced as before in the same cycle: $(cat "$out")"
+  pass "a deferred result that its status wake does not carry surfaces as before in the same cycle"
+}
+
 # --- heartbeat: no-change absorbed, backstop surfaces a missed status --------
 
 test_heartbeat_no_change_absorbed() {
@@ -2065,6 +2311,15 @@ test_procevent_marker_keys_are_injective
 test_procevent_surface_serializes_with_drain
 test_procevent_surface_crash_boundaries
 test_procevent_marker_failure_exits_and_replays
+test_procevent_applied_result_folds_into_status_wake
+test_procevent_fold_wake_is_never_absorbed
+test_procevent_unacknowledged_result_never_folds
+test_procevent_unrecorded_or_reported_result_surfaces_as_before
+test_procevent_unsafe_record_surfaces_as_before
+test_procevent_fold_off_under_away_supervision
+test_procevent_mixed_results_surface_together
+test_procevent_fold_output_failure_replays
+test_procevent_deferred_result_not_carried_surfaces_same_cycle
 test_heartbeat_no_change_absorbed
 test_heartbeat_backstop_surfaces_unsurfaced_status
 test_beacon_stays_fresh_while_absorbing
