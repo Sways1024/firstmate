@@ -900,8 +900,11 @@ test_pi_session_transition_generation_owner() {
   cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
 #!/usr/bin/env bash
 printf 'watcher: started pid=%s\n' "$$"
-printf '%s\n' "$$" > "${FM_CHILD_PID_FILE:?}"
+# Log first, then publish the pid file by rename: a reader that sees this pid
+# always finds its arm-log line and never reads a truncated, still-empty file.
 printf 'arm pid=%s\n' "$$" >> "${FM_ARM_LOG:?}"
+printf '%s\n' "$$" > "${FM_CHILD_PID_FILE:?}.$$"
+mv -f "$FM_CHILD_PID_FILE.$$" "$FM_CHILD_PID_FILE"
 trap 'exit 0' TERM INT
 while :; do sleep 0.2; done
 SH
@@ -928,6 +931,8 @@ function makePi() {
 }
 
 function pidAlive(pid) {
+  // kill(0, 0) probes the whole process group, so an empty pid must never read as alive.
+  if (!/^[1-9][0-9]*$/.test(String(pid))) return false;
   try {
     process.kill(Number(pid), 0);
     return true;
@@ -1064,7 +1069,7 @@ if (liveArmPids().length !== 0) {
 EOF
 )
   status=$?
-  expect_code 0 "$status" "Pi session transitions must rearm through an explicit generation owner"
+  expect_code 0 "$status" "Pi session transitions must rearm through an explicit generation owner: $out"
   [ -z "$out" ] || fail "Pi session-transition generation owner test printed output: $out"
   pass "Pi session transitions use a generation owner across /new /resume /fork, stale callbacks, and quit"
 }
