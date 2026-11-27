@@ -128,6 +128,7 @@ case "$1 ${2:-}" in
   "session stop")
     ! not_ours "$3" || violation "stopped a session the helper did not create"
     [ "$3" = "$session" ] || exit 91
+    [ "${FM_FAKE_HERDR_STOP_FAIL:-}" != 1 ] || exit 96
     printf '%s\n' stopped > "$state/$session"
     [ -z "${FM_FAKE_HERDR_ON_STOP:-}" ] || mutate_others "$FM_FAKE_HERDR_ON_STOP"
     [ -z "${FM_FAKE_HERDR_DEFAULT_ON_STOP:-}" ] || printf '%s\n' true > "$state/default-flag.$session"
@@ -172,6 +173,7 @@ run_with_fake() {
     FM_FAKE_HERDR_SERVER_DELAY="${FM_FAKE_HERDR_SERVER_DELAY:-0}" \
     FM_FAKE_HERDR_FAST_POLL="${FM_FAKE_HERDR_FAST_POLL:-}" \
     FM_FAKE_HERDR_DELETE_FAIL="${FM_FAKE_HERDR_DELETE_FAIL:-}" \
+    FM_FAKE_HERDR_STOP_FAIL="${FM_FAKE_HERDR_STOP_FAIL:-}" \
     FM_FAKE_HERDR_LIST_MODE="${FM_FAKE_HERDR_LIST_MODE:-}" \
     FM_FAKE_HERDR_ON_STOP="${FM_FAKE_HERDR_ON_STOP:-}" \
     FM_FAKE_HERDR_ON_DELETE="${FM_FAKE_HERDR_ON_DELETE:-}" \
@@ -495,6 +497,36 @@ test_teardown_trips_on_transient_fleet_change() {
   pass "fm-herdr-lab: a fleet change after the lab's stop fails teardown even once restored"
 }
 
+# Teardown's final check after the delete still guards the fleet: a recorded
+# fleet session that stops while the lab is deleted fails teardown loudly even
+# though the check after the lab's stop passed.
+test_teardown_trips_on_fleet_change_during_delete() {
+  local case_spec layout target name status err="$TMP_ROOT/delete-trip.err"
+  for case_spec in mac:fleet-e old:default two:fleet-e; do
+    layout=${case_spec%%:*}
+    target=${case_spec#*:}
+    set_fleet "$layout"
+    name="fm-lab-delete-trip-$layout-$$"
+    : > "$FAKE_LOG"
+    fast fm_herdr_lab_provision "$name" || fail "$layout: delete-trip fixture provision failed"
+    status=0
+    FM_FAKE_HERDR_ON_DELETE="map(if .name == \"$target\" then .running = false else . end)" \
+      fast fm_herdr_lab_teardown "$name" >/dev/null 2>"$err" || status=$?
+    expect_code 1 "$status" "$layout: a fleet change during the lab's delete must fail teardown"
+    assert_grep "FLEET-STATE TRIPWIRE FAILED" "$err" \
+      "$layout: a fleet change during the delete did not name the fleet tripwire"
+    assert_no_grep "the fleet-state check after its stop failed" "$err" \
+      "$layout: the fixture changed the fleet before the delete, so the final check went untested"
+    [ "$(cat "$FAKE_STATE/$name")" = deleted ] || fail "$layout: teardown left the lab session behind"
+    assert_present "$TRIPWIRES/$name.fleet-state.json" \
+      "$layout: a fleet change during the delete removed the tripwire evidence"
+    assert_never_touched_others "$name" "$layout delete-time change"
+    rm -f "$TRIPWIRES/$name.fleet-state.json"
+  done
+  set_fleet old
+  pass "fm-herdr-lab: teardown's final check fails loudly on a fleet change during the lab's delete"
+}
+
 # The fleet check after a guarded stop fails loudly in every layout, and the
 # retained record still guards a later teardown once the fleet is back.
 test_guarded_stop_trips_on_fleet_change() {
@@ -519,6 +551,30 @@ test_guarded_stop_trips_on_fleet_change() {
   done
   set_fleet old
   pass "fm-herdr-lab: guarded stop fails loudly when a recorded fleet session changed"
+}
+
+# A failed Herdr stop still gets the fleet check: guarded stop returns Herdr's
+# own failure status when the fleet is unchanged, and fails the tripwire when
+# it is not.
+test_guarded_stop_reports_a_failed_stop() {
+  local name="fm-lab-stop-fail-$$" status=0 err="$TMP_ROOT/stop-fail.err"
+  set_fleet mac
+  : > "$FAKE_LOG"
+  fast fm_herdr_lab_provision "$name" || fail "stop-failure fixture provision failed"
+  FM_FAKE_HERDR_STOP_FAIL=1 fast fm_herdr_lab_stop "$name" >/dev/null 2>"$err" || status=$?
+  expect_code 96 "$status" "guarded stop must return the failed Herdr stop's own status"
+  [ "$(cat "$FAKE_STATE/$name")" = running ] || fail "the failed-stop fixture changed the lab"
+  assert_present "$TRIPWIRES/$name.fleet-state.json" "a failed guarded stop dropped the tripwire"
+  fleet_change stop fleet-e
+  status=0
+  FM_FAKE_HERDR_STOP_FAIL=1 fast fm_herdr_lab_stop "$name" >/dev/null 2>"$err" || status=$?
+  expect_code 1 "$status" "a failed guarded stop must still fail on a fleet change"
+  assert_grep "FLEET-STATE TRIPWIRE FAILED" "$err" "a failed guarded stop skipped the fleet check"
+  set_fleet mac
+  fast fm_herdr_lab_teardown "$name" || fail "teardown after a failed guarded stop failed"
+  assert_never_touched_others "$name" "failed guarded stop"
+  set_fleet old
+  pass "fm-herdr-lab: guarded stop reports a failed Herdr stop after checking the fleet"
 }
 
 test_reordered_listing_is_not_a_fleet_change() {
@@ -734,7 +790,9 @@ test_timed_out_provision_cancels_late_launch
 test_provisions_whatever_the_fleet_session_is_called
 test_teardown_trips_on_any_recorded_fleet_change
 test_teardown_trips_on_transient_fleet_change
+test_teardown_trips_on_fleet_change_during_delete
 test_guarded_stop_trips_on_fleet_change
+test_guarded_stop_reports_a_failed_stop
 test_reordered_listing_is_not_a_fleet_change
 test_provision_refuses_without_a_running_fleet
 test_never_acts_on_sessions_it_did_not_create
