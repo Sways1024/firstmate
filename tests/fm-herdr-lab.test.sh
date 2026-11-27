@@ -68,7 +68,9 @@ mutate_others() { # <jq filter>
 # Every case runs as a worker inside a live fleet pane, so the caller's own
 # pane identity, including the fleet server's socket, must never reach herdr.
 for var in HERDR_ENV HERDR_PANE_ID HERDR_SOCKET_PATH HERDR_TAB_ID HERDR_WORKSPACE_ID; do
-  ! printenv "$var" >/dev/null || violation "inherited $var reached herdr"
+  # A builtin test, not printenv: the provision poll calls this fake hundreds of
+  # times, and the timed-out-provision case needs those polls to stay cheap.
+  [ -z "${!var+x}" ] || violation "inherited $var reached herdr"
 done
 [ "${HERDR_SESSION:-}" = "$session" ] \
   || violation "HERDR_SESSION '${HERDR_SESSION:-}' does not match --session '$session'"
@@ -97,10 +99,18 @@ case "$1 ${2:-}" in
         stopped) running=false ;;
         *) continue ;;
       esac
+      # A test makes Herdr report a lab as the default session by writing
+      # default-flag.<lab>, so refuse-default is exercised on a real listing.
+      is_default=false
+      [ ! -f "$state/default-flag.$lab" ] || is_default=true
       labs=$(printf '%s' "$labs" | jq -c --arg name "$lab" --argjson running "$running" \
-        '. + [{default:false,name:$name,running:$running,socket_path:("/tmp/" + $name + ".sock")}]')
+        --argjson default "$is_default" \
+        '. + [{default:$default,name:$name,running:$running,socket_path:("/tmp/" + $name + ".sock")}]')
     done
-    jq -c --argjson labs "$labs" '{sessions:(. + $labs)}' "$state/others.json"
+    listing=$(jq -c --argjson labs "$labs" '{sessions:(. + $labs)}' "$state/others.json")
+    printf '%s\n' "$listing"
+    # multi: a reply holding more than one JSON document.
+    [ "${FM_FAKE_HERDR_LIST_MODE:-}" != multi ] || printf '%s\n' "$listing"
     ;;
   "server --session")
     if [ "${FM_FAKE_HERDR_SERVER_DELAY:-0}" != 0 ]; then
@@ -120,6 +130,7 @@ case "$1 ${2:-}" in
     [ "$3" = "$session" ] || exit 91
     printf '%s\n' stopped > "$state/$session"
     [ -z "${FM_FAKE_HERDR_ON_STOP:-}" ] || mutate_others "$FM_FAKE_HERDR_ON_STOP"
+    [ -z "${FM_FAKE_HERDR_DEFAULT_ON_STOP:-}" ] || printf '%s\n' true > "$state/default-flag.$session"
     ;;
   "session delete")
     ! not_ours "$3" || violation "deleted a session the helper did not create"
@@ -164,6 +175,7 @@ run_with_fake() {
     FM_FAKE_HERDR_LIST_MODE="${FM_FAKE_HERDR_LIST_MODE:-}" \
     FM_FAKE_HERDR_ON_STOP="${FM_FAKE_HERDR_ON_STOP:-}" \
     FM_FAKE_HERDR_ON_DELETE="${FM_FAKE_HERDR_ON_DELETE:-}" \
+    FM_FAKE_HERDR_DEFAULT_ON_STOP="${FM_FAKE_HERDR_DEFAULT_ON_STOP:-}" \
     FM_HERDR_LAB_STATE_DIR="$TRIPWIRES" \
     "$@"
 }
@@ -524,7 +536,8 @@ test_reordered_listing_is_not_a_fleet_change() {
 # when no session outside the lab namespace is running or the list is unusable.
 test_provision_refuses_without_a_running_fleet() {
   local spec layout mode expect name status err="$TMP_ROOT/no-fleet.err" verb
-  for spec in stopped:: empty:: labs-only:: mac:fail:'cannot list Herdr sessions' mac:garbage:'cannot parse'; do
+  for spec in stopped:: empty:: labs-only:: mac:fail:'cannot list Herdr sessions' mac:garbage:'cannot parse' \
+    mac:multi:'cannot parse'; do
     layout=${spec%%:*}
     mode=${spec#*:}
     mode=${mode%%:*}
@@ -643,6 +656,67 @@ test_drops_inherited_fleet_pane_identity() {
   pass "fm-herdr-lab: a caller's inherited fleet pane identity never reaches Herdr"
 }
 
+# Refuse-default runs immediately before each destructive call: a lab Herdr
+# reports as the default session is never stopped or deleted, whether it reads
+# default before the stop or turns default between the stop and the delete.
+test_destructive_calls_refuse_a_default_flagged_lab() {
+  local name="fm-lab-default-flag-$$" verb status err="$TMP_ROOT/default-flag.err"
+  set_fleet mac
+  : > "$FAKE_LOG"
+  fast fm_herdr_lab_provision "$name" || fail "default-flag fixture provision failed"
+  printf '%s\n' true > "$FAKE_STATE/default-flag.$name"
+  for verb in stop teardown; do
+    : > "$FAKE_LOG"
+    status=0
+    fast "fm_herdr_lab_$verb" "$name" >/dev/null 2>"$err" || status=$?
+    expect_code 1 "$status" "guarded $verb must refuse a lab Herdr reports as default"
+    assert_grep "refusing destructive call for '$name'" "$err" \
+      "guarded $verb refused a default-flagged lab without the refuse-default reason"
+    assert_no_grep "session stop " "$FAKE_LOG" "guarded $verb stopped a lab Herdr reports as default"
+    assert_no_grep "session delete " "$FAKE_LOG" "guarded $verb deleted a lab Herdr reports as default"
+    [ "$(cat "$FAKE_STATE/$name")" = running ] || fail "guarded $verb changed a lab Herdr reports as default"
+    assert_present "$TRIPWIRES/$name.fleet-state.json" "guarded $verb dropped a default-flagged lab's tripwire"
+  done
+  rm -f "$FAKE_STATE/default-flag.$name"
+  : > "$FAKE_LOG"
+  status=0
+  FM_FAKE_HERDR_DEFAULT_ON_STOP=1 fast fm_herdr_lab_teardown "$name" >/dev/null 2>"$err" || status=$?
+  expect_code 1 "$status" "teardown must refuse to delete a lab that turned default after its stop"
+  assert_grep "refusing destructive call for '$name'" "$err" \
+    "teardown refused a lab that turned default without the refuse-default reason"
+  assert_no_grep "session delete " "$FAKE_LOG" "teardown deleted a lab that turned default after its stop"
+  [ "$(cat "$FAKE_STATE/$name")" = stopped ] || fail "teardown did not leave the lab that turned default stopped"
+  assert_present "$TRIPWIRES/$name.fleet-state.json" "teardown dropped the tripwire of a lab that turned default"
+  rm -f "$FAKE_STATE/default-flag.$name"
+  : > "$FAKE_LOG"
+  fast fm_herdr_lab_teardown "$name" || fail "teardown once the lab no longer reads default failed"
+  assert_never_touched_others "$name" "default-flagged lab"
+  set_fleet old
+  pass "fm-herdr-lab: a lab Herdr reports as default is never stopped or deleted"
+}
+
+# A running session listed without a string name is recorded as fleet rather
+# than escaping the record, so its stopping still trips teardown.
+test_nameless_running_session_counts_as_fleet() {
+  local name="fm-lab-nameless-$$" status=0 err="$TMP_ROOT/nameless.err"
+  set_fleet mac
+  others_mutate '. + [{default:false,running:true,socket_path:"/tmp/nameless.sock"}]'
+  : > "$FAKE_LOG"
+  fast fm_herdr_lab_provision "$name" || fail "provision beside a nameless running session failed"
+  jq -e 'length == 2 and any(.[]; .name == null and .socket_path == "/tmp/nameless.sock")' \
+    "$TRIPWIRES/$name.fleet-state.json" >/dev/null \
+    || fail "the tripwire did not record a nameless running session as fleet: $(cat "$TRIPWIRES/$name.fleet-state.json")"
+  others_mutate 'map(if .name == null then .running = false else . end)'
+  fast fm_herdr_lab_teardown "$name" >/dev/null 2>"$err" || status=$?
+  expect_code 1 "$status" "a nameless fleet session that stopped must fail teardown"
+  assert_grep "FLEET-STATE TRIPWIRE FAILED" "$err" "a stopped nameless fleet session did not name the fleet tripwire"
+  [ "$(cat "$FAKE_STATE/$name")" = deleted ] || fail "teardown beside a nameless session left the lab behind"
+  assert_never_touched_others "$name" "nameless fleet session"
+  rm -f "$TRIPWIRES/$name.fleet-state.json"
+  set_fleet old
+  pass "fm-herdr-lab: a running session without a name counts as fleet"
+}
+
 test_no_case_reached_a_session_it_did_not_create() {
   [ ! -s "$FAKE_STATE/violations" ] \
     || fail "a case made a call the helper must never make: $(cat "$FAKE_STATE/violations")"
@@ -666,4 +740,6 @@ test_provision_refuses_without_a_running_fleet
 test_never_acts_on_sessions_it_did_not_create
 test_lab_sessions_never_count_as_fleet
 test_drops_inherited_fleet_pane_identity
+test_destructive_calls_refuse_a_default_flagged_lab
+test_nameless_running_session_counts_as_fleet
 test_no_case_reached_a_session_it_did_not_create
