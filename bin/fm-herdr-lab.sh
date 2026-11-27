@@ -327,7 +327,7 @@ fm_herdr_lab_teardown() { # <session>
     return 1
   fi
   [ "$fleet_after_stop" -eq 0 ] || {
-    fm_herdr_lab_error "lab session '$name' was removed, but the fleet changed after its stop; keeping the tripwire at $tripwire"
+    fm_herdr_lab_error "lab session '$name' was removed, but the fleet-state check after its stop failed; keeping the tripwire at $tripwire"
     return 1
   }
   fm_herdr_lab_verify_tripwire "$name"

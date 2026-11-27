@@ -472,7 +472,7 @@ test_teardown_trips_on_transient_fleet_change() {
     fast fm_herdr_lab_teardown "$name" >/dev/null 2>"$err" || status=$?
   expect_code 1 "$status" "a fleet change seen after the lab's stop must fail teardown"
   assert_grep "FLEET-STATE TRIPWIRE FAILED" "$err" "transient change did not name the fleet tripwire"
-  assert_grep "the fleet changed after its stop" "$err" "transient change did not explain the failed teardown"
+  assert_grep "the fleet-state check after its stop failed" "$err" "transient change did not explain the failed teardown"
   [ "$(cat "$FAKE_STATE/$name")" = deleted ] || fail "transient change left the lab session behind"
   assert_present "$TRIPWIRES/$name.fleet-state.json" "transient change removed the tripwire evidence"
   jq -e 'any(.[]; .name == "fleet-e" and .running == true)' "$FAKE_STATE/others.json" >/dev/null \

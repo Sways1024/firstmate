@@ -845,6 +845,7 @@ e2e_herdr() {
   local SESSION home_tmp cap_ws cap_tab cap_pane target
   local before during after ws_before ws_during ws_after out dtgt dtab
   SESSION="fm-lab-afk-launch-e2e-$$"
+  herdr_forget_inherited_pane
   export HERDR_SESSION="$SESSION"
   home_tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-e2e-home.XXXXXX")
   E2E_HERDR_CLEANUP() {
