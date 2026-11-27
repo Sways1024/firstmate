@@ -166,7 +166,7 @@ jobs:
 
   # Required real-Herdr lane: pinned install, serial real-herdr-gated family,
   # hard-fail on "skip: herdr not found". Starts on Linux x86_64; if a genuine
-  # platform invariant fails (focus, cleanup, default-session tripwire), keep
+  # platform invariant fails (focus, cleanup, fleet-state tripwire), keep
   # the failure evidence and move the job to macOS rather than skip assertions.
   tests-herdr:
     name: Behavior tests (Herdr)
@@ -224,9 +224,10 @@ jobs:
       - name: Start default Herdr session for fleet-state tripwire
         run: |
           set -eu
-          # Lab provision requires exactly one running default session so the
-          # default-session tripwire can arm. Start it headless; never use it
-          # for lab work (tests still refuse default and use fm-lab-* only).
+          # Lab provision requires at least one running session outside the
+          # fm-lab-* namespace so the fleet-state tripwire can arm; the default
+          # session stands in for the fleet here. Start it headless; never use
+          # it for lab work (tests still refuse default and use fm-lab-* only).
           mkdir -p "$RUNNER_TEMP/fm-herdr"
           nohup herdr server >"$RUNNER_TEMP/fm-herdr/default-server.log" 2>&1 &
           echo $! >"$RUNNER_TEMP/fm-herdr/default-server.pid"

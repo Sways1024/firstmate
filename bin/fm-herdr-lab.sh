@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Provision and operate an isolated Herdr lab session without risking the live
-# default session.
+# fleet's own Herdr sessions.
 #
 # Usage:
 #   fm-herdr-lab.sh name <label>
@@ -13,7 +13,8 @@
 # Session names must begin with "fm-lab-" and can never be "default".
 # The name command sanitizes the label, caps it at 16 characters, and appends
 # process/random suffixes to keep generated socket paths short.
-# Every Herdr call made here carries a trailing --session <session>.
+# Every Herdr call made here carries a trailing --session <session> and drops
+# the caller's inherited Herdr pane identity, such as HERDR_SOCKET_PATH.
 # The run command rejects caller-supplied --session flags, any leading option
 # before the subcommand, all session lifecycle operations, and every server
 # operation.
@@ -21,8 +22,11 @@
 # delete is available only through teardown.
 # Both paths perform a fresh refuse-default check immediately before each
 # destructive call.
-# Provision records the running default session as a fleet-state tripwire and
-# teardown requires that record to be identical afterward.
+# Provision records every running session whose name does not begin with
+# "fm-lab-" - the live fleet, whatever its sessions are called - as a
+# fleet-state tripwire, and refuses when there is none.
+# Guarded stop and teardown each require that recorded set to be identical
+# afterward.
 set -u
 
 fm_herdr_lab_error() {
@@ -61,35 +65,50 @@ fm_herdr_lab_raw() { # <session> <herdr arguments...>
     [ "$seen_dd" -eq 1 ] || [ "$arg" != '--' ] || seen_dd=1
     if [ "$seen_dd" -eq 0 ]; then pre+=("$arg"); else post+=("$arg"); fi
   done
-  HERDR_SESSION="$name" herdr ${pre[@]+"${pre[@]}"} --session "$name" ${post[@]+"${post[@]}"}
+  # A caller inside a live fleet pane inherits that pane's Herdr identity,
+  # including the fleet server's socket path. None of it is passed on, so only
+  # the explicit --session can route a lab call, exactly as when no Herdr pane
+  # is involved at all.
+  HERDR_SESSION="$name" env -u HERDR_ENV -u HERDR_PANE_ID -u HERDR_SOCKET_PATH \
+    -u HERDR_TAB_ID -u HERDR_WORKSPACE_ID \
+    herdr ${pre[@]+"${pre[@]}"} --session "$name" ${post[@]+"${post[@]}"}
 }
 
 fm_herdr_lab_session_list() { # <session>
   fm_herdr_lab_raw "$1" session list --json
 }
 
+# The fleet is every running session outside the lab namespace, so the record
+# protects a fleet in `default` and a fleet in any other named session alike.
+# Lab sessions - this one and any concurrent one - are never fleet, and a
+# running session without a string name counts as fleet rather than escaping.
+# Sorting by name keeps the record independent of Herdr's listing order.
+# An empty fleet prints [] so an after-check reports what vanished; only
+# recording requires at least one fleet session.
 fm_herdr_lab_fleet_state() { # <session>
   local name=$1 sessions snapshot
   sessions=$(fm_herdr_lab_session_list "$name" 2>/dev/null) || {
     fm_herdr_lab_error "cannot read Herdr sessions for the fleet-state tripwire"
     return 1
   }
-  snapshot=$(printf '%s' "$sessions" | jq -c '
-    [.sessions[]? | select(.default == true)]
-    | if length == 1 and .[0].name == "default" and .[0].running == true
-      then .[0] | {name, default, running, socket_path}
-      else empty
-      end
-  ' 2>/dev/null)
-  [ -n "$snapshot" ] || {
-    fm_herdr_lab_error "fleet-state tripwire requires exactly one running default session"
-    return 1
-  }
+  snapshot=$(printf '%s' "$sessions" | jq -ce '
+    [.sessions[]?
+      | select(.running == true)
+      | select((.name | type) != "string" or (.name | startswith("fm-lab-") | not))
+      | {name, default, running, socket_path}]
+    | sort_by(.name)
+  ' 2>/dev/null) || snapshot=
+  case "$snapshot" in
+    ''|*$'\n'*)
+      fm_herdr_lab_error "cannot parse the Herdr session list for the fleet-state tripwire"
+      return 1
+      ;;
+  esac
   printf '%s\n' "$snapshot"
 }
 
 fm_herdr_lab_prepare() { # <session>
-  local name=$1 sessions state_dir tripwire
+  local name=$1 sessions state_dir tripwire snapshot
   fm_herdr_lab_validate_name "$name" || return 1
   command -v herdr >/dev/null 2>&1 || { fm_herdr_lab_error "herdr is required"; return 1; }
   command -v jq >/dev/null 2>&1 || { fm_herdr_lab_error "jq is required"; return 1; }
@@ -110,7 +129,12 @@ fm_herdr_lab_prepare() { # <session>
     fm_herdr_lab_error "tripwire already exists for '$name'; refusing ambiguous ownership"
     return 1
   }
-  fm_herdr_lab_fleet_state "$name" > "$tripwire" || {
+  snapshot=$(fm_herdr_lab_fleet_state "$name") || return 1
+  [ "$snapshot" != '[]' ] || {
+    fm_herdr_lab_error "fleet-state tripwire requires at least one running Herdr session whose name does not begin with 'fm-lab-'"
+    return 1
+  }
+  printf '%s\n' "$snapshot" > "$tripwire" || {
     rm -f "$tripwire"
     return 1
   }
@@ -237,7 +261,7 @@ fm_herdr_lab_check_tripwire() { # <session>
   before=$(cat "$tripwire")
   after=$(fm_herdr_lab_fleet_state "$name") || return 1
   [ "$before" = "$after" ] || {
-    fm_herdr_lab_error "FLEET-STATE TRIPWIRE FAILED: default session changed during lab work"
+    fm_herdr_lab_error "FLEET-STATE TRIPWIRE FAILED: the running fleet sessions changed during lab work"
     fm_herdr_lab_error "before: $before"
     fm_herdr_lab_error "after:  $after"
     return 1
@@ -252,7 +276,7 @@ fm_herdr_lab_verify_tripwire() { # <session>
 }
 
 fm_herdr_lab_stop() { # <session>
-  local name=$1 tripwire
+  local name=$1 tripwire stop_status=0
   fm_herdr_lab_validate_name "$name" || return 1
   tripwire=$(fm_herdr_lab_tripwire_path "$name")
   [ -f "$tripwire" ] || {
@@ -260,11 +284,13 @@ fm_herdr_lab_stop() { # <session>
     return 1
   }
   fm_herdr_lab_refuse_if_default "$name" || return 1
-  fm_herdr_lab_raw "$name" session stop "$name" --json
+  fm_herdr_lab_raw "$name" session stop "$name" --json || stop_status=$?
+  fm_herdr_lab_check_tripwire "$name" || return 1
+  return "$stop_status"
 }
 
 fm_herdr_lab_teardown() { # <session>
-  local name=$1 tripwire sessions delete_status=0
+  local name=$1 tripwire sessions delete_status=0 fleet_after_stop=0
   fm_herdr_lab_validate_name "$name" || return 1
   tripwire=$(fm_herdr_lab_tripwire_path "$name")
   [ -f "$tripwire" ] || {
@@ -279,8 +305,13 @@ fm_herdr_lab_teardown() { # <session>
     fm_herdr_lab_verify_tripwire "$name"
     return
   fi
-  fm_herdr_lab_stop "$name" >/dev/null 2>&1 || true
+  fm_herdr_lab_refuse_if_default "$name" || return 1
+  fm_herdr_lab_raw "$name" session stop "$name" --json >/dev/null 2>&1 || true
   sleep 0.5
+  # A fleet change seen after the stop still lets this lab be deleted, because
+  # delete names only this lab, but it fails teardown even when the fleet looks
+  # restored again by the final check.
+  fm_herdr_lab_check_tripwire "$name" || fleet_after_stop=1
   fm_herdr_lab_refuse_if_default "$name" || return 1
   fm_herdr_lab_raw "$name" session delete "$name" --json >/dev/null 2>&1 || delete_status=$?
   sessions=$(fm_herdr_lab_session_list "$name" 2>/dev/null) || {
@@ -295,6 +326,10 @@ fm_herdr_lab_teardown() { # <session>
     fi
     return 1
   fi
+  [ "$fleet_after_stop" -eq 0 ] || {
+    fm_herdr_lab_error "lab session '$name' was removed, but the fleet changed after its stop; keeping the tripwire at $tripwire"
+    return 1
+  }
   fm_herdr_lab_verify_tripwire "$name"
 }
 

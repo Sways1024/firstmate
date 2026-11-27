@@ -16,7 +16,7 @@
 #
 # Every Herdr call is scoped to a named non-default lab session provisioned
 # through bin/fm-herdr-lab.sh, whose teardown re-verifies that the captain's
-# own default session is untouched.
+# own fleet sessions are untouched.
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
