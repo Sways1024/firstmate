@@ -66,7 +66,12 @@
 #                          a durably captured process-to-event result is queued
 #                          and has not been surfaced yet; reported once per
 #                          captured generation, never again while that record
-#                          stays queued and never once it is acknowledged
+#                          stays queued and never once it is acknowledged. A
+#                          result already applied and recorded as announced via
+#                          a status log with an unreported change is instead
+#                          folded into that log's "signal:" wake, which is then
+#                          always actionable; never in away mode (see
+#                          procevent_fold_status)
 #   check: rejected unauthenticated state checks: <paths>
 #                          unsafe state checks were refused without execution
 #   check: rejected unauthenticated PR poll retirement receipts: <paths>
@@ -103,6 +108,10 @@ mkdir -p "$STATE"
 . "$SCRIPT_DIR/fm-pending-reply-lib.sh"
 # shellcheck source=bin/fm-busy-lib.sh
 . "$SCRIPT_DIR/fm-busy-lib.sh"
+# Read-only here: the process-event fold below reads a result's handled
+# acknowledgement and its announced-via-status record through this owner.
+# shellcheck source=bin/fm-procevent-lib.sh
+. "$SCRIPT_DIR/fm-procevent-lib.sh"
 
 WATCH_LOCK="$STATE/.watch.lock"
 WATCH_PATH="$SCRIPT_DIR/fm-watch.sh"
@@ -617,9 +626,14 @@ procevent_surface_after_output() {
   return "$status"
 }
 
-procevent_surface_queued() {
-  local key reason
+# Without "no-fold", a set of unsurfaced keys that would all fold into this
+# cycle's status wake (see procevent_fold_status) is deferred to the signal
+# scan below instead of surfaced here; the cycle surfaces it with no-fold if
+# that status wake does not carry it after all.
+procevent_surface_queued() {  # [no-fold]
+  local key reason mode=${1-}
   PROCEVENT_SURFACED=
+  [ "$mode" = no-fold ] || PROCEVENT_DEFERRED=
   [ -s "$FM_WAKE_QUEUE" ] || return 0
   fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
   while IFS= read -r key; do
@@ -631,9 +645,129 @@ procevent_surface_queued() {
     fm_lock_release "$FM_WAKE_QUEUE_LOCK"
     return 0
   fi
+  # shellcheck disable=SC2086 # queue keys are validated path-safe words
+  if [ "$mode" != no-fold ] && procevent_all_fold $PROCEVENT_SURFACED; then
+    PROCEVENT_DEFERRED=$PROCEVENT_SURFACED
+    PROCEVENT_SURFACED=
+    fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+    triage_log "deferred process-event result(s) to this cycle's status wake:$PROCEVENT_DEFERRED"
+    return 0
+  fi
   reason="check: process-event result captured:$PROCEVENT_SURFACED"
   FM_WAKE_POST_OUTPUT_ACTION=procevent_surface_after_output
   wake "$reason"
+}
+
+# Folding a cleanly applied result into its status wake.
+# An adapter that applies a captured result by appending lines to one of this
+# home's own status logs records that through `fm-procevent.sh via-status`
+# just before acknowledging it (bin/fm-procevent-lib.sh owns the record). That
+# result's process-event wake then says nothing the status log's own wake does
+# not, and delivering both costs firstmate a second turn that finds nothing
+# new. So the status wake alone is delivered, but only when every condition
+# below holds; anything else surfaces the process-event wake exactly as before:
+#   - this watcher reports to firstmate itself, never to the away-mode daemon,
+#     whose status triage reads only a log's last line and could self-handle an
+#     update whose captain-relevant line is not last (procevent_fold_allowed);
+#   - the result is durably acknowledged AND recorded as announced via a named
+#     regular status log of this home (fm_procevent_via_status);
+#   - that status log has a change this watcher has not reported yet, so the
+#     status wake about to be delivered covers the applied lines.
+# A status wake that carries a fold is always actionable, exactly as the
+# process-event wake it replaces always was, so the crew-state triage that may
+# absorb a benign status wake can never absorb a folded one. The folded records
+# are marked surfaced and withdrawn from the durable queue only after that
+# wake's output succeeds; any failure before then leaves them queued and
+# unsurfaced for a later cycle, where they surface as before.
+PROCEVENT_SURFACED=
+PROCEVENT_DEFERRED=
+PROCEVENT_FOLDED=
+PROCEVENT_FOLD_PAIRS=
+
+procevent_fold_allowed() {
+  afk_present && return 1
+  if [ -e "$STATE/.supervise-daemon.lock" ] || [ -L "$STATE/.supervise-daemon.lock" ]; then
+    return 1
+  fi
+  return 0
+}
+
+status_has_unseen_change() {  # <status-file>
+  local f=$1 sig
+  sig=$(stat_sig "$f") || return 1
+  [ -n "$sig" ] || return 1
+  [ "$sig" != "$(cat "$STATE/.seen-$(basename "$f" | tr '.' '_')" 2>/dev/null)" ]
+}
+
+# Print the status log a queued process-event key folds into right now, or
+# return 1 to have it surfaced as before.
+procevent_fold_status() {  # <queue-key>
+  local key=$1 rest sid seq name f
+  rest=${key#procevent:}
+  [ "$rest" != "$key" ] || return 1
+  seq=${rest##*:}
+  sid=${rest%:*}
+  [ "$sid" != "$rest" ] || return 1
+  name=$(fm_procevent_via_status "$STATE" "$sid" "$seq") || return 1
+  f="$STATE/$name"
+  status_has_unseen_change "$f" || return 1
+  printf '%s\n' "$f"
+}
+
+procevent_all_fold() {  # <queue-key>...
+  local key
+  [ "$#" -gt 0 ] || return 1
+  procevent_fold_allowed || return 1
+  for key in "$@"; do
+    procevent_fold_status "$key" >/dev/null || return 1
+  done
+}
+
+# Record, as "<key><TAB><status-file>" lines in PROCEVENT_FOLD_PAIRS, every
+# queued and unsurfaced process-event key that folds right now.
+procevent_collect_folds() {
+  local key f
+  PROCEVENT_FOLD_PAIRS=
+  procevent_fold_allowed || return 0
+  [ -s "$FM_WAKE_QUEUE" ] || return 0
+  while IFS= read -r key; do
+    case "$key" in procevent:*) ;; *) continue ;; esac
+    [ -e "$(procevent_surfaced_marker "$key")" ] && continue
+    f=$(procevent_fold_status "$key") || continue
+    PROCEVENT_FOLD_PAIRS="$PROCEVENT_FOLD_PAIRS$key	$f
+"
+  done < <(fm_wake_queued_keys check)
+}
+
+# Keep in PROCEVENT_FOLDED only the collected keys whose status log is among
+# the files the status wake about to be delivered names.
+procevent_keep_carried_folds() {  # <space-separated signal files>
+  local files=" $1 " key f
+  PROCEVENT_FOLDED=
+  while IFS=$(printf '\t') read -r key f; do
+    [ -n "$key" ] || continue
+    case "$files" in *" $f "*) PROCEVENT_FOLDED="$PROCEVENT_FOLDED $key" ;; esac
+  done <<EOF
+$PROCEVENT_FOLD_PAIRS
+EOF
+}
+
+procevent_fold_after_output() {
+  local output_status=$1 key marker tmp status=0
+  [ "$output_status" -eq 0 ] || return 0
+  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
+  for key in $PROCEVENT_FOLDED; do
+    marker=$(procevent_surfaced_marker "$key")
+    tmp=$(umask 077; mktemp "$STATE/.seen-procevent.XXXXXX") || { status=1; continue; }
+    if ! mv -f -- "$tmp" "$marker"; then
+      rm -f -- "$tmp"
+      status=1
+      continue
+    fi
+    fm_wake_withdraw_locked check "$key" || status=1
+  done
+  fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+  return "$status"
 }
 
 run_check_process() {
@@ -1008,6 +1142,10 @@ while :; do
   pending=$(scan_signals)
   if [ -n "$pending" ]; then
     sleep "$SIGNAL_GRACE"
+    # Collect folds BEFORE the re-scan: an acknowledged result's lines were
+    # appended before its acknowledgement, so the re-scan below sees them and
+    # the signature this wake commits covers them.
+    procevent_collect_folds
     pending=$(printf '%s\n%s' "$pending" "$(scan_signals)")
     files=""
     while IFS=$(printf '\t') read -r sf sig f; do
@@ -1017,7 +1155,10 @@ while :; do
 $pending
 EOF
     reason="signal:$files"
+    procevent_keep_carried_folds "$files"
     # Triage: a signal is ACTIONABLE when any of these holds (cheapest first):
+    #   - it carries a folded process-event result (see procevent_fold_status),
+    #     which was always actionable on its own;
     #   - the away-mode daemon owns triage (afk) and wants every wake;
     #   - any status file carries a captain-relevant verb;
     #   - or it is a no-verb wake (a bare turn-end, a working: note) whose crew is
@@ -1031,7 +1172,7 @@ EOF
     # check is the only costly one (it may run a bounded no-mistakes call), so the ||
     # ordering evaluates it ONLY for a non-afk, no-captain-verb signal.
     # shellcheck disable=SC2086  # $files is a space-separated status-path list (ids carry no spaces)
-    if afk_present || signal_reason_is_actionable $files || ! signal_crew_provably_working $files; then
+    if [ -n "$PROCEVENT_FOLDED" ] || afk_present || signal_reason_is_actionable $files || ! signal_crew_provably_working $files; then
       while IFS=$(printf '\t') read -r sf sig f; do
         [ -n "$sf" ] || continue
         fm_wake_append signal "$(basename "$f")" "$reason" || exit 1
@@ -1045,6 +1186,10 @@ EOF
       done <<EOF
 $pending
 EOF
+      if [ -n "$PROCEVENT_FOLDED" ]; then
+        triage_log "folded process-event result(s)$PROCEVENT_FOLDED into $reason"
+        FM_WAKE_POST_OUTPUT_ACTION=procevent_fold_after_output
+      fi
       wake "$reason"
     else
       while IFS=$(printf '\t') read -r sf sig f; do
@@ -1056,6 +1201,9 @@ EOF
       triage_log "absorbed benign $reason"
     fi
   fi
+  # A result deferred to this cycle's status wake that the wake did not carry
+  # after all is surfaced now, exactly as before.
+  [ -z "$PROCEVENT_DEFERRED" ] || procevent_surface_queued no-fold
 
   # Layer 1 backbone: pane staleness. Two consecutive identical hashes with no busy
   # signature means the crewmate finished, is waiting, or is wedged. Each distinct

@@ -8,6 +8,7 @@
 #   fm-procevent.sh start <source-id>
 #   fm-procevent.sh reconcile
 #   fm-procevent.sh handled <source-id> <sequence>
+#   fm-procevent.sh via-status <source-id> <sequence> <name>.status
 #   fm-procevent.sh retire <source-id>
 #   fm-procevent.sh sweep-home [--preflight]
 #   fm-procevent.sh list
@@ -37,6 +38,14 @@
 #            twice. Until this is called, the result stays eligible for
 #            bounded re-announcement on every reconcile. Marking a result
 #            handled does not retire its source registration or claim.
+# via-status Record that a captured generation was announced via this home's
+#            state/<name>.status: its whole effect is new lines in that status
+#            log, which the watcher already reports. An adapter calls it just
+#            before `handled`, and only for a clean automatic apply. Together
+#            with the handled acknowledgement it lets the watcher fold that
+#            result's wake into the status log's own wake (bin/fm-watch.sh);
+#            without the acknowledgement it does nothing, and it never stops
+#            re-announcement.
 # retire     Drop a registration, stop a runner this home owns, release the claim.
 #            Idempotent, and still the supported explicit path after a source has
 #            already retired itself on its adapter's terminal verdict.
@@ -90,7 +99,7 @@ REG=$(fm_procevent_registry_dir "$STATE")
 MAX_OUTPUT_BYTES=${FM_PROCEVENT_MAX_OUTPUT_BYTES:-1048576}
 
 die() { printf 'error: %s\n' "$1" >&2; exit 1; }
-usage() { sed -n '2,74p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,83p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2; }
 
 adapter_script() { printf '%s/bin/fm-procevent-%s.sh\n' "$FM_ROOT" "$1"; }
 
@@ -602,6 +611,25 @@ cmd_handled() {
   esac
 }
 
+# Record that a captured generation was announced via one of this home's status
+# logs, so the watcher may fold its process-event wake into that status log's
+# own wake. Serialized at the same per-source boundary as handled. It changes
+# nothing on its own: the record is read only alongside a durable handled
+# acknowledgement, so an adapter records it before calling handled.
+cmd_via_status() {
+  local id=${1-} seq=${2-} name=${3-} status
+  [ "$#" -eq 3 ] || usage
+  fm_procevent_source_id_valid "$id" || die "source id must be path-safe: $id"
+  case "$seq" in ''|*[!0-9]*) die "sequence must be a nonnegative integer: $seq" ;; esac
+  fm_procevent_status_name_valid "$name" || die "status log must be a path-safe <name>.status file name: $name"
+  fm_procevent_source_lock_acquire "$id" || die "cannot lock source: $id"
+  fm_procevent_record_via_status "$STATE" "$id" "$seq" "$name"
+  status=$?
+  fm_procevent_source_lock_release "$id"
+  [ "$status" -eq 0 ] || die "cannot durably record the status log announcement: $id $seq"
+  printf 'via-status: %s %s %s\n' "$id" "$seq" "$name"
+}
+
 cmd_retire() {
   local id=${1-} owner='' pid='' token='' identity='' stop_state
   fm_procevent_source_id_valid "$id" || die "source id must be path-safe: $id"
@@ -769,6 +797,7 @@ case "${1-}" in
   _start)    shift; cmd_start "$@" ;;
   reconcile) shift; cmd_reconcile "$@" ;;
   handled)   shift; cmd_handled "$@" ;;
+  via-status) shift; cmd_via_status "$@" ;;
   retire)    shift; cmd_retire "$@" ;;
   sweep-home) shift; cmd_sweep_home "$@" ;;
   list)      shift; cmd_list "$@" ;;
