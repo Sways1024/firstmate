@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Real restored-shell E2E for home-local session-start Herdr projection cleanup.
 # Every CLI operation is routed through one guarded named non-default lab, and
-# lab teardown verifies that the default fleet session is byte-identical.
+# lab teardown verifies that the live fleet sessions are byte-identical.
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -15,7 +15,7 @@
 # On a future release whose explicit close preserves focus, Part A records
 # that and Parts B and C keep outcome-only assertions, so no version is guessed.
 # Every CLI operation is routed through one guarded named non-default lab, and
-# lab teardown verifies that the default fleet session is byte-identical.
+# lab teardown verifies that the live fleet sessions are byte-identical.
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
