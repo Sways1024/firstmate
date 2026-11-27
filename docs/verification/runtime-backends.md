@@ -589,6 +589,26 @@ FM_AFK_PI_HERDR_E2E=1 HERDR_LAB_HELPER=bin/fm-herdr-lab.sh \
 Observed guarantees: pending composer input refused injection and raised one alert; idle Pi accepted one marked escalation; the return gate refused ordinary work while a live blocker remained; resolving the blocker allowed the return flow.
 The dedicated Herdr daemon workspace topology is covered by `tests/fm-afk-launch.test.sh` and preserves the captain tab's pane count.
 
+### Turn-end duplicate stale
+
+A real Claude worker's turn end was verified on 2026-11-27 with Herdr 0.8.0, Claude Code 2.1.332, and `claude-haiku-5-5` on macOS, in a guarded `fm-lab-` session:
+
+```sh
+FM_WATCH_TURNEND_HERDR_E2E=1 HERDR_LAB_HELPER=bin/fm-herdr-lab.sh \
+  tests/fm-watch-turnend-duplicate-herdr-live-e2e.test.sh
+```
+
+Observed output:
+
+```text
+ok - real Claude on Herdr: one turn-end signal, no bare stale across 3 re-arms, duplicate absorbed
+ok - real Claude on Herdr: a draft left in the composer after the signal still surfaces a stale
+ok - real Claude on Herdr: the agent exiting to its shell still surfaces a stale
+```
+
+The settled Herdr pane matched the pane captured when the signal surfaced, inside the production signal grace, so the watcher absorbed the duplicate rather than only failing to reach it.
+The same test against the watcher before this guard failed at the first re-arm, which surfaced a bare `stale:` for the unchanged idle pane 56 seconds after the signal.
+
 ## Zellij
 
 The current compatibility floor and latest verification are Zellij 0.44.0 with `jq` on macOS aarch64.
