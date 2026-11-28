@@ -2173,12 +2173,13 @@ seed_turnend_case() {  # <name> <status-line> [record] [harness]
 
 # One watcher round over the seeded case; 0 when it exited (a wake surfaced),
 # 1 when it was still blocking after <secs> (nothing surfaced).
-# The crew-state verdict defaults to a stopped crew, so a verdict exported by an
-# earlier case cannot leak in; a case's own assignment comes later and wins.
+# The crew-state verdict defaults to a stopped crew and the pane's foreground
+# command to a running Claude, so a value exported by an earlier case cannot leak
+# in; a case's own assignment comes later and wins.
 turnend_round() {  # <out> <secs> [env assignment...]
   local out=$1 secs=$2 pid i=0
   shift 2
-  env FM_FAKE_CREW_STATE='state: unknown · source: none · fixture default' \
+  env FM_FAKE_CREW_STATE='state: unknown · source: none · fixture default' FM_FAKE_TMUX_CURRENT_COMMAND=claude \
     PATH="$DUP_FAKEBIN:$PATH" FM_FAKE_TMUX_WINDOW="$DUP_WIN" FM_FAKE_TMUX_CAPTURE="$DUP_CAP" \
     FM_STATE_OVERRIDE="$DUP_STATE" FM_CREW_STATE_BIN="$DUP_FAKEBIN/fm-crew-state.sh" \
     FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$@" "$WATCH" > "$out" &
@@ -2313,6 +2314,34 @@ test_turnend_duplicate_grok_regex_never_seeds() {
   turnend_round "$DUP_DIR/w2.out" 15 || fail "a Grok stale was absorbed through its rendered-text verdict"
   [ "$(cat "$DUP_DIR/w2.out")" = "stale: $DUP_WIN" ] || fail "a Grok stale surfaced the wrong wake: $(cat "$DUP_DIR/w2.out")"
   pass "the Grok rendered-text idle fallback never seeds a snapshot, so Grok surfaces exactly as before"
+}
+
+test_turnend_agent_exit_in_grace_never_seeds() {
+  seed_turnend_case dup-exit-in-grace 'done: PR https://example.test/pr/1 checks green'
+  # Claude exits inside the signal grace: its SessionEnd hook closes the record
+  # as idle and the pane is left on a shell.
+  "$ROOT/bin/fm-busy-event.sh" apply "$DUP_STATE" task idle --gen "$DUP_GEN" \
+    --source claude-hook --event session-end >/dev/null || fail "could not record the session end"
+  printf '✻ Baked for 13s\n❯ \n  bypass permissions on\n\nuser@host repo %% \n' > "$DUP_CAP"
+  turnend_signal_round FM_FAKE_TMUX_CURRENT_COMMAND=zsh
+  [ ! -e "$DUP_STATE/.signal-pane-$DUP_KEY" ] || fail "an agent that exited inside the signal grace seeded an idle-pane snapshot"
+  turnend_round "$DUP_DIR/w2.out" 15 FM_FAKE_TMUX_CURRENT_COMMAND=zsh \
+    || fail "the stale of an agent that exited inside the signal grace was absorbed"
+  [ "$(cat "$DUP_DIR/w2.out")" = "stale: $DUP_WIN" ] || fail "an exited agent's stale surfaced the wrong wake: $(cat "$DUP_DIR/w2.out")"
+  pass "an agent that exits inside the signal grace seeds no snapshot, so its stale surfaces exactly as before"
+}
+
+test_turnend_duplicate_agent_gone_at_check_surfaces() {
+  seed_turnend_case dup-gone-at-check 'done: PR https://example.test/pr/1 checks green'
+  turnend_signal_round
+  [ -s "$DUP_STATE/.signal-pane-$DUP_KEY" ] || fail "the live agent's turn-end signal recorded no idle-pane snapshot"
+  # The agent dies after the signal without any hook firing, so the pane and
+  # every fingerprint field stay identical.
+  turnend_round "$DUP_DIR/w2.out" 15 FM_FAKE_TMUX_CURRENT_COMMAND=zsh \
+    || fail "the stale of an agent gone since its signal was absorbed"
+  [ "$(cat "$DUP_DIR/w2.out")" = "stale: $DUP_WIN" ] || fail "a gone agent's stale surfaced the wrong wake: $(cat "$DUP_DIR/w2.out")"
+  [ ! -e "$DUP_STATE/.signal-pane-$DUP_KEY" ] || fail "the consulted snapshot was not consumed"
+  pass "an agent no longer alive at the duplicate check surfaces its stale despite an unchanged pane and fingerprint"
 }
 
 test_turnend_duplicate_secondmate_fold_unaffected() {
@@ -2533,6 +2562,8 @@ test_turnend_duplicate_snapshot_is_one_shot
 test_turnend_duplicate_crew_state_change_surfaces
 test_turnend_duplicate_requires_semantic_idle
 test_turnend_duplicate_grok_regex_never_seeds
+test_turnend_agent_exit_in_grace_never_seeds
+test_turnend_duplicate_agent_gone_at_check_surfaces
 test_turnend_duplicate_secondmate_fold_unaffected
 test_heartbeat_no_change_absorbed
 test_heartbeat_backstop_surfaces_unsurfaced_status

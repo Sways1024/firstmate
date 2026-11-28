@@ -24,9 +24,10 @@
 #                          absorb class applies does the log's last line decide:
 #                          terminal (captain-relevant) or non-terminal (no verb),
 #                          both surfaced at once, except a pane byte-identical,
-#                          with unchanged lifecycle, status, and crew state, to
-#                          the idle pane that task's own signal wake already
-#                          reported (see signal_pane_snapshot_record), which
+#                          with unchanged lifecycle, status, and crew state and
+#                          a still-alive agent, to the idle pane that task's
+#                          own signal wake already reported (see
+#                          signal_pane_snapshot_record), which
 #                          keeps the surface's bookkeeping without a second
 #                          wake. A provably-working stale past the
 #                          wedge threshold also surfaces, with an "escalation N"
@@ -562,10 +563,12 @@ pause_state_class() {  # <window> <task>
 # signal_pane_snapshot_record runs when a signal is surfaced in normal mode,
 # after its durable queue record exists.
 # For each signalled ordinary task whose busy verdict is an exact idle from a
-# lifecycle source, it records the pane hash plus signal_pane_fingerprint.
+# lifecycle source and whose agent probes exactly alive, it records the pane
+# hash plus signal_pane_fingerprint.
 # signal_pane_snapshot_matches is consulted only at the two first-sight bare
 # stale surfacing points, consumes the snapshot on every consult, and succeeds
-# only when the pane and the fingerprint are both unchanged.
+# only when the pane and the fingerprint are both unchanged and the agent still
+# probes exactly alive.
 # Anything that differs surfaces exactly as before.
 
 # The progress fingerprint: the busy-record line, the status and turn-ended
@@ -573,16 +576,18 @@ pause_state_class() {  # <window> <task>
 # The crew-state verdict keeps a validation run that changes outcome under a
 # still pane from ever being absorbed.
 signal_pane_fingerprint() {  # <task>
-  local task=$1 rec_line='' status_sig='' turn_sig='' crew=''
-  if [ -f "$STATE/$task.busy-state" ]; then
-    IFS= read -r rec_line < "$STATE/$task.busy-state" 2>/dev/null || rec_line=
-  fi
-  [ -n "$rec_line" ] || rec_line=none
-  status_sig=$(stat_sig "$STATE/$task.status") || status_sig=none
+  local task=$1 turn_sig='' crew=''
   turn_sig=$(stat_sig "$STATE/$task.turn-ended") || turn_sig=none
   crew=$("$FM_CREW_STATE_BIN" "$task" 2>/dev/null) || crew=
   crew=$(printf '%s' "$crew" | awk -F ' · ' 'NR == 1 { print $1 " · " $2 }')
-  printf '%s|%s|%s|%s' "$rec_line" "$status_sig" "$turn_sig" "${crew:-none}"
+  printf '%s|%s|%s' "$(wedge_progress_signature "$task")" "$turn_sig" "${crew:-none}"
+}
+
+# 0 iff the backend's agent liveness probe says exactly alive.
+signal_pane_agent_alive() {  # <window>
+  local win=$1 agent_alive
+  agent_alive=$(fm_backend_agent_alive "$(window_backend "$win")" "$win" 2>/dev/null) || agent_alive=unknown
+  [ "$agent_alive" = alive ]
 }
 
 signal_pane_snapshot_record() {  # <signalled-file>...
@@ -613,6 +618,8 @@ signal_pane_snapshot_record() {  # <signalled-file>...
     verdict=$(fm_busy_classify_meta "$meta" "$task" "$STATE" "$tail40")
     [ "${verdict%% *}" = idle ] || continue
     [ "${verdict#* }" != grok-regex ] || continue
+    # An agent that exited or cannot be confirmed running never seeds one either.
+    signal_pane_agent_alive "$w" || continue
     h=$(printf '%s' "$tail40" | hash_pane)
     printf '%s\t%s\n' "$h" "$(signal_pane_fingerprint "$task")" > "$STATE/.signal-pane-$key"
   done
@@ -629,6 +636,7 @@ signal_pane_snapshot_matches() {  # <window> <task> <hash>
   snap_h=${line%%$'\t'*}
   snap_fp=${line#*$'\t'}
   [ -n "$snap_h" ] && [ "$snap_h" = "$h" ] || return 1
+  signal_pane_agent_alive "$win" || return 1
   [ "$snap_fp" = "$(signal_pane_fingerprint "$task")" ] || return 1
   return 0
 }
