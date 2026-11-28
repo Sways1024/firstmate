@@ -23,7 +23,13 @@
 #                          re-surface cadence, never as a wedge. Only when neither
 #                          absorb class applies does the log's last line decide:
 #                          terminal (captain-relevant) or non-terminal (no verb),
-#                          both surfaced at once. A provably-working stale past the
+#                          both surfaced at once, except a pane byte-identical,
+#                          with unchanged lifecycle, status, and crew state and
+#                          a still-alive agent, to the idle pane that task's
+#                          own signal wake already reported (see
+#                          signal_pane_snapshot_record), which
+#                          keeps the surface's bookkeeping without a second
+#                          wake. A provably-working stale past the
 #                          wedge threshold also surfaces, with an "escalation N"
 #                          count in the reason; at FM_WEDGE_DEMAND_INSPECT_COUNT
 #                          consecutive escalations on the SAME pane, the reason
@@ -548,10 +554,99 @@ pause_state_class() {  # <window> <task>
   printf '%s' "$class"
 }
 
-surface_nonterminal_stale() {  # <window> <hash>
-  local win=$1 h=$2 key task last
+# Turn-end duplicate suppression.
+# A surfaced signal wake exits this watcher before the stale loop ever sees that
+# turn's settled idle pane.
+# Without these helpers the next watcher would meet that pane as a hash it never
+# classified and surface a bare "stale: <window>" for exactly the pane state
+# firstmate was just woken for.
+# signal_pane_snapshot_record runs when a signal is surfaced in normal mode,
+# after its durable queue record exists.
+# For each signalled ordinary task whose busy verdict is an exact idle from a
+# lifecycle source and whose agent probes exactly alive, it records the pane
+# hash plus signal_pane_fingerprint.
+# signal_pane_snapshot_matches is consulted only at the two first-sight bare
+# stale surfacing points, consumes the snapshot on every consult, and succeeds
+# only when the pane and the fingerprint are both unchanged and the agent still
+# probes exactly alive.
+# Anything that differs surfaces exactly as before.
+
+# The progress fingerprint: the busy-record line, the status and turn-ended
+# signatures, and the authoritative crew-state verdict (state and source only).
+# The crew-state verdict keeps a validation run that changes outcome under a
+# still pane from ever being absorbed.
+signal_pane_fingerprint() {  # <task>
+  local task=$1 turn_sig='' crew=''
+  turn_sig=$(stat_sig "$STATE/$task.turn-ended") || turn_sig=none
+  crew=$("$FM_CREW_STATE_BIN" "$task" 2>/dev/null) || crew=
+  crew=$(printf '%s' "$crew" | awk -F ' · ' 'NR == 1 { print $1 " · " $2 }')
+  printf '%s|%s|%s' "$(wedge_progress_signature "$task")" "$turn_sig" "${crew:-none}"
+}
+
+# 0 iff the backend's agent liveness probe says exactly alive.
+signal_pane_agent_alive() {  # <window>
+  local win=$1 agent_alive
+  agent_alive=$(fm_backend_agent_alive "$(window_backend "$win")" "$win" 2>/dev/null) || agent_alive=unknown
+  [ "$agent_alive" = alive ]
+}
+
+signal_pane_snapshot_record() {  # <signalled-file>...
+  local f base task meta w key tail40 h verdict seen=''
+  for f in "$@"; do
+    base=${f##*/}
+    case "$base" in
+      *.status) task=${base%.status} ;;
+      *.turn-ended) task=${base%.turn-ended} ;;
+      *) continue ;;
+    esac
+    [ -n "$task" ] || continue
+    case " $seen " in *" $task "*) continue ;; esac
+    seen="$seen $task"
+    meta="$STATE/$task.meta"
+    [ -f "$meta" ] || continue
+    w=$(fm_backend_target_of_meta "$meta")
+    [ -n "$w" ] || continue
+    [ "$(window_kind "$w")" = secondmate ] && continue
+    key=$(printf '%s' "$w" | tr ':/.' '___')
+    rm -f "$STATE/.signal-pane-$key"
+    tail40=$(fm_backend_capture "$(window_backend "$w")" "$w" 40 "$(window_label "$w")" 2>/dev/null) || continue
+    # Only a harness's own lifecycle source saying the turn ended may seed a
+    # snapshot.
+    # Busy, unknown, dead, and the Grok rendered-text fallback never do, so a
+    # mid-turn pane can never be recorded as the idle state firstmate was told
+    # about.
+    verdict=$(fm_busy_classify_meta "$meta" "$task" "$STATE" "$tail40")
+    [ "${verdict%% *}" = idle ] || continue
+    [ "${verdict#* }" != grok-regex ] || continue
+    # An agent that exited or cannot be confirmed running never seeds one either.
+    signal_pane_agent_alive "$w" || continue
+    h=$(printf '%s' "$tail40" | hash_pane)
+    printf '%s\t%s\n' "$h" "$(signal_pane_fingerprint "$task")" > "$STATE/.signal-pane-$key"
+  done
+  return 0
+}
+
+signal_pane_snapshot_matches() {  # <window> <task> <hash>
+  local win=$1 task=$2 h=$3 key f line snap_h snap_fp
   key=$(printf '%s' "$win" | tr ':/.' '___')
-  fm_wake_append stale "$win" "stale: $win" || exit 1
+  f="$STATE/.signal-pane-$key"
+  [ -f "$f" ] || return 1
+  IFS= read -r line < "$f" 2>/dev/null || line=
+  rm -f "$f"
+  snap_h=${line%%$'\t'*}
+  snap_fp=${line#*$'\t'}
+  [ -n "$snap_h" ] && [ "$snap_h" = "$h" ] || return 1
+  signal_pane_agent_alive "$win" || return 1
+  [ "$snap_fp" = "$(signal_pane_fingerprint "$task")" ] || return 1
+  return 0
+}
+
+# With "absorb", performs the same bookkeeping as a surface without queueing
+# or waking, for a stale that repeats an already surfaced signal.
+surface_nonterminal_stale() {  # <window> <hash> [absorb]
+  local win=$1 h=$2 absorb=${3:-} key task last
+  key=$(printf '%s' "$win" | tr ':/.' '___')
+  [ -n "$absorb" ] || fm_wake_append stale "$win" "stale: $win" || exit 1
   printf '%s' "$h" > "$STATE/.stale-$key"
   rm -f "$STATE/.stale-since-$key"
   task=$(window_to_task "$win" "$STATE")
@@ -562,6 +657,10 @@ surface_nonterminal_stale() {  # <window> <hash>
     date +%s > "$STATE/.paused-resurfaced-$key"
   else
     rm -f "$STATE/.paused-$key" "$STATE/.paused-rechecked-$key" "$STATE/.paused-resurfaced-$key"
+  fi
+  if [ -n "$absorb" ]; then
+    triage_log "absorbed non-terminal stale (same idle pane already surfaced by this task's signal): $win"
+    return 0
   fi
   wake "stale: $win"
 }
@@ -1190,6 +1289,11 @@ EOF
         triage_log "folded process-event result(s)$PROCEVENT_FOLDED into $reason"
         FM_WAKE_POST_OUTPUT_ACTION=procevent_fold_after_output
       fi
+      # Remember each signalled worker's settled idle pane, so the next
+      # watcher does not re-report it as a bare stale (see
+      # signal_pane_snapshot_record).
+      # shellcheck disable=SC2086  # $files is a space-separated status-path list (ids carry no spaces)
+      afk_present || signal_pane_snapshot_record $files
       wake "$reason"
     else
       while IFS=$(printf '\t') read -r sf sig f; do
@@ -1276,6 +1380,11 @@ EOF
               printf '%s' "$h" > "$sf"
               date +%s > "$ssf"
               triage_log "absorbed stale (provably working, overriding a stale captain-relevant status): $w"
+            elif signal_pane_snapshot_matches "$w" "$(window_to_task "$w" "$STATE")" "$h"; then
+              # The same idle pane this task's own signal wake already reported.
+              printf '%s' "$h" > "$sf"
+              rm -f "$ssf"
+              triage_log "absorbed stale (same idle pane already surfaced by this task's signal): $w"
             else
               fm_wake_append stale "$w" "stale: $w" || exit 1
               printf '%s' "$h" > "$sf"
@@ -1308,6 +1417,9 @@ EOF
           #     (it may be done via an interactive menu that wrote no done: status,
           #     waiting on a decision, or wedged) instead of leaving the finish to
           #     wait out the timer.
+          #     The one exception is the same idle pane this task's own signal
+          #     wake already reported, which keeps the surface's bookkeeping,
+          #     including the wedge timer, without a second wake.
           if [ "$(cat "$sf" 2>/dev/null || true)" != "$h" ]; then
             task=$(window_to_task "$w" "$STATE")
             case "$(pause_state_class "$w" "$task")" in
@@ -1321,7 +1433,11 @@ EOF
                 handle_paused_stale "$w" "$task" "$h"
                 ;;
               *)
-                surface_nonterminal_stale "$w" "$h"
+                if signal_pane_snapshot_matches "$w" "$task" "$h"; then
+                  surface_nonterminal_stale "$w" "$h" absorb
+                else
+                  surface_nonterminal_stale "$w" "$h"
+                fi
                 ;;
             esac
           else

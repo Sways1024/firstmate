@@ -118,7 +118,7 @@ state/               volatile runtime signals; gitignored
   .afk               durable away-mode flag; present = sub-supervisor may inject escalations (set by /afk, cleared on user return)
   .watch.lock .wake-queue.lock watcher singleton and queue serialization locks
   .claude-autoarm.lock .claude-autoarm-epoch .claude-autoarm-failure-notified .claude-autoarm-failure-alarmed .turnend-claude-blocks .turnend-claude-blocks.lock   Claude Stop auto-arm single-flight, epoch, failure-episode, attended-alarm, guard-budget, and budget-lock records; never touch
-  .hash-* .count-* .stale-* .stale-since-* .paused-* .wedge-escalations-* .seen-* .hb-surfaced-* .last-* .heartbeat-streak   watcher internals; never touch
+  .hash-* .count-* .stale-* .stale-since-* .signal-pane-* .paused-* .wedge-escalations-* .seen-* .hb-surfaced-* .last-* .heartbeat-streak   watcher internals; never touch
   .watch-triage.log  watcher's ABSORBED-wake debug log only (size-capped); a delivered wake is never written here, so its absence from this log is not evidence the wake did not fire; never relied on, safe to delete
   .watch-cycle-exits.log  bounded arm-layer ledger of every observed watcher cycle, including each delivered wake's reason class and subject; bin/fm-watch-arm.sh owns it
   .watch-deliveries.log  bounded watcher record of every wake actually delivered to the supervisor, with its full reason text; these two logs, not the triage log, are the durable record of supervision wakes

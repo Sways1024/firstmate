@@ -2138,6 +2138,238 @@ test_procevent_deferred_result_not_carried_surfaces_same_cycle() {
   pass "a deferred result that its status wake does not carry surfaces as before in the same cycle"
 }
 
+# --- turn-end duplicate: a stale that repeats the task's own signal ----------
+# A surfaced signal wake exits the watcher before its stale loop sees that
+# turn's settled idle pane, so the re-armed watcher used to report the same
+# pane again as a bare "stale: <window>".
+# Each case runs a FIRST watcher that surfaces the turn-end signal and a SECOND
+# watcher (firstmate's re-arm) over the scenario's pane.
+# Only a byte-identical pane with an unchanged lifecycle record, status log,
+# turn-ended marker, and crew-state verdict may be absorbed; every other shape
+# must surface exactly as before.
+
+DUP_WIN='test:fm-task'
+
+# Seed one Claude worker that ended its turn on <status-line>, with the real
+# lifecycle record its Stop hook leaves unless <record> is "none".
+seed_turnend_case() {  # <name> <status-line> [record] [harness]
+  local name=$1 line=$2 record=${3:-idle} harness=${4:-claude} gen
+  DUP_DIR=$(make_case "$name"); DUP_STATE="$DUP_DIR/state"; DUP_FAKEBIN="$DUP_DIR/fakebin"
+  DUP_CAP="$DUP_DIR/pane.txt"
+  DUP_KEY=$(printf '%s' "$DUP_WIN" | tr ':/.' '___')
+  printf 'window=%s\nkind=ship\nharness=%s\nbackend=tmux\n' "$DUP_WIN" "$harness" > "$DUP_STATE/task.meta"
+  printf '%s\n' "$line" > "$DUP_STATE/task.status"
+  : > "$DUP_STATE/task.turn-ended"
+  printf '✻ Baked for 13s\n❯ \n  bypass permissions on\n' > "$DUP_CAP"
+  if [ "$record" = idle ]; then
+    gen=$("$ROOT/bin/fm-busy-event.sh" arm "$DUP_STATE" task) || fail "could not arm the lifecycle record"
+    DUP_GEN=$gen
+    "$ROOT/bin/fm-busy-event.sh" apply "$DUP_STATE" task busy --gen "$gen" \
+      --source claude-hook --event user-prompt-submit >/dev/null || fail "could not open the fixture turn"
+    "$ROOT/bin/fm-busy-event.sh" apply "$DUP_STATE" task idle --gen "$gen" \
+      --source claude-hook --event stop >/dev/null || fail "could not close the fixture turn"
+  fi
+}
+
+# One watcher round over the seeded case; 0 when it exited (a wake surfaced),
+# 1 when it was still blocking after <secs> (nothing surfaced).
+# The crew-state verdict defaults to a stopped crew and the pane's foreground
+# command to a running Claude, so a value exported by an earlier case cannot leak
+# in; a case's own assignment comes later and wins.
+turnend_round() {  # <out> <secs> [env assignment...]
+  local out=$1 secs=$2 pid i=0
+  shift 2
+  env FM_FAKE_CREW_STATE='state: unknown · source: none · fixture default' FM_FAKE_TMUX_CURRENT_COMMAND=claude \
+    PATH="$DUP_FAKEBIN:$PATH" FM_FAKE_TMUX_WINDOW="$DUP_WIN" FM_FAKE_TMUX_CAPTURE="$DUP_CAP" \
+    FM_STATE_OVERRIDE="$DUP_STATE" FM_CREW_STATE_BIN="$DUP_FAKEBIN/fm-crew-state.sh" \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$@" "$WATCH" > "$out" &
+  pid=$!
+  while [ "$i" -lt $((secs * 10)) ]; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid" 2>/dev/null
+      return 0
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  reap "$pid"
+  return 1
+}
+
+# Round one must surface the turn-end signal itself.
+turnend_signal_round() {  # [env assignment...]
+  turnend_round "$DUP_DIR/w1.out" 30 "$@" || fail "the turn-end signal never surfaced"
+  grep -q '^signal: ' "$DUP_DIR/w1.out" || fail "round one surfaced something other than the turn-end signal: $(cat "$DUP_DIR/w1.out")"
+}
+
+bare_stale_records() {
+  awk -F '\t' -v w="$DUP_WIN" '$3 == "stale" && $4 == w && $5 == "stale: " w { n++ } END { print n + 0 }' \
+    "$DUP_STATE/.wake-queue" 2>/dev/null || printf '0\n'
+}
+
+test_turnend_duplicate_stale_absorbed() {
+  seed_turnend_case dup-absorbed 'done: PR https://example.test/pr/1 checks green'
+  turnend_signal_round
+  [ -s "$DUP_STATE/.signal-pane-$DUP_KEY" ] || fail "the surfaced turn-end signal recorded no idle-pane snapshot"
+  if turnend_round "$DUP_DIR/w2.out" 8; then
+    fail "the re-armed watcher re-reported the idle pane its signal already covered: $(cat "$DUP_DIR/w2.out")"
+  fi
+  [ "$(bare_stale_records)" -eq 0 ] || fail "a bare duplicate stale reached the durable queue"
+  assert_grep "absorbed stale (same idle pane already surfaced by this task's signal): $DUP_WIN" \
+    "$DUP_STATE/.watch-triage.log" "the absorbed duplicate left no triage evidence"
+  [ ! -e "$DUP_STATE/.signal-pane-$DUP_KEY" ] || fail "the consulted snapshot was not consumed"
+  pass "a stale repeating the idle pane its task's own turn-end signal reported is absorbed, with triage evidence"
+}
+
+test_turnend_duplicate_pane_change_surfaces() {
+  seed_turnend_case dup-pane-change 'done: PR https://example.test/pr/1 checks green'
+  turnend_signal_round
+  printf '✻ Baked for 13s\n❯ please also rebase onto main\n  bypass permissions on\n' > "$DUP_CAP"
+  turnend_round "$DUP_DIR/w2.out" 15 || fail "a pane that changed after the signal (an unsubmitted draft) never surfaced"
+  [ "$(cat "$DUP_DIR/w2.out")" = "stale: $DUP_WIN" ] || fail "a changed pane surfaced the wrong wake: $(cat "$DUP_DIR/w2.out")"
+  pass "a pane that changed after the turn-end signal still surfaces a stale"
+}
+
+test_turnend_duplicate_lifecycle_change_surfaces() {
+  seed_turnend_case dup-lifecycle 'done: PR https://example.test/pr/1 checks green'
+  turnend_signal_round
+  # A new turn opened and ended through StopFailure, which touches no
+  # turn-ended marker, while the pane bytes stayed identical.
+  "$ROOT/bin/fm-busy-event.sh" apply "$DUP_STATE" task busy --gen "$DUP_GEN" \
+    --source claude-hook --event user-prompt-submit >/dev/null || fail "could not open the second turn"
+  "$ROOT/bin/fm-busy-event.sh" apply "$DUP_STATE" task idle --gen "$DUP_GEN" \
+    --source claude-hook --event stop-failure >/dev/null || fail "could not end the second turn"
+  turnend_round "$DUP_DIR/w2.out" 15 || fail "a lifecycle event after the signal never surfaced"
+  [ "$(cat "$DUP_DIR/w2.out")" = "stale: $DUP_WIN" ] || fail "a lifecycle change surfaced the wrong wake: $(cat "$DUP_DIR/w2.out")"
+  pass "a new turn after the signal, with an identical pane and no turn-ended touch, still surfaces a stale"
+}
+
+test_stop_without_turnend_signal_surfaces() {
+  seed_turnend_case dup-no-signal 'working: step 2 of 5'
+  # The worker stopped with nothing new to report: no unseen status or
+  # turn-ended change, so no signal and no snapshot.
+  prime_turnend_seen "$DUP_STATE/task.status"
+  prime_turnend_seen "$DUP_STATE/task.turn-ended"
+  turnend_round "$DUP_DIR/w1.out" 15 || fail "a worker that stopped without a turn-end signal never surfaced"
+  [ "$(cat "$DUP_DIR/w1.out")" = "stale: $DUP_WIN" ] || fail "a signal-less stop surfaced the wrong wake: $(cat "$DUP_DIR/w1.out")"
+  pass "a worker that stops without any turn-end signal still surfaces a bare stale"
+}
+
+test_turnend_duplicate_nonterminal_still_escalates() {
+  seed_turnend_case dup-nonterminal 'working: step 2 of 5'
+  turnend_signal_round
+  turnend_round "$DUP_DIR/w2.out" 25 FM_STALE_ESCALATE_SECS=4 \
+    || fail "a worker that stopped mid-task never reached its wedge escalation"
+  grep -q "^stale: $DUP_WIN (idle [0-9]*s, possible wedge, escalation 1)" "$DUP_DIR/w2.out" \
+    || fail "the next wake after a mid-task stop was not the wedge escalation: $(cat "$DUP_DIR/w2.out")"
+  [ "$(bare_stale_records)" -eq 0 ] || fail "a bare duplicate stale preceded the wedge escalation"
+  pass "a mid-task stop keeps its wedge escalation, without a bare duplicate before it"
+}
+
+test_turnend_duplicate_paused_live_keeps_recheck() {
+  seed_turnend_case dup-paused 'paused: waiting on the upstream release'
+  turnend_signal_round FM_FAKE_CREW_STATE='state: paused · source: status-log · waiting'
+  turnend_round "$DUP_DIR/w2.out" 30 FM_FAKE_CREW_STATE='state: paused · source: status-log · waiting' \
+    FM_PAUSE_RESURFACE_SECS=6 || fail "a paused live worker never reached its bounded recheck"
+  grep -q "^stale: $DUP_WIN (paused [0-9]*s, awaiting external" "$DUP_DIR/w2.out" \
+    || fail "the next wake for a paused live worker was not the bounded recheck: $(cat "$DUP_DIR/w2.out")"
+  [ "$(bare_stale_records)" -eq 0 ] || fail "a bare duplicate stale preceded the paused recheck"
+  pass "a paused live worker keeps its bounded recheck, without a bare duplicate before it"
+}
+
+test_turnend_duplicate_snapshot_is_one_shot() {
+  seed_turnend_case dup-one-shot 'done: PR https://example.test/pr/1 checks green'
+  turnend_signal_round
+  if turnend_round "$DUP_DIR/w2.out" 8; then
+    fail "the duplicate was not absorbed before the repaint: $(cat "$DUP_DIR/w2.out")"
+  fi
+  printf '✻ Baked for 13s\n※ recap: the PR is green and waiting for review\n❯ \n  bypass permissions on\n' > "$DUP_CAP"
+  turnend_round "$DUP_DIR/w3.out" 15 || fail "a later autonomous repaint after the absorbed duplicate never surfaced"
+  [ "$(cat "$DUP_DIR/w3.out")" = "stale: $DUP_WIN" ] || fail "a later repaint surfaced the wrong wake: $(cat "$DUP_DIR/w3.out")"
+  pass "the snapshot is one-shot: a later repaint after the absorbed duplicate surfaces"
+}
+
+test_turnend_duplicate_crew_state_change_surfaces() {
+  seed_turnend_case dup-crew-state 'done: PR https://example.test/pr/1 checks green'
+  turnend_signal_round FM_FAKE_CREW_STATE='state: done · source: run-step · checks-passed'
+  turnend_round "$DUP_DIR/w2.out" 15 FM_FAKE_CREW_STATE='state: failed · source: run-step · ci failed' \
+    || fail "a crew-state change under an unchanged pane never surfaced"
+  [ "$(cat "$DUP_DIR/w2.out")" = "stale: $DUP_WIN" ] || fail "a crew-state change surfaced the wrong wake: $(cat "$DUP_DIR/w2.out")"
+  pass "an authoritative state change (done to failed) under an unchanged pane still surfaces a stale"
+}
+
+test_turnend_duplicate_requires_semantic_idle() {
+  seed_turnend_case dup-no-record 'done: PR https://example.test/pr/1 checks green' none
+  turnend_signal_round
+  [ ! -e "$DUP_STATE/.signal-pane-$DUP_KEY" ] || fail "an unknown busy verdict seeded an idle-pane snapshot"
+  turnend_round "$DUP_DIR/w2.out" 15 || fail "a stale without a semantic idle verdict was absorbed"
+  [ "$(cat "$DUP_DIR/w2.out")" = "stale: $DUP_WIN" ] || fail "an unknown-verdict stale surfaced the wrong wake: $(cat "$DUP_DIR/w2.out")"
+  pass "without a lifecycle idle verdict at signal time the stale surfaces exactly as before"
+}
+
+test_turnend_duplicate_grok_regex_never_seeds() {
+  seed_turnend_case dup-grok 'done: PR https://example.test/pr/1 checks green' none grok
+  turnend_signal_round
+  [ ! -e "$DUP_STATE/.signal-pane-$DUP_KEY" ] || fail "the Grok rendered-text fallback seeded an idle-pane snapshot"
+  turnend_round "$DUP_DIR/w2.out" 15 || fail "a Grok stale was absorbed through its rendered-text verdict"
+  [ "$(cat "$DUP_DIR/w2.out")" = "stale: $DUP_WIN" ] || fail "a Grok stale surfaced the wrong wake: $(cat "$DUP_DIR/w2.out")"
+  pass "the Grok rendered-text idle fallback never seeds a snapshot, so Grok surfaces exactly as before"
+}
+
+test_turnend_agent_exit_in_grace_never_seeds() {
+  seed_turnend_case dup-exit-in-grace 'done: PR https://example.test/pr/1 checks green'
+  # Claude exits inside the signal grace: its SessionEnd hook closes the record
+  # as idle and the pane is left on a shell.
+  "$ROOT/bin/fm-busy-event.sh" apply "$DUP_STATE" task idle --gen "$DUP_GEN" \
+    --source claude-hook --event session-end >/dev/null || fail "could not record the session end"
+  printf '✻ Baked for 13s\n❯ \n  bypass permissions on\n\nuser@host repo %% \n' > "$DUP_CAP"
+  turnend_signal_round FM_FAKE_TMUX_CURRENT_COMMAND=zsh
+  [ ! -e "$DUP_STATE/.signal-pane-$DUP_KEY" ] || fail "an agent that exited inside the signal grace seeded an idle-pane snapshot"
+  turnend_round "$DUP_DIR/w2.out" 15 FM_FAKE_TMUX_CURRENT_COMMAND=zsh \
+    || fail "the stale of an agent that exited inside the signal grace was absorbed"
+  [ "$(cat "$DUP_DIR/w2.out")" = "stale: $DUP_WIN" ] || fail "an exited agent's stale surfaced the wrong wake: $(cat "$DUP_DIR/w2.out")"
+  pass "an agent that exits inside the signal grace seeds no snapshot, so its stale surfaces exactly as before"
+}
+
+test_turnend_duplicate_agent_gone_at_check_surfaces() {
+  seed_turnend_case dup-gone-at-check 'done: PR https://example.test/pr/1 checks green'
+  turnend_signal_round
+  [ -s "$DUP_STATE/.signal-pane-$DUP_KEY" ] || fail "the live agent's turn-end signal recorded no idle-pane snapshot"
+  # The agent dies after the signal without any hook firing, so the pane and
+  # every fingerprint field stay identical.
+  turnend_round "$DUP_DIR/w2.out" 15 FM_FAKE_TMUX_CURRENT_COMMAND=zsh \
+    || fail "the stale of an agent gone since its signal was absorbed"
+  [ "$(cat "$DUP_DIR/w2.out")" = "stale: $DUP_WIN" ] || fail "a gone agent's stale surfaced the wrong wake: $(cat "$DUP_DIR/w2.out")"
+  [ ! -e "$DUP_STATE/.signal-pane-$DUP_KEY" ] || fail "the consulted snapshot was not consumed"
+  pass "an agent no longer alive at the duplicate check surfaces its stale despite an unchanged pane and fingerprint"
+}
+
+test_turnend_duplicate_secondmate_fold_unaffected() {
+  local dir state out pid
+  dir=$(make_case dup-secondmate-fold); state="$dir/state"; out="$dir/watch.out"
+  printf 'window=remote:mate\nkind=secondmate\nharness=claude\n' > "$state/mate.meta"
+  seed_applied_procevent_result "$dir" remote-reply-mate mate.status handled via \
+    || fail "could not seed an applied second-mate result"
+  fold_watch_once "$dir" "$out" "a second mate's applied result never woke the watcher"
+  [ "$(cat "$out")" = "signal: $state/mate.status" ] \
+    || fail "a second mate's folded update did not arrive as exactly one status wake: $(cat "$out")"
+  assert_grep 'folded process-event result(s) procevent:remote-reply-mate:1' "$state/.watch-triage.log" \
+    "the second mate's fold left no triage evidence"
+  assert_no_grep 'procevent:remote-reply-mate:1' "$state/.wake-queue" \
+    "the folded second-mate record stayed on the durable queue"
+  if ls "$state"/.signal-pane-* >/dev/null 2>&1; then
+    fail "a second mate's folded status wake recorded an idle-pane snapshot"
+  fi
+  : > "$out"
+  procevent_watch_bg "$dir" "$out"
+  pid=$!
+  if ! wait_live "$pid" 40; then
+    fail "a second mate's folded update woke the watcher a second time: $(cat "$out")"
+  fi
+  reap "$pid"
+  pass "a second mate's folded status wake is unchanged: one wake, fold intact, no snapshot"
+}
+
 # --- heartbeat: no-change absorbed, backstop surfaces a missed status --------
 
 test_heartbeat_no_change_absorbed() {
@@ -2320,6 +2552,19 @@ test_procevent_fold_off_under_away_supervision
 test_procevent_mixed_results_surface_together
 test_procevent_fold_output_failure_replays
 test_procevent_deferred_result_not_carried_surfaces_same_cycle
+test_turnend_duplicate_stale_absorbed
+test_turnend_duplicate_pane_change_surfaces
+test_turnend_duplicate_lifecycle_change_surfaces
+test_stop_without_turnend_signal_surfaces
+test_turnend_duplicate_nonterminal_still_escalates
+test_turnend_duplicate_paused_live_keeps_recheck
+test_turnend_duplicate_snapshot_is_one_shot
+test_turnend_duplicate_crew_state_change_surfaces
+test_turnend_duplicate_requires_semantic_idle
+test_turnend_duplicate_grok_regex_never_seeds
+test_turnend_agent_exit_in_grace_never_seeds
+test_turnend_duplicate_agent_gone_at_check_surfaces
+test_turnend_duplicate_secondmate_fold_unaffected
 test_heartbeat_no_change_absorbed
 test_heartbeat_backstop_surfaces_unsurfaced_status
 test_beacon_stays_fresh_while_absorbing
